@@ -1,10 +1,6 @@
 # Coding Plan Proxy
 
-A smart proxy that lets you use Alibaba DashScope's Coding Plan at full throttle, without hitting rate limits or getting your requests dropped.
-
-## Why this exists
-
-DashScope's Coding Plan gives you generous quotas (thousands of requests per week), but the raw API has aggressive per-minute and per-second throttling. This proxy sits between your IDE and DashScope, smoothing out the request flow so you get steady, uninterrupted access — it handles retries, queues, and pacing automatically.
+An HTTP proxy for the DashScope Coding API with rate limiting, request queuing, and automatic retries.
 
 ## Quick Start
 
@@ -15,27 +11,27 @@ cp .env.example .env
 python dashscope_proxy.py
 ```
 
-Point your OpenAI-compatible client at `http://127.0.0.1:8899` and you're done.
+Point your OpenAI-compatible client at `http://127.0.0.1:8899`.
 
-## What it does
+## Features
 
-**Rate limiting that won't kill your flow**
-Multiple quota layers (RPS, RPM, tokens, 5-hour, weekly, monthly) with a built-in safety margin so you stay well within DashScope's limits.
+**Multi-layer rate limiting**
+Enforces RPS, RPM, TPM, and quotas over 5-hour, weekly, and monthly windows. A configurable safety factor keeps usage below the hard limits.
 
 **Automatic retries**
-When the upstream returns 429 or 5xx, the proxy backs off with exponential jitter and retries transparently — your client never sees the hiccup.
+Retries 429 and 5xx responses with exponential backoff and jitter.
 
 **Request queuing**
-Instead of failing fast when limits are hit, requests wait in a bounded queue until a slot opens up.
+Requests that exceed rate limits are placed in a bounded queue instead of failing immediately.
 
 **Developer role mapping**
-Converts the `developer` message role to `system` so your requests work even if the upstream doesn't support the newer format.
+Converts `developer` role messages to `system` for upstream compatibility.
 
 **SSE streaming**
-Full support for streaming completions with client disconnect detection so resources aren't wasted on abandoned requests.
+Streams completions through the proxy and aborts if the client disconnects.
 
 **Mock model list**
-`GET /v1/models` returns a curated catalog of supported models without hitting the upstream.
+`GET /v1/models` returns a static list of supported models.
 
 ## Endpoints
 
