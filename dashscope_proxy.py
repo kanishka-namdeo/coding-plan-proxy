@@ -41,14 +41,14 @@ HOP_BY_HOP_HEADERS = frozenset({
 })
 
 CODING_PLAN_CONFIG = {
-    "rpm_limit": 2400,
-    "tpm_limit": 4_000_000,
+    "rpm_limit": 20,
+    "tpm_limit": 3_000_000,
     "safety_factor": 0.8,
     "requests_per_5h": 6000,
     "requests_per_week": 45000,
     "requests_per_month": 90000,
-    "max_queue_size": 200,
-    "max_retries": 10,
+    "max_queue_size": 500,
+    "max_retries": 40,
     "base_backoff": 2.0,
 }
 
@@ -425,24 +425,21 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     estimated_tokens = estimate_tokens_for_request(body_bytes) if body_bytes else 0
 
     rate_limiter.pending_requests += 1
-    try:
-        wait_time = await wait_for_slot(rate_limiter)
-        if wait_time is None:
-            rate_limiter.total_rejected += 1
-            retry_sec = max(1, rate_limiter.pending_requests // max(1, rate_limiter.rps_limit))
-            return _make_error_response(
-                503,
-                json.dumps({"error": "queue full", "retry_after": retry_sec}).encode(),
-                request_id,
-                retry_after=retry_sec,
-            )
-
-        if wait_time > 0:
-            rate_limiter.total_queued += 1
-            logger.info("%s Request queued for %.1fs", log_prefix, wait_time)
-    except Exception:
+    wait_time = await wait_for_slot(rate_limiter)
+    if wait_time is None:
+        rate_limiter.total_rejected += 1
         rate_limiter.pending_requests -= 1
-        raise
+        retry_sec = max(1, rate_limiter.pending_requests // max(1, rate_limiter.rps_limit))
+        return _make_error_response(
+            503,
+            json.dumps({"error": "queue full", "retry_after": retry_sec}).encode(),
+            request_id,
+            retry_after=retry_sec,
+        )
+
+    if wait_time > 0:
+        rate_limiter.total_queued += 1
+        logger.info("%s Request queued for %.1fs", log_prefix, wait_time)
 
     target_path = path if path.startswith("/v1") else f"/v1{path}"
     target_url = f"{TARGET_BASE}{target_path}"
@@ -463,7 +460,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     retry_5xx = 0
 
     try:
-        while retry + retry_5xx <= rate_limiter.max_retries:
+        while retry <= rate_limiter.max_retries and retry_5xx <= MAX_5XX_RETRIES:
             try:
                 if _client_disconnected(request):
                     logger.info("%s Client disconnected, aborting", log_prefix)
@@ -477,9 +474,11 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         data=body_bytes,
                     )
                     try:
+                        # Check for error status codes BEFORE streaming
                         if upstream.status == 429:
                             rate_limiter.total_429s += 1
                             error_body = await upstream.read()
+                            upstream.close()  # Close connection before retrying
                             retry += 1
                             if retry > rate_limiter.max_retries:
                                 logger.error("%s Max retries exceeded after 429", log_prefix)
@@ -495,8 +494,9 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             await asyncio.sleep(retry_wait)
                             continue
 
-                        if 500 <= upstream.status < 600 and not is_stream:
+                        if 500 <= upstream.status < 600:
                             upstream_body = await upstream.read()
+                            upstream.close()  # Close connection before retrying
                             retry_5xx += 1
                             if retry_5xx > MAX_5XX_RETRIES:
                                 logger.warning("%s Upstream %d after %d retries", log_prefix, upstream.status, MAX_5XX_RETRIES)
