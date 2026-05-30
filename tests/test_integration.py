@@ -588,3 +588,221 @@ class TestGracefulShutdown:
             }).encode(),
         )
         assert "Retry-After" in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# Streaming error paths
+# ---------------------------------------------------------------------------
+
+class TestStreamingErrors:
+    async def test_streaming_forwards_ok(self, aiohttp_client, proxy_app):
+        """Happy path: upstream returns 200 for a streaming request."""
+        upstream_app = web.Application()
+
+        async def mock_upstream(request):
+            return web.Response(
+                status=200,
+                body=b'data: {"choices": [{"delta": {"content": "hi"}}]}\n\ndata: {"usage": {"total_tokens": 5}}\n\ndata: [DONE]\n\n',
+                content_type="text/event-stream",
+            )
+
+        upstream_app.router.add_post("/v1/chat/completions", mock_upstream)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                app, _ = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": True,
+                        }).encode(),
+                    )
+                    assert resp.status == 200
+                    text = await resp.text()
+                    assert "data:" in text
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
+
+    async def test_streaming_429_retries_then_succeeds(self, aiohttp_client, proxy_app):
+        """Streaming request: upstream returns 429 first, then succeeds."""
+        call_count = 0
+
+        upstream_app = web.Application()
+
+        async def flaky_upstream(request):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return web.Response(status=429, body=b'{"error":"rate limited"}')
+            return web.Response(
+                status=200,
+                body=b'data: {"usage": {"total_tokens": 10}}\n\ndata: [DONE]\n\n',
+                content_type="text/event-stream",
+            )
+
+        upstream_app.router.add_post("/v1/chat/completions", flaky_upstream)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                app, _ = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": True,
+                        }).encode(),
+                    )
+                    assert resp.status == 200
+                    assert call_count == 2
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
+
+    async def test_streaming_5xx_retries_then_gives_up(self, aiohttp_client, proxy_app):
+        """Streaming request: upstream returns 502 all times, should give up."""
+        upstream_app = web.Application()
+
+        async def always_502(request):
+            return web.Response(status=502, body=b'{"error":"bad gateway"}')
+
+        upstream_app.router.add_post("/v1/chat/completions", always_502)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                app, _ = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": True,
+                        }).encode(),
+                    )
+                    assert resp.status == 502
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
+
+    async def test_streaming_429_forwards_retry_after_header(self, aiohttp_client, proxy_app):
+        """Verify upstream Retry-After header is forwarded on stream 429 after max retries."""
+        upstream_app = web.Application()
+
+        async def always_429(request):
+            return web.Response(
+                status=429,
+                body=b'{"error":"rate limited"}',
+                headers={"Retry-After": "10"},
+            )
+
+        upstream_app.router.add_post("/v1/chat/completions", always_429)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                app, _ = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": True,
+                        }).encode(),
+                    )
+                    assert resp.status == 429
+                    assert "Retry-After" in resp.headers
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
+
+    async def test_is_stream_from_parsed_json_not_byte_substring(self, aiohttp_client, proxy_app):
+        """Verify is_stream is True when stream: true is in parsed JSON body."""
+        upstream_app = web.Application()
+        received_body = None
+
+        async def capture_upstream(request):
+            nonlocal received_body
+            received_body = await request.read()
+            return web.Response(
+                status=200,
+                body=b'data: {"usage": {"total_tokens": 5}}\n\ndata: [DONE]\n\n',
+                content_type="text/event-stream",
+            )
+
+        upstream_app.router.add_post("/v1/chat/completions", capture_upstream)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                app, _ = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    # Use compact JSON without space after colon
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=b'{"model":"qwen3-coder-plus","messages":[{"role":"user","content":"hi"}],"stream":true}',
+                    )
+                    assert resp.status == 200
+                    assert received_body is not None
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()

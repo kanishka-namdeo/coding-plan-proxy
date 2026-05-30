@@ -41,15 +41,15 @@ HOP_BY_HOP_HEADERS = frozenset({
 })
 
 CODING_PLAN_CONFIG = {
-    "rpm_limit": 20,
-    "tpm_limit": 3_000_000,
-    "safety_factor": 0.8,
+    "rpm_limit": 12,
+    "tpm_limit": 2_000_000,
+    "safety_factor": 0.6,
     "requests_per_5h": 6000,
     "requests_per_week": 45000,
     "requests_per_month": 90000,
     "max_queue_size": 500,
     "max_retries": 40,
-    "base_backoff": 2.0,
+    "base_backoff": 1.0,
 }
 
 MOCK_MODELS = {
@@ -94,6 +94,67 @@ class SlidingWindowCounter:
                 self.events.popleft()
 
 
+class TokenBucket:
+    """
+    Token bucket algorithm for TPM enforcement.
+
+    Tokens refill at a constant rate. Each request drains tokens proportional
+    to its estimated size. Burst capacity equals the full bucket (tpm_limit).
+    O(1) state — tracks only current tokens and last refill time.
+
+    Pattern: reserve before send, reconcile after response, refund on error.
+    """
+
+    def __init__(self, capacity: int, window_seconds: int = 60):
+        self.capacity = capacity
+        self.window_seconds = window_seconds
+        self.refill_rate = capacity / window_seconds  # tokens per second
+        self.tokens = float(capacity)
+        self.last_refill = time.monotonic()
+        self.reserved = 0  # tokens reserved for in-flight requests
+
+    def _refill(self, now: float) -> None:
+        elapsed = now - self.last_refill
+        if elapsed > 0:
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+            self.last_refill = now
+
+    def available(self, now: float | None = None) -> float:
+        """Return currently available tokens (after refill, minus reservations)."""
+        now = now or time.monotonic()
+        self._refill(now)
+        return max(0.0, self.tokens - self.reserved)
+
+    def try_reserve(self, tokens: int, now: float | None = None) -> bool:
+        """Reserve tokens if available. Returns True on success."""
+        now = now or time.monotonic()
+        self._refill(now)
+        if self.tokens - self.reserved >= tokens:
+            self.reserved += tokens
+            return True
+        return False
+
+    def reconcile(self, estimated: int, actual: int) -> None:
+        """Adjust bucket after response. If actual > estimated, drain extra. If less, refund."""
+        diff = actual - estimated
+        self.reserved = max(0, self.reserved - estimated)
+        if diff > 0:
+            self.tokens = max(0, self.tokens - diff)
+
+    def refund(self, tokens: int) -> None:
+        """Release reserved tokens back (on upstream error)."""
+        self.reserved = max(0, self.reserved - tokens)
+
+    def status(self) -> dict:
+        now = time.monotonic()
+        self._refill(now)
+        return {
+            "tpm_capacity": self.capacity,
+            "tpm_available": int(self.tokens - self.reserved),
+            "tpm_reserved": self.reserved,
+        }
+
+
 class RateLimiter:
     """
     Multi-layer rate limiter for DashScope Coding Plan.
@@ -107,6 +168,7 @@ class RateLimiter:
         self.rps_limit = max(1, int(self.rpm_limit / 60 * sf))
 
         self.rpm_window = SlidingWindowCounter(60)
+        self.tpm_bucket = TokenBucket(self.tpm_limit)
         self.hour5_window = SlidingWindowCounter(5 * 3600)
 
         self.week_count = 0
@@ -132,7 +194,12 @@ class RateLimiter:
         self.last_request_time: float = 0.0
         self._lock = asyncio.Lock()
 
-    async def can_proceed(self) -> tuple[bool, str, float]:
+    async def can_proceed(self, estimated_tokens: int = 0) -> tuple[bool, str, float]:
+        """
+        Check if a request can proceed. Pure read-only check — no side effects.
+        When estimated_tokens > 0, both RPM and TPM must have headroom.
+        Returns (allowed, reason, wait_seconds).
+        """
         async with self._lock:
             now_mono = time.monotonic()
             now_wall = time.time()
@@ -161,6 +228,13 @@ class RateLimiter:
                 wait = 60.0 / self.rpm_limit
                 return False, "RPM limit reached", wait
 
+            if estimated_tokens > 0:
+                avail = self.tpm_bucket.available(now_mono)
+                if avail < estimated_tokens:
+                    shortfall = estimated_tokens - avail
+                    wait = max(1.0, shortfall / self.tpm_bucket.refill_rate)
+                    return False, "TPM limit reached", wait
+
             min_gap = 1.0 / self.rps_limit
             time_since_last = now_mono - self.last_request_time
             if time_since_last < min_gap:
@@ -168,7 +242,20 @@ class RateLimiter:
 
             return True, "ok", 0.0
 
+    async def reserve_tokens(self, estimated_tokens: int) -> bool:
+        """
+        Reserve TPM before sending to upstream. Call this AFTER can_proceed()
+        returns True but BEFORE forwarding the request. Returns False if the
+        bucket no longer has sufficient tokens (race condition guard).
+        """
+        async with self._lock:
+            if estimated_tokens <= 0:
+                return True
+            return self.tpm_bucket.try_reserve(estimated_tokens)
+
     async def record_request(self, tokens_used: int = 0, now: float | None = None):
+        """Record a successfully completed request. Does NOT touch TPM bucket —
+        that is handled by reconcile_tokens() which releases the reservation."""
         async with self._lock:
             now = now or time.monotonic()
             self.rpm_window.add(now)
@@ -179,21 +266,38 @@ class RateLimiter:
             self.total_tokens_consumed += tokens_used
             self.last_request_time = now
 
-    async def remaining_tpm(self) -> int:
+    async def reconcile_tokens(self, estimated: int, actual: int) -> None:
+        """
+        Release the reservation and adjust the bucket after receiving the real
+        token count. The reservation is always for `estimated`; actual usage
+        is reconciled by draining or refunding the difference.
+        """
         async with self._lock:
-            now = time.monotonic()
-            used = sum(
-                estimate_tokens_for_request_cached(e)
-                for e in self.rpm_window.events
-            ) if self.rpm_window.events else 0
-            return max(0, self.tpm_limit - used)
+            if estimated <= 0:
+                return
+            self.tpm_bucket.reconcile(estimated, actual)
+
+    async def refund_tokens(self, estimated_tokens: int) -> None:
+        """Refund reserved tokens when an upstream request fails permanently."""
+        async with self._lock:
+            if estimated_tokens > 0:
+                self.tpm_bucket.refund(estimated_tokens)
+
+    async def remaining_tpm(self) -> int:
+        """Return available TPM in the current minute window."""
+        async with self._lock:
+            return int(self.tpm_bucket.available())
 
     def status(self) -> dict:
         now = time.monotonic()
+        tpm_status = self.tpm_bucket.status()
         return {
             "rps_limit": self.rps_limit,
             "rpm_limit": self.rpm_limit,
             "rpm_current": self.rpm_window.count(now),
+            "tpm_limit": tpm_status["tpm_capacity"],
+            "tpm_available": tpm_status["tpm_available"],
+            "tpm_reserved": tpm_status["tpm_reserved"],
             "requests_5h": self.hour5_window.count(now),
             "requests_5h_limit": self.hour5_limit,
             "requests_week": self.week_count,
@@ -212,26 +316,28 @@ class RateLimiter:
 _token_cache: dict[int, int] = {}
 
 
-def estimate_tokens_for_request_cached(ts: float) -> int:
-    """Cached rough token estimate per tracked event (simplified)."""
-    return 100
-
-
-async def wait_for_slot(rate_limiter: RateLimiter) -> float | None:
+async def wait_for_slot(rate_limiter: RateLimiter, request: web.Request, estimated_tokens: int = 0, deadline_seconds: float = 120.0) -> float | None:
     """
     Wait until the rate limiter allows a request through.
-    Returns total wait time, or None if queue is full.
+    Passes estimated_tokens to can_proceed() for TPM check.
+    Returns total wait time, or None if queue is full, client disconnected, or deadline exceeded.
+    Checks for client disconnect between sleep iterations.
     """
     if rate_limiter.pending_requests > rate_limiter.max_queue_size:
         return None
 
+    deadline = time.monotonic() + deadline_seconds
     total_wait = 0.0
-    while True:
-        allowed, reason, wait = await rate_limiter.can_proceed()
+    while time.monotonic() < deadline:
+        allowed, reason, wait = await rate_limiter.can_proceed(estimated_tokens)
         if allowed:
             return total_wait
 
         if rate_limiter.pending_requests > rate_limiter.max_queue_size:
+            return None
+
+        # Bail if the client gave up while we were sleeping
+        if _client_disconnected(request):
             return None
 
         if "quota" in reason.lower():
@@ -241,12 +347,23 @@ async def wait_for_slot(rate_limiter: RateLimiter) -> float | None:
             jitter = random.uniform(0.05, 0.2)
             wait_time = wait + jitter
 
+        # Don't sleep past deadline — leave a safety buffer
+        remaining = deadline - time.monotonic() - wait_time
+        if remaining < 0:
+            logger.info(
+                "Queue wait exceeded deadline (%.1fs total). Aborting.",
+                total_wait
+            )
+            return None
+
         total_wait += wait_time
         logger.info(
             "Rate limited: %s. Waiting %.1fs before retry...",
             reason, wait_time
         )
         await asyncio.sleep(wait_time)
+
+    return None  # deadline exceeded
 
 
 def extract_tokens_from_response(body: bytes) -> int:
@@ -342,6 +459,8 @@ def _add_ratelimit_headers(response: web.Response, rate_limiter: RateLimiter) ->
     rpm_current = rate_limiter.rpm_window.count(now)
     response.headers["X-RateLimit-Limit"] = str(rate_limiter.rpm_limit)
     response.headers["X-RateLimit-Remaining"] = str(max(0, rate_limiter.rpm_limit - rpm_current))
+    tpm_avail = rate_limiter.tpm_bucket.available(now)
+    response.headers["X-RateLimit-Tokens-Remaining"] = str(int(tpm_avail))
 
 
 def _strip_hop_by_hop(headers: dict) -> dict:
@@ -398,7 +517,6 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     if len(body_bytes) > MAX_BODY_SIZE:
         return _make_error_response(413, b'{"error":"payload too large"}', request_id)
 
-    is_stream = b'"stream": true' in body_bytes
     body = None
     if body_bytes and method == "POST":
         try:
@@ -424,8 +542,10 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
     estimated_tokens = estimate_tokens_for_request(body_bytes) if body_bytes else 0
 
+    is_stream = isinstance(body, dict) and body.get("stream") is True
+
     rate_limiter.pending_requests += 1
-    wait_time = await wait_for_slot(rate_limiter)
+    wait_time = await wait_for_slot(rate_limiter, request, estimated_tokens)
     if wait_time is None:
         rate_limiter.total_rejected += 1
         rate_limiter.pending_requests -= 1
@@ -433,6 +553,17 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         return _make_error_response(
             503,
             json.dumps({"error": "queue full", "retry_after": retry_sec}).encode(),
+            request_id,
+            retry_after=retry_sec,
+        )
+
+    # Reserve TPM before forwarding (post-queue guard — bucket may have drained)
+    if estimated_tokens > 0 and not await rate_limiter.reserve_tokens(estimated_tokens):
+        rate_limiter.pending_requests -= 1
+        retry_sec = max(1, rate_limiter.pending_requests // max(1, rate_limiter.rps_limit))
+        return _make_error_response(
+            503,
+            json.dumps({"error": "TPM quota exceeded while queued", "retry_after": retry_sec}).encode(),
             request_id,
             retry_after=retry_sec,
         )
@@ -473,17 +604,20 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         headers=headers,
                         data=body_bytes,
                     )
+                    stream_prepared = False  # Track if prepare() was called
                     try:
                         # Check for error status codes BEFORE streaming
                         if upstream.status == 429:
                             rate_limiter.total_429s += 1
                             error_body = await upstream.read()
-                            upstream.close()  # Close connection before retrying
+                            upstream.close()
                             retry += 1
                             if retry > rate_limiter.max_retries:
                                 logger.error("%s Max retries exceeded after 429", log_prefix)
+                                await rate_limiter.refund_tokens(estimated_tokens)
                                 resp = web.Response(status=429, body=error_body, content_type="application/json")
                                 resp.headers["X-Request-ID"] = request_id
+                                _add_forwarded_headers(resp, upstream)
                                 return resp
 
                             retry_wait = _compute_backoff(rate_limiter, retry)
@@ -496,10 +630,11 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
                         if 500 <= upstream.status < 600:
                             upstream_body = await upstream.read()
-                            upstream.close()  # Close connection before retrying
+                            upstream.close()
                             retry_5xx += 1
                             if retry_5xx > MAX_5XX_RETRIES:
                                 logger.warning("%s Upstream %d after %d retries", log_prefix, upstream.status, MAX_5XX_RETRIES)
+                                await rate_limiter.refund_tokens(estimated_tokens)
                                 resp = web.Response(status=upstream.status, body=upstream_body)
                                 resp.headers["X-Request-ID"] = request_id
                                 _add_forwarded_headers(resp, upstream)
@@ -516,24 +651,35 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         stream_buffer = b""
                         tokens_from_stream = 0
 
+                        assert 200 <= upstream.status < 400, (
+                            f"Upstream {upstream.status} reached prepare() — "
+                            "this should have triggered a retry, not streaming"
+                        )
+
                         resp = web.StreamResponse(
                             status=upstream.status,
                             headers={"Content-Type": "text/event-stream"},
                         )
                         resp.headers["X-Request-ID"] = request_id
+                        _add_ratelimit_headers(resp, rate_limiter)
                         await resp.prepare(request)
+                        stream_prepared = True
+
                         try:
                             async for chunk in upstream.content:
                                 if _client_disconnected(request):
                                     logger.info("%s Client disconnected mid-stream, aborting", log_prefix)
                                     upstream.close()
-                                    return _make_error_response(499, b'', request_id)
+                                    await rate_limiter.refund_tokens(estimated_tokens)
+                                    return resp
+
                                 stream_buffer += chunk
                                 await resp.write(chunk)
                         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
                             logger.info("%s Client disconnected during stream, aborting", log_prefix)
                             upstream.close()
-                            return _make_error_response(499, b'', request_id)
+                            await rate_limiter.refund_tokens(estimated_tokens)
+                            return resp
 
                         await resp.write_eof()
 
@@ -541,10 +687,14 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         if tokens_from_stream == 0:
                             tokens_from_stream = estimated_tokens
 
+                        await rate_limiter.reconcile_tokens(estimated_tokens, tokens_from_stream)
                         await rate_limiter.record_request(tokens_from_stream)
                         return resp
                     except Exception:
-                        upstream.close()
+                        if not stream_prepared:
+                            await rate_limiter.refund_tokens(estimated_tokens)
+                        if not upstream.closed:
+                            upstream.close()
                         raise
 
                 else:
@@ -558,11 +708,17 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         resp_headers = dict(resp_up.headers)
                         status_code = resp_up.status
 
+                    if _client_disconnected(request):
+                        await rate_limiter.refund_tokens(estimated_tokens)
+                        logger.info("%s Client disconnected after upstream response", log_prefix)
+                        return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
+
                     if status_code == 429:
                         rate_limiter.total_429s += 1
                         retry += 1
                         if retry > rate_limiter.max_retries:
                             logger.error("%s Max retries exceeded after 429", log_prefix)
+                            await rate_limiter.refund_tokens(estimated_tokens)
                             out = web.Response(status=429, body=resp_body, content_type="application/json")
                             out.headers["X-Request-ID"] = request_id
                             return out
@@ -588,6 +744,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         retry_5xx += 1
                         if retry_5xx > MAX_5XX_RETRIES:
                             logger.warning("%s Upstream %d after %d retries", log_prefix, status_code, MAX_5XX_RETRIES)
+                            await rate_limiter.refund_tokens(estimated_tokens)
                             out = web.Response(status=status_code, body=resp_body)
                             out.headers["X-Request-ID"] = request_id
                             _add_forwarded_headers(out, resp_headers)
@@ -604,6 +761,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                     tokens_used = extract_tokens_from_response(resp_body)
                     if tokens_used == 0:
                         tokens_used = estimated_tokens
+                    await rate_limiter.reconcile_tokens(estimated_tokens, tokens_used)
                     await rate_limiter.record_request(tokens_used)
 
                     if status_code != 200:
@@ -625,10 +783,12 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 logger.error("%s Forward error (attempt %d): %s", log_prefix, retry + 1, e)
                 retry += 1
                 if retry > rate_limiter.max_retries:
+                    await rate_limiter.refund_tokens(estimated_tokens)
                     return _make_error_response(502, b'{"error":"proxy forward error"}', request_id)
                 await asyncio.sleep(_compute_backoff(rate_limiter, retry))
                 continue
 
+        await rate_limiter.refund_tokens(estimated_tokens)
         return _make_error_response(502, b'{"error":"proxy forward error"}', request_id)
     finally:
         rate_limiter.pending_requests -= 1
@@ -725,7 +885,16 @@ async def main():
         logger.info("Shutting down...")
 
     logger.info("Draining in-flight requests...")
-    await asyncio.sleep(2)
+    # Block new requests from entering the queue
+    rate_limiter.max_queue_size = 0
+    # Wait until all pending requests finish (poll every 0.5s, max 30s)
+    drain_deadline = time.monotonic() + 30
+    while rate_limiter.pending_requests > 0 and time.monotonic() < drain_deadline:
+        await asyncio.sleep(0.5)
+    if rate_limiter.pending_requests > 0:
+        logger.warning("Shutdown timed out with %d pending requests", rate_limiter.pending_requests)
+    else:
+        logger.info("All in-flight requests drained")
 
     session = app.get("client_session")
     if session and not session.closed:
