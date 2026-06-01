@@ -137,8 +137,12 @@ async def main():
             await pilot.pause()
             await pilot.pause()
             await pilot.pause()
+            # Save SVG (for local preview)
             filepath = tui_app.save_screenshot(filename=f"{basename}.svg", path=screenshot_dir)
             print(f"Saved {filepath}")
+            # Save PNG via PIL from the SVG
+            filepath_png = tui_app.save_screenshot(filename=f"{basename}.png", path=screenshot_dir)
+            print(f"Saved {filepath_png}")
 
     print(f"All screenshots saved to {screenshot_dir}/")
 
