@@ -9,7 +9,8 @@ py -m venv .venv
 .venv\Scripts\Activate.ps1
 py -m pip install -r requirements.txt
 # add your API key to .env (see .env.example)
-py dashscope_proxy.py
+py dashscope_proxy.py           # launches proxy + TUI dashboard
+py dashscope_proxy.py --headless # launches proxy without TUI
 ```
 
 Point your OpenAI-compatible client at `http://127.0.0.1:8899`.
@@ -26,25 +27,25 @@ Real-time rate limiter status, RPM/TPM/quotas with progress bars, connection sta
 
 ### Metrics Tab
 
-Sparkline charts for RPM, tokens-per-minute, and queue depth. Derived metrics (success rate, latency percentiles) and quota reset timers.
+Sparkline charts for RPM, tokens-per-minute, and queue depth. Derived metrics (success rate, latency percentiles), latency histogram, and quota reset timers.
 
 ![Metrics](screenshots/metrics.svg)
 
 ### Logs Tab
 
-Full log viewer with text search and level filtering. Clear and refresh controls.
+Full log viewer with text search, level filtering, time range selection, pause/resume, auto-scroll toggle, and export to file.
 
 ![Logs](screenshots/logs.svg)
 
 ### Models Tab
 
-Per-model usage breakdown: request count, tokens, 429 errors, and average latency.
+Per-model usage breakdown: request count with percentage, tokens, 429 errors, average latency, and totals row. Sortable by requests, tokens, latency, or 429s.
 
 ![Models](screenshots/models.svg)
 
 ### Config Tab
 
-Read-only configuration viewer showing current values and whether each setting came from environment or defaults.
+Configuration viewer with filter, grouped view toggle, and source indicator (environment vs default).
 
 ![Config](screenshots/config.svg)
 
@@ -62,8 +63,18 @@ Read-only configuration viewer showing current values and whether each setting c
 
 ## Features
 
+### Rate Limiting & Quotas
+
 **Multi-layer rate limiting**
 Enforces RPS, RPM, TPM (via Token Bucket), and quotas over 5-hour, weekly, and monthly windows. A configurable safety factor keeps usage below the hard limits.
+
+**TPM token lifecycle**
+TPM is enforced via a Token Bucket with reserve/reconcile/refund semantics. Tokens are reserved before sending to upstream, reconciled with real token counts after the response, and refunded on errors or client disconnects.
+
+**Deadline-bounded queue waits**
+Queue waits respect a configurable deadline (default 120s). The proxy checks for client disconnects between wait iterations and aborts queued requests if the deadline is exceeded.
+
+### Resilience
 
 **Automatic retries**
 Retries 429 and 5xx responses with exponential backoff and jitter.
@@ -71,20 +82,30 @@ Retries 429 and 5xx responses with exponential backoff and jitter.
 **Request queuing**
 Requests that exceed rate limits are placed in a bounded queue instead of failing immediately.
 
+**Circuit breaker**
+Opens circuit on repeated upstream failures, preventing cascade failures and allowing recovery.
+
+### Request Handling
+
 **Developer role mapping**
 Converts `developer` role messages to `system` for upstream compatibility.
 
 **SSE streaming**
 Streams completions through the proxy and aborts if the client disconnects.
 
+**Hop-by-hop header stripping**
+Removes connection-specific headers before forwarding to upstream.
+
+**Client disconnect detection**
+Detects when clients disconnect and refunds TPM tokens, cancels pending requests.
+
+**Session logging**
+All requests and responses are logged to `session_logs/` for audit and debugging.
+
+### Mock & Diagnostics
+
 **Mock model list**
 `GET /v1/models` returns a static list of supported models.
-
-**TPM token lifecycle**
-TPM is enforced via a Token Bucket with reserve/reconcile/refund semantics. Tokens are reserved before sending to upstream, reconciled with real token counts after the response, and refunded on errors or client disconnects.
-
-**Deadline-bounded queue waits**
-Queue waits respect a configurable deadline (default 120s). The proxy checks for client disconnects between wait iterations and aborts queued requests if the deadline is exceeded.
 
 **Interactive TUI dashboard**
 Five-tab dashboard with live metrics, sparkline charts, log viewer with filters, per-model analytics, and configuration viewer. Keyboard-driven navigation.
