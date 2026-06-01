@@ -1,0 +1,172 @@
+#dashboard {
+    layout: vertical;
+    height: 1fr;
+}
+
+#metrics-panel {
+    width: 35%;
+    border: tall green;
+    padding: 0 1;
+    margin: 0;
+}
+
+#log-panel {
+    width: 65%;
+    border: tall blue;
+    padding: 0 1;
+    margin: 0;
+}
+
+.panel-title {
+    text-style: bold;
+    color: $primary;
+    dock: top;
+    padding: 0 1;
+    height: 1;
+}
+
+.spacer {
+    height: 1;
+}
+
+#status-indicator {
+    dock: top;
+    padding: 0 1;
+    text-style: bold;
+    height: 1;
+}
+
+#status-indicator.status-running {
+    color: $success;
+}
+
+#status-indicator.status-stopped {
+    color: $error;
+}
+
+#error-banner {
+    dock: top;
+    padding: 0 1;
+    color: $error;
+    background: $error 10%;
+    height: auto;
+    max-height: 2;
+}
+
+#live-log {
+    height: 1fr;
+}
+
+#token-status {
+    dock: bottom;
+    padding: 0 1;
+    color: $success;
+    height: 1;
+}
+
+DataTable {
+    height: auto;
+}
+
+/* Tabbed content layout */
+TabbedContent {
+    height: 1fr;
+}
+
+TabPane {
+    height: 1fr;
+}
+
+/* Metrics tab */
+#metrics-tab-content {
+    height: 1fr;
+}
+
+#sparkline-row {
+    height: auto;
+    margin: 1 0;
+}
+
+.sparkline-label {
+    width: 10;
+    text-style: bold;
+    color: $primary;
+}
+
+Sparkline {
+    height: 5;
+}
+
+#rpm-sparkline {
+    width: 1fr;
+}
+
+#tpm-sparkline {
+    width: 1fr;
+}
+
+#queue-sparkline {
+    width: 1fr;
+}
+
+.derived-panel {
+    height: auto;
+    padding: 0 1;
+    margin: 1 0;
+    border: round $primary;
+}
+
+.timers-panel {
+    height: auto;
+    padding: 0 1;
+    margin: 1 0;
+    border: round $warning;
+}
+
+.poll-error {
+    height: auto;
+    padding: 0 1;
+    color: $error;
+    background: $error 10%;
+}
+
+.poll-error:empty {
+    display: none;
+}
+
+/* Logs tab */
+#logs-tab-content {
+    height: 1fr;
+}
+
+#filter-bar {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#log-filter {
+    width: 2fr;
+}
+
+#log-level-filter {
+    width: 1fr;
+    margin: 0 1 0 1;
+}
+
+#clear-logs-btn {
+    width: auto;
+}
+
+#live-log-full {
+    height: 1fr;
+}
+
+/* Models tab */
+#model-usage-table {
+    height: 1fr;
+}
+
+/* Config tab */
+#config-table {
+    height: 1fr;
+}

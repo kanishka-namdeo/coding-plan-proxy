@@ -1,0 +1,612 @@
+"""Request handlers for the DashScope proxy."""
+
+import asyncio
+import json
+import logging
+import random
+import sys
+import time
+import typing
+import uuid
+from datetime import datetime, timezone
+
+import aiohttp
+from aiohttp import web
+
+# Resolve mutable constants through the facade at runtime so that tests
+# patching ``dashscope_proxy.TARGET_BASE`` / ``DASHSCOPE_API_KEY`` etc. work.
+# We import immutable things (classes, functions) directly.
+from dashscope_proxy_lib.rate_limiter import RateLimiter
+from dashscope_proxy_lib.session_log import SessionLogWriter
+from dashscope_proxy_lib.logging_config import _log
+from dashscope_proxy_lib.token_utils import (
+    estimate_tokens_for_request, extract_tokens_from_response, extract_tokens_from_stream,
+)
+from dashscope_proxy_lib.request_transform import _is_chat_endpoint, map_developer_to_system
+from dashscope_proxy_lib.http_helpers import (
+    _add_forwarded_headers, _add_ratelimit_headers, _client_disconnected, _compute_backoff,
+    _make_error_response, _strip_hop_by_hop, parse_retry_after,
+)
+from dashscope_proxy_lib.queue import wait_for_slot
+
+
+def _cfg(name: str):
+    """Resolve a constant through the facade module (supports runtime patching by tests)."""
+    _ds = sys.modules.get("dashscope_proxy")
+    if _ds is not None:
+        return getattr(_ds, name)
+    from dashscope_proxy_lib import config as _c
+    return getattr(_c, name)
+
+
+async def handle_request(request: web.Request) -> web.StreamResponse:
+    path = request.path
+    method = request.method
+    rate_limiter = request.app["rate_limiter"]
+    request_start = time.monotonic()
+
+    request_id = request.headers.get("X-Request-ID", f"{uuid.uuid4().hex[:12]}")
+    log_prefix = f"[{request_id}]"
+
+    model_name = None
+    is_stream = False
+    estimated_tokens = 0
+    actual_tokens = 0
+    queue_wait_ms = 0.0
+    retry_count = 0
+    retry_5xx = 0
+    error_reason = None
+    status_code = 200
+
+    session_entry = {
+        "request_id": request_id,
+        "method": method,
+        "path": path,
+    }
+
+    app_shutting_down = request.app.get("shutting_down")
+    if app_shutting_down and app_shutting_down.is_set():
+        error_reason = "shutting_down"
+        status_code = 503
+        _log(logging.WARNING, "request rejected: proxy shutting down",
+             request_id=request_id, method=method, path=path)
+        return _make_error_response(
+            503, b'{"error":"shutting down"}', request_id, retry_after=30
+        )
+
+    # Health / Ready endpoints — no rate limiting, no stats
+    if path == "/health" and method == "GET":
+        return web.json_response({"status": "ok"})
+    if path == "/ready" and method == "GET":
+        session = request.app.get("client_session")
+        ready = session is not None and not session.closed
+        status_code = 200 if ready else 503
+        return web.json_response({"status": "ready" if ready else "not_ready"}, status=status_code)
+
+    if path == "/v1/proxy/status" and method == "GET":
+        return web.json_response(rate_limiter.status())
+
+    if method == "GET" and path in ("/v1/models", "/models"):
+        _log(logging.INFO, "mock model list returned",
+             request_id=request_id, method=method, path=path)
+        resp = web.json_response({"object": "list", "data": [
+            {"id": "qwen3.6-plus", "object": "model"},
+            {"id": "qwen3.5-plus", "object": "model"},
+            {"id": "qwen3-max", "object": "model"},
+            {"id": "qwen3-coder-plus", "object": "model"},
+            {"id": "kimi-k2-5", "object": "model"},
+            {"id": "glm-5-0", "object": "model"},
+            {"id": "MiniMax-M2.5", "object": "model"},
+        ]})
+        resp.headers["X-Request-ID"] = request_id
+        return resp
+
+    body_bytes = await request.read()
+
+    if method == "POST" and not body_bytes:
+        error_reason = "empty_body"
+        status_code = 400
+        _log(logging.WARNING, "request rejected: empty body",
+             request_id=request_id, method=method, path=path, reason="empty_body")
+        session_entry["status_code"] = status_code
+        session_entry["error_reason"] = error_reason
+        _maybe_flush_session_log(request.app, session_entry)
+        return _make_error_response(400, b'{"error":"empty request body"}', request_id)
+
+    if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+        error_reason = "method_not_allowed"
+        status_code = 405
+        _log(logging.WARNING, "request rejected: method not allowed",
+             request_id=request_id, method=method, path=path, reason="method_not_allowed")
+        session_entry["status_code"] = status_code
+        session_entry["error_reason"] = error_reason
+        _maybe_flush_session_log(request.app, session_entry)
+        return _make_error_response(405, b'{"error":"method not allowed"}', request_id)
+
+    if _is_chat_endpoint(path) and method != "POST":
+        error_reason = "method_not_allowed_chat"
+        status_code = 405
+        _log(logging.WARNING, "request rejected: method not allowed for chat endpoint",
+             request_id=request_id, method=method, path=path, reason="method_not_allowed")
+        session_entry["status_code"] = status_code
+        session_entry["error_reason"] = error_reason
+        _maybe_flush_session_log(request.app, session_entry)
+        return _make_error_response(405, b'{"error":"method not allowed"}', request_id)
+
+    if len(body_bytes) > _cfg("MAX_BODY_SIZE"):
+        error_reason = "body_too_large"
+        status_code = 413
+        _log(logging.WARNING, "request rejected: payload too large",
+             request_id=request_id, method=method, path=path,
+             reason="body_too_large", body_size=len(body_bytes))
+        session_entry["status_code"] = status_code
+        session_entry["error_reason"] = error_reason
+        _maybe_flush_session_log(request.app, session_entry)
+        return _make_error_response(413, b'{"error":"payload too large"}', request_id)
+
+    body = None
+    if body_bytes and method == "POST":
+        try:
+            body = json.loads(body_bytes)
+        except json.JSONDecodeError:
+            error_reason = "invalid_json"
+            status_code = 400
+            _log(logging.WARNING, "request rejected: invalid JSON",
+                 request_id=request_id, method=method, path=path, reason="invalid_json")
+            session_entry["status_code"] = status_code
+            session_entry["error_reason"] = error_reason
+            _maybe_flush_session_log(request.app, session_entry)
+            return _make_error_response(400, b'{"error":"invalid JSON"}', request_id)
+
+        if not isinstance(body, dict):
+            error_reason = "invalid_body_type"
+            status_code = 400
+            _log(logging.WARNING, "request rejected: body must be a JSON object",
+                 request_id=request_id, method=method, path=path, reason="invalid_body_type")
+            session_entry["status_code"] = status_code
+            session_entry["error_reason"] = error_reason
+            _maybe_flush_session_log(request.app, session_entry)
+            return _make_error_response(400, b'{"error":"request body must be a JSON object"}', request_id)
+
+        if "model" not in body:
+            error_reason = "missing_model"
+            status_code = 400
+            _log(logging.WARNING, "request rejected: missing model field",
+                 request_id=request_id, method=method, path=path, reason="missing_model")
+            session_entry["status_code"] = status_code
+            session_entry["error_reason"] = error_reason
+            _maybe_flush_session_log(request.app, session_entry)
+            return _make_error_response(400, b'{"error":"missing required field: model"}', request_id)
+
+        messages = body.get("messages")
+        if messages is None or (isinstance(messages, list) and len(messages) == 0):
+            error_reason = "missing_messages"
+            status_code = 400
+            _log(logging.WARNING, "request rejected: missing messages field",
+                 request_id=request_id, method=method, path=path, reason="missing_messages")
+            session_entry["status_code"] = status_code
+            session_entry["error_reason"] = error_reason
+            _maybe_flush_session_log(request.app, session_entry)
+            return _make_error_response(400, b'{"error":"missing required field: messages"}', request_id)
+
+        body = map_developer_to_system(body)
+        try:
+            body_bytes = json.dumps(body).encode()
+        except (TypeError, ValueError) as e:
+            error_reason = "unserializable"
+            status_code = 400
+            _log(logging.WARNING, "request rejected: unserializable body",
+                 request_id=request_id, method=method, path=path, reason="unserializable", error=str(e))
+            session_entry["status_code"] = status_code
+            session_entry["error_reason"] = error_reason
+            _maybe_flush_session_log(request.app, session_entry)
+            return _make_error_response(400, json.dumps({"error": f"unserializable body: {e}"}).encode(), request_id)
+
+    estimated_tokens = estimate_tokens_for_request(body_bytes) if body_bytes else 0
+    model_name = body.get("model") if isinstance(body, dict) else None
+    is_stream = isinstance(body, dict) and body.get("stream") is True
+
+    session_entry["model"] = model_name
+    session_entry["is_stream"] = is_stream
+    session_entry["estimated_tokens"] = estimated_tokens
+
+    rate_limiter.pending_requests += 1
+    try:
+        wait_time = await wait_for_slot(rate_limiter, request, estimated_tokens)
+        if wait_time is None:
+            rate_limiter.total_rejected += 1
+            error_reason = "queue_full"
+            status_code = 503
+            _log(logging.WARNING, "request rejected: queue full",
+                 request_id=request_id, method=method, path=path,
+                 model=model_name, pending=rate_limiter.pending_requests,
+                 max_queue=rate_limiter.max_queue_size)
+            session_entry["status_code"] = status_code
+            session_entry["error_reason"] = error_reason
+            _maybe_flush_session_log(request.app, session_entry)
+            retry_sec = max(1, rate_limiter.pending_requests // max(1, rate_limiter.rps_limit))
+            return _make_error_response(
+                503,
+                json.dumps({"error": "queue full", "retry_after": retry_sec}).encode(),
+                request_id,
+                retry_after=retry_sec,
+            )
+
+        # Reserve TPM before forwarding (post-queue guard — bucket may have drained)
+        if estimated_tokens > 0 and not await rate_limiter.reserve_tokens(estimated_tokens):
+            error_reason = "tpm_reservation_failed"
+            status_code = 503
+            _log(logging.WARNING, "request rejected: TPM reservation failed after queue",
+                 request_id=request_id, method=method, path=path,
+                 model=model_name, estimated_tokens=estimated_tokens)
+            session_entry["status_code"] = status_code
+            session_entry["error_reason"] = error_reason
+            _maybe_flush_session_log(request.app, session_entry)
+            retry_sec = max(1, rate_limiter.pending_requests // max(1, rate_limiter.rps_limit))
+            return _make_error_response(
+                503,
+                json.dumps({"error": "TPM quota exceeded while queued", "retry_after": retry_sec}).encode(),
+                request_id,
+                retry_after=retry_sec,
+            )
+
+        if wait_time > 0:
+            rate_limiter.total_queued += 1
+            queue_wait_ms = round(wait_time * 1000, 1)
+            _log(logging.INFO, "request queued",
+                 request_id=request_id, wait_ms=queue_wait_ms)
+
+        target_path = path if path.startswith("/v1") else f"/v1{path}"
+        target_url = f"{_cfg('TARGET_BASE')}{target_path}"
+        if request.query_string:
+            target_url += f"?{request.query_string}"
+
+        headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in ("host", "transfer-encoding", "content-length", "authorization")
+        }
+        headers["Content-Type"] = "application/json"
+        headers["Authorization"] = f"Bearer {_cfg('DASHSCOPE_API_KEY')}"
+        headers["X-Request-ID"] = request_id
+
+        _log(logging.INFO, "forwarding to upstream",
+             request_id=request_id, method=method, path=path,
+             model=model_name, target_url=target_url,
+             is_stream=is_stream, estimated_tokens=estimated_tokens)
+
+        retry = 0
+        retry_5xx = 0
+
+        while retry <= rate_limiter.max_retries and retry_5xx <= _cfg("MAX_5XX_RETRIES"):
+            try:
+                # Circuit breaker: reject immediately if circuit is open
+                if rate_limiter.circuit_is_open():
+                    error_reason = "circuit_open"
+                    status_code = 503
+                    _log(logging.WARNING, "request rejected: circuit breaker open",
+                         request_id=request_id, failure_count=rate_limiter.circuit_failure_count)
+                    return _make_error_response(
+                        503,
+                        json.dumps({"error": "upstream unavailable", "retry_after": int(rate_limiter.circuit_cooldown)}).encode(),
+                        request_id,
+                        retry_after=int(rate_limiter.circuit_cooldown),
+                    )
+
+                if _client_disconnected(request):
+                    error_reason = "client_disconnected"
+                    status_code = 499
+                    _log(logging.INFO, "client disconnected before upstream",
+                         request_id=request_id)
+                    return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
+
+                if is_stream:
+                    upstream = await request.app["client_session"].request(
+                        method=method,
+                        url=target_url,
+                        headers=headers,
+                        data=body_bytes,
+                    )
+                    stream_prepared = False  # Track if prepare() was called
+                    try:
+                        # Check for error status codes BEFORE streaming
+                        if upstream.status == 429:
+                            rate_limiter.total_429s += 1
+                            error_body = await upstream.read()
+                            upstream.close()
+                            retry += 1
+                            if retry > rate_limiter.max_retries:
+                                error_reason = "max_retries_429"
+                                status_code = 429
+                                _log(logging.ERROR, "max retries exceeded after 429",
+                                     request_id=request_id, model=model_name,
+                                     retry_count=retry, max_retries=rate_limiter.max_retries)
+                                await rate_limiter.refund_tokens(estimated_tokens)
+                                resp = web.Response(status=429, body=error_body, content_type="application/json")
+                                resp.headers["X-Request-ID"] = request_id
+                                _add_forwarded_headers(resp, upstream)
+                                return resp
+
+                            retry_wait = _compute_backoff(rate_limiter, retry)
+                            _log(logging.INFO, "429 received, backing off",
+                                 request_id=request_id, model=model_name,
+                                 attempt=retry, max_retries=rate_limiter.max_retries,
+                                 backoff_seconds=round(retry_wait, 1))
+                            await asyncio.sleep(retry_wait)
+                            continue
+
+                        if 500 <= upstream.status < 600:
+                            upstream_body = await upstream.read()
+                            upstream.close()
+                            retry_5xx += 1
+                            rate_limiter.record_circuit_failure()
+                            if retry_5xx > _cfg("MAX_5XX_RETRIES"):
+                                error_reason = "upstream_5xx"
+                                status_code = upstream.status
+                                _log(logging.WARNING, "upstream 5xx after max retries",
+                                     request_id=request_id, model=model_name,
+                                     status=upstream.status, retry_5xx=retry_5xx,
+                                     max_retries=_cfg("MAX_5XX_RETRIES"))
+                                await rate_limiter.refund_tokens(estimated_tokens)
+                                resp = web.Response(status=upstream.status, body=upstream_body)
+                                resp.headers["X-Request-ID"] = request_id
+                                _add_forwarded_headers(resp, upstream)
+                                return resp
+
+                            retry_wait = 1.0 * (2 ** retry_5xx) * random.uniform(0.5, 1.5)
+                            _log(logging.WARNING, "upstream 5xx, retrying",
+                                 request_id=request_id, model=model_name,
+                                 status=upstream.status, retry_5xx=retry_5xx,
+                                 max_retries=_cfg("MAX_5XX_RETRIES"),
+                                 backoff_seconds=round(retry_wait, 1))
+                            await asyncio.sleep(retry_wait)
+                            continue
+
+                        stream_buffer = b""
+                        tokens_from_stream = 0
+                        buffer_capped = False
+
+                        assert 200 <= upstream.status < 400, (
+                            f"Upstream {upstream.status} reached prepare() — "
+                            "this should have triggered a retry, not streaming"
+                        )
+
+                        _log(logging.DEBUG, "streaming started",
+                             request_id=request_id, model=model_name,
+                             upstream_status=upstream.status)
+
+                        resp = web.StreamResponse(
+                            status=upstream.status,
+                            headers={"Content-Type": "text/event-stream"},
+                        )
+                        resp.headers["X-Request-ID"] = request_id
+                        _add_ratelimit_headers(resp, rate_limiter)
+                        await resp.prepare(request)
+                        stream_prepared = True
+
+                        try:
+                            async for chunk in upstream.content:
+                                if _client_disconnected(request):
+                                    _log(logging.INFO, "client disconnected mid-stream",
+                                         request_id=request_id, model=model_name,
+                                         buffer_size=len(stream_buffer))
+                                    upstream.close()
+                                    await rate_limiter.refund_tokens(estimated_tokens)
+                                    return resp
+
+                                if len(stream_buffer) < _cfg("MAX_STREAM_BUFFER"):
+                                    stream_buffer += chunk
+                                elif not buffer_capped:
+                                    _log(logging.WARNING, "stream buffer cap reached, skipping further buffering",
+                                         request_id=request_id, model=model_name,
+                                         max_buffer=_cfg("MAX_STREAM_BUFFER"))
+                                    buffer_capped = True
+                                await resp.write(chunk)
+                        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+                            _log(logging.INFO, "client disconnected during stream read",
+                                 request_id=request_id, model=model_name,
+                                 buffer_size=len(stream_buffer))
+                            upstream.close()
+                            await rate_limiter.refund_tokens(estimated_tokens)
+                            return resp
+
+                        await resp.write_eof()
+
+                        duration_ms = round((time.monotonic() - request_start) * 1000, 1)
+                        tokens_from_stream = extract_tokens_from_stream(stream_buffer)
+                        if tokens_from_stream == 0:
+                            _log(logging.WARNING, "no token usage found in stream, using estimate",
+                                 request_id=request_id, estimated=estimated_tokens)
+                            tokens_from_stream = estimated_tokens
+
+                        await rate_limiter.reconcile_tokens(estimated_tokens, tokens_from_stream)
+                        await rate_limiter.record_request(tokens_from_stream)
+                        rate_limiter.record_circuit_success()
+                        rate_limiter.record_model_stats(model_name or "unknown", tokens_from_stream, duration_ms)
+                        actual_tokens = tokens_from_stream
+                        status_code = upstream.status
+                        _log(logging.INFO, "stream complete",
+                             request_id=request_id, method=method, path=path,
+                             model=model_name, status_code=upstream.status,
+                             is_stream=True, stream_buffer_bytes=len(stream_buffer),
+                             estimated_tokens=estimated_tokens,
+                             actual_tokens=tokens_from_stream,
+                             duration_ms=duration_ms, queue_wait_ms=queue_wait_ms,
+                             retry_count=retry + retry_5xx)
+                        return resp
+                    except Exception:
+                        if not stream_prepared:
+                            await rate_limiter.refund_tokens(estimated_tokens)
+                        if not upstream.closed:
+                            upstream.close()
+                        raise
+
+                else:
+                    async with request.app["client_session"].request(
+                        method=method,
+                        url=target_url,
+                        headers=headers,
+                        data=body_bytes,
+                    ) as resp_up:
+                        resp_body = await resp_up.read()
+                        resp_headers = dict(resp_up.headers)
+                        status_code = resp_up.status
+
+                    if _client_disconnected(request):
+                        error_reason = "client_disconnected"
+                        await rate_limiter.refund_tokens(estimated_tokens)
+                        _log(logging.INFO, "client disconnected after upstream response",
+                             request_id=request_id, model=model_name)
+                        return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
+
+                    if status_code == 429:
+                        rate_limiter.total_429s += 1
+                        retry += 1
+                        retry_after_raw = resp_headers.get("Retry-After")
+                        if retry > rate_limiter.max_retries:
+                            error_reason = "max_retries_429"
+                            _log(logging.ERROR, "max retries exceeded after 429",
+                                 request_id=request_id, model=model_name,
+                                 retry_count=retry, max_retries=rate_limiter.max_retries)
+                            await rate_limiter.refund_tokens(estimated_tokens)
+                            out = web.Response(status=429, body=resp_body, content_type="application/json")
+                            out.headers["X-Request-ID"] = request_id
+                            if retry_after_raw:
+                                out.headers["Retry-After"] = retry_after_raw
+                            return out
+                        if retry_after_raw:
+                            parsed = parse_retry_after(retry_after_raw)
+                            if parsed is not None:
+                                wait = parsed
+                            else:
+                                wait = _compute_backoff(rate_limiter, retry)
+                        else:
+                            wait = _compute_backoff(rate_limiter, retry)
+
+                        _log(logging.INFO, "429 received, backing off",
+                             request_id=request_id, model=model_name,
+                             attempt=retry, max_retries=rate_limiter.max_retries,
+                             backoff_seconds=round(wait, 1))
+                        await asyncio.sleep(wait)
+                        continue
+
+                    if 500 <= status_code < 600:
+                        retry_5xx += 1
+                        rate_limiter.record_circuit_failure()
+                        if retry_5xx > _cfg("MAX_5XX_RETRIES"):
+                            error_reason = "upstream_5xx"
+                            _log(logging.WARNING, "upstream 5xx after max retries",
+                                 request_id=request_id, model=model_name,
+                                 status=status_code, retry_5xx=retry_5xx,
+                                 max_retries=_cfg("MAX_5XX_RETRIES"))
+                            await rate_limiter.refund_tokens(estimated_tokens)
+                            out = web.Response(status=status_code, body=resp_body)
+                            out.headers["X-Request-ID"] = request_id
+                            _add_forwarded_headers(out, resp_headers)
+                            return out
+
+                        retry_wait = 1.0 * (2 ** retry_5xx) * random.uniform(0.5, 1.5)
+                        _log(logging.WARNING, "upstream 5xx, retrying",
+                             request_id=request_id, model=model_name,
+                             status=status_code, retry_5xx=retry_5xx,
+                             max_retries=_cfg("MAX_5XX_RETRIES"),
+                             backoff_seconds=round(retry_wait, 1))
+                        await asyncio.sleep(retry_wait)
+                        continue
+
+                    tokens_used = extract_tokens_from_response(resp_body)
+                    if tokens_used == 0:
+                        tokens_used = estimated_tokens
+                    duration_ms = round((time.monotonic() - request_start) * 1000, 1)
+                    await rate_limiter.reconcile_tokens(estimated_tokens, tokens_used)
+                    await rate_limiter.record_request(tokens_used)
+                    rate_limiter.record_circuit_success()
+                    rate_limiter.record_model_stats(model_name or "unknown", tokens_used, duration_ms)
+
+                    _log(logging.DEBUG, "token reconciliation",
+                         request_id=request_id, estimated=estimated_tokens,
+                         actual=tokens_used,
+                         diff=tokens_used - estimated_tokens)
+
+                    if status_code != 200:
+                        _log(logging.ERROR, "upstream non-200 response",
+                             request_id=request_id, model=model_name,
+                             status=status_code,
+                             body_preview=resp_body[:500].decode(errors="replace"))
+
+                    content_type = resp_headers.get("Content-Type", "application/json")
+                    content_type = content_type.split(";")[0].strip()
+                    out = web.Response(
+                        status=status_code,
+                        body=resp_body,
+                        content_type=content_type,
+                    )
+                    out.headers["X-Request-ID"] = request_id
+                    _add_forwarded_headers(out, resp_headers)
+                    _add_ratelimit_headers(out, rate_limiter)
+
+                    duration_ms = round((time.monotonic() - request_start) * 1000, 1)
+                    actual_tokens = tokens_used
+                    _log(logging.INFO, "request complete",
+                         request_id=request_id, method=method, path=path,
+                         model=model_name, status_code=status_code,
+                         is_stream=False,
+                         estimated_tokens=estimated_tokens,
+                         actual_tokens=actual_tokens,
+                         duration_ms=duration_ms, queue_wait_ms=queue_wait_ms,
+                         retry_count=retry + retry_5xx)
+                    return out
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                _log(logging.ERROR, "forward error",
+                     request_id=request_id, method=method, path=path,
+                     model=model_name, target_url=target_url,
+                     attempt=retry + 1, error_type=type(e).__name__,
+                     error=str(e))
+                rate_limiter.record_circuit_failure()
+                retry += 1
+                if retry > rate_limiter.max_retries:
+                    error_reason = "max_retries_exceeded"
+                    status_code = 502
+                    await rate_limiter.refund_tokens(estimated_tokens)
+                    return _make_error_response(502, b'{"error":"proxy forward error"}', request_id)
+                await asyncio.sleep(_compute_backoff(rate_limiter, retry))
+                continue
+
+        error_reason = "max_retries_exhausted"
+        status_code = 502
+        await rate_limiter.refund_tokens(estimated_tokens)
+        return _make_error_response(502, b'{"error":"proxy forward error"}', request_id)
+    finally:
+        rate_limiter.pending_requests = max(0, rate_limiter.pending_requests - 1)
+        session_log: SessionLogWriter | None = request.app.get("session_log")
+        if session_log is not None:
+            session_entry["status_code"] = status_code
+            session_entry["actual_tokens"] = actual_tokens
+            duration_ms = round((time.monotonic() - request_start) * 1000, 1)
+            session_entry["duration_ms"] = duration_ms
+            session_entry["queue_wait_ms"] = queue_wait_ms
+            session_entry["retry_count"] = retry + retry_5xx
+            session_entry["error_reason"] = error_reason
+            session_entry["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
+            try:
+                with session_log._lock:
+                    session_log.log(session_entry)
+            except Exception as e:
+                _log(logging.ERROR, "session log write failed", request_id=request_id, error=str(e))
+
+
+def _maybe_flush_session_log(app: web.Application, entry: dict) -> None:
+    """Best-effort session log write for early-exit paths outside the main try/finally."""
+    session_log: SessionLogWriter | None = app.get("session_log")
+    if session_log is None:
+        return
+    entry.setdefault("actual_tokens", 0)
+    entry.setdefault("duration_ms", 0.0)
+    entry.setdefault("queue_wait_ms", 0.0)
+    entry.setdefault("retry_count", 0)
+    entry.setdefault("timestamp_utc", datetime.now(timezone.utc).isoformat())
+    try:
+        with session_log._lock:
+            session_log.log(entry)
+    except Exception:
+        pass

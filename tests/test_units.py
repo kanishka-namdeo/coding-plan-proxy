@@ -3,11 +3,14 @@ import json
 import time
 import asyncio
 import os
+import sys
+import logging
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone
 from email.utils import formatdate
 
 import pytest
+import aiohttp
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +164,90 @@ class TestRateLimiterConcurrency:
 
 
 # ---------------------------------------------------------------------------
+# TokenBucket
+# ---------------------------------------------------------------------------
+
+class TestTokenBucket:
+    def test_reserve_success(self, dashscope_module):
+        bucket = dashscope_module.TokenBucket(capacity=1000)
+        now = bucket.last_refill
+        assert bucket.try_reserve(100, now=now) is True
+        assert bucket.reserved == 100
+        assert bucket.available(now=now) == 900.0
+
+    def test_reserve_failure_insufficient_tokens(self, dashscope_module):
+        bucket = dashscope_module.TokenBucket(capacity=1000)
+        now = bucket.last_refill
+        assert bucket.try_reserve(900, now=now) is True
+        assert bucket.available(now=now) == 100.0
+        assert bucket.try_reserve(200, now=now) is False
+
+    def test_reserve_zero_tokens_always_succeeds(self, dashscope_module):
+        bucket = dashscope_module.TokenBucket(capacity=100)
+        bucket.tokens = 0.0
+        bucket.last_refill = time.monotonic()
+        assert bucket.try_reserve(0) is True
+
+    def test_reconcile_actual_greater_than_estimated(self, dashscope_module):
+        """If actual usage > estimated, drain the extra from the bucket."""
+        bucket = dashscope_module.TokenBucket(capacity=1000)
+        now = bucket.last_refill
+        bucket.try_reserve(100, now=now)
+        bucket.reconcile(estimated=100, actual=150)
+        assert bucket.reserved == 0
+        # tokens = 1000 - (150 - 100) = 950; reconcile drains diff from tokens, not estimated
+        assert bucket.tokens == 950.0
+
+    def test_reconcile_actual_less_than_estimated(self, dashscope_module):
+        """If actual usage < estimated, refund unused tokens."""
+        bucket = dashscope_module.TokenBucket(capacity=1000)
+        now = bucket.last_refill
+        bucket.try_reserve(100, now=now)
+        bucket.reconcile(estimated=100, actual=60)
+        assert bucket.reserved == 0
+        assert bucket.tokens == 1000.0  # no extra drain since we used less
+
+    def test_refund_tokens(self, dashscope_module):
+        bucket = dashscope_module.TokenBucket(capacity=1000)
+        now = bucket.last_refill
+        bucket.try_reserve(200, now=now)
+        assert bucket.reserved == 200
+        bucket.refund(200)
+        assert bucket.reserved == 0
+        assert bucket.available(now=now) == 1000.0
+
+    def test_available_after_refill(self, dashscope_module):
+        """Tokens refill over time at the correct rate."""
+        bucket = dashscope_module.TokenBucket(capacity=1000, window_seconds=60)
+        now = bucket.last_refill
+        bucket.tokens = 500.0
+        assert bucket.available(now=now + 30) == 1000.0  # 500 + 30 * (1000/60) = 1000 (capped)
+
+    def test_status_dict_shape(self, dashscope_module):
+        bucket = dashscope_module.TokenBucket(capacity=1000)
+        status = bucket.status()
+        assert "tpm_capacity" in status
+        assert "tpm_available" in status
+        assert "tpm_reserved" in status
+        assert status["tpm_capacity"] == 1000
+
+    def test_available_never_negative(self, dashscope_module):
+        bucket = dashscope_module.TokenBucket(capacity=100)
+        now = bucket.last_refill
+        bucket.tokens = 0.0
+        # available() calls _refill(now) first, which adds a tiny amount
+        # so we just check it doesn't go below 0
+        assert bucket.available(now=now) >= 0.0
+
+    def test_refund_cannot_go_negative(self, dashscope_module):
+        """Refunding more than reserved should clamp to 0."""
+        bucket = dashscope_module.TokenBucket(capacity=1000)
+        bucket.reserved = 50
+        bucket.refund(200)
+        assert bucket.reserved == 0
+
+
+# ---------------------------------------------------------------------------
 # Token extraction
 # ---------------------------------------------------------------------------
 
@@ -248,17 +335,710 @@ class TestParseRetryAfter:
         assert dashscope_module.parse_retry_after("2.5") == 2.5
 
     def test_http_date_future(self, dashscope_module):
-        future = datetime.now(timezone.utc).timestamp() + 60
-        header = formatdate(timeval=future, usegmt=True)
-        result = dashscope_module.parse_retry_after(header)
+        # Use a fixed date 60 seconds in the future
+        now = datetime.now(timezone.utc)
+        future_dt = now + __import__("datetime").timedelta(seconds=60)
+        header = formatdate(timeval=future_dt.timestamp(), usegmt=True)
+        # parse_retry_after calls datetime.now(timezone.utc) internally
+        # We mock at the module level where the function is used
+        with patch("dashscope_proxy.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            mock_dt.timezone = timezone
+            mock_dt.datetime = datetime
+            result = dashscope_module.parse_retry_after(header)
         assert result is not None
-        assert 30 < result < 90  # roughly 60s
+        assert 55 < result < 65
 
     def test_http_date_past(self, dashscope_module):
-        past = datetime.now(timezone.utc).timestamp() - 10
-        header = formatdate(timeval=past, usegmt=True)
-        result = dashscope_module.parse_retry_after(header)
+        now = datetime.now(timezone.utc)
+        past_dt = now - __import__("datetime").timedelta(seconds=10)
+        header = formatdate(timeval=past_dt.timestamp(), usegmt=True)
+        with patch("dashscope_proxy.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            mock_dt.timezone = timezone
+            mock_dt.datetime = datetime
+            result = dashscope_module.parse_retry_after(header)
         assert result == 0.5  # clamped to minimum
 
     def test_invalid_string(self, dashscope_module):
         assert dashscope_module.parse_retry_after("not-a-number") is None
+
+    def test_empty_string(self, dashscope_module):
+        assert dashscope_module.parse_retry_after("") is None
+
+
+# ---------------------------------------------------------------------------
+# _strip_hop_by_hop
+# ---------------------------------------------------------------------------
+
+class TestStripHopByHop:
+    def test_removes_hop_by_hop_headers(self, dashscope_module):
+        headers = {
+            "Content-Type": "application/json",
+            "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
+            "X-Custom": "value",
+        }
+        result = dashscope_module._strip_hop_by_hop(headers)
+        assert "Connection" not in result
+        assert "Transfer-Encoding" not in result
+        assert result["Content-Type"] == "application/json"
+        assert result["X-Custom"] == "value"
+
+    def test_preserves_normal_headers(self, dashscope_module):
+        headers = {
+            "X-Request-ID": "abc123",
+            "Cache-Control": "no-cache",
+            "Content-Type": "text/plain",
+        }
+        result = dashscope_module._strip_hop_by_hop(headers)
+        assert result == headers
+
+
+# ---------------------------------------------------------------------------
+# _compute_backoff
+# ---------------------------------------------------------------------------
+
+class TestComputeBackoff:
+    def test_backoff_grows_with_attempt(self, dashscope_module):
+        config = {
+            "rpm_limit": 100, "tpm_limit": 1_000_000, "safety_factor": 0.8,
+            "requests_per_5h": 1000, "requests_per_week": 1000,
+            "requests_per_month": 1000, "max_queue_size": 10,
+            "max_retries": 5, "base_backoff": 1.0,
+        }
+        rl = dashscope_module.RateLimiter(config)
+        # Seed random to make the test deterministic
+        with patch.object(dashscope_module.random, "uniform", return_value=1.0):
+            b1 = dashscope_module._compute_backoff(rl, 1)
+            b3 = dashscope_module._compute_backoff(rl, 3)
+            b5 = dashscope_module._compute_backoff(rl, 5)
+        # With jitter fixed at 1.0: b1=2, b3=8, b5=32
+        assert b5 > b3 > b1
+        assert b1 == 2.0
+        assert b3 == 8.0
+        assert b5 == 32.0
+
+    def test_backoff_respects_base_config(self, dashscope_module):
+        config = {
+            "rpm_limit": 100, "tpm_limit": 1_000_000, "safety_factor": 0.8,
+            "requests_per_5h": 1000, "requests_per_week": 1000,
+            "requests_per_month": 1000, "max_queue_size": 10,
+            "max_retries": 5, "base_backoff": 0.5,
+        }
+        rl = dashscope_module.RateLimiter(config)
+        with patch.object(dashscope_module.random, "uniform", return_value=1.0):
+            b = dashscope_module._compute_backoff(rl, 0)
+        # 0.5 * 2^0 * 1.0 = 0.5
+        assert b == 0.5
+
+
+# ---------------------------------------------------------------------------
+# _is_chat_endpoint
+# ---------------------------------------------------------------------------
+
+class TestIsChatEndpoint:
+    def test_matches_chat_completions(self, dashscope_module):
+        assert dashscope_module._is_chat_endpoint("/v1/chat/completions") is True
+        assert dashscope_module._is_chat_endpoint("/chat/completions") is True
+        assert dashscope_module._is_chat_endpoint("/V1/CHAT/COMPLETIONS") is True
+
+    def test_non_chat_endpoints(self, dashscope_module):
+        assert dashscope_module._is_chat_endpoint("/health") is False
+        assert dashscope_module._is_chat_endpoint("/v1/models") is False
+        assert dashscope_module._is_chat_endpoint("/v1/proxy/status") is False
+
+
+# ---------------------------------------------------------------------------
+# _add_forwarded_headers
+# ---------------------------------------------------------------------------
+
+class TestAddForwardedHeaders:
+    def test_forwards_meaningful_headers_strips_hop_by_hop(self, dashscope_module):
+        response = MagicMock()
+        response.headers = {}
+        upstream = {
+            "Content-Type": "application/json",
+            "Connection": "keep-alive",
+            "X-Request-ID": "abc123",
+            "X-RateLimit-Limit": "100",
+            "Content-Length": "512",
+        }
+        dashscope_module._add_forwarded_headers(response, upstream)
+        assert response.headers.get("X-Request-ID") == "abc123"
+        assert response.headers.get("X-RateLimit-Limit") == "100"
+        assert "Connection" not in response.headers
+        # Content-Type and Content-Length should NOT be forwarded (explicitly excluded)
+        assert "Content-Type" not in response.headers
+        assert "Content-Length" not in response.headers
+
+    def test_works_with_client_response(self, dashscope_module):
+        response = MagicMock()
+        response.headers = {}
+        # Simulate what _add_forwarded_headers does when given an object with .headers
+        mock_resp_headers = {
+            "X-Custom-Header": "val",
+            "Keep-Alive": "timeout=5",
+        }
+        # Test the dict path (the function checks isinstance for ClientResponse)
+        dashscope_module._add_forwarded_headers(response, mock_resp_headers)
+        assert response.headers.get("X-Custom-Header") == "val"
+        assert "Keep-Alive" not in response.headers
+
+
+# ---------------------------------------------------------------------------
+# estimate_tokens_for_request edge cases
+# ---------------------------------------------------------------------------
+
+class TestEstimateTokensEdgeCases:
+    def test_non_list_messages(self, dashscope_module):
+        body = json.dumps({"messages": "not a list"}).encode()
+        assert dashscope_module.estimate_tokens_for_request(body) == 100
+
+    def test_content_not_string(self, dashscope_module):
+        body = json.dumps({
+            "messages": [{"role": "user", "content": ["array", "content"]}]
+        }).encode()
+        # Non-string content is skipped, total_chars = 0, clamped to 100
+        assert dashscope_module.estimate_tokens_for_request(body) == 100
+
+    def test_extremely_long_content(self, dashscope_module):
+        long_content = "x" * 100_000
+        body = json.dumps({
+            "messages": [{"role": "user", "content": long_content}]
+        }).encode()
+        est = dashscope_module.estimate_tokens_for_request(body)
+        assert est == 100_000 // 4  # ~25000
+
+    def test_invalid_json(self, dashscope_module):
+        assert dashscope_module.estimate_tokens_for_request(b"not json") == 100
+
+    def test_missing_messages_field(self, dashscope_module):
+        body = json.dumps({"model": "qwen3-coder-plus"}).encode()
+        assert dashscope_module.estimate_tokens_for_request(body) == 100
+
+
+# ---------------------------------------------------------------------------
+# extract_tokens_from_stream edge cases
+# ---------------------------------------------------------------------------
+
+class TestExtractStreamTokensEdgeCases:
+    def test_empty_buffer(self, dashscope_module):
+        assert dashscope_module.extract_tokens_from_stream(b"") == 0
+
+    def test_only_done_marker(self, dashscope_module):
+        assert dashscope_module.extract_tokens_from_stream(b"data: [DONE]\n\n") == 0
+
+    def test_malformed_utf8(self, dashscope_module):
+        # Invalid UTF-8 bytes
+        data = b'\xff\xfe data: {"usage": {"total_tokens": 10}}'
+        # Should not raise, return 0 (or parse with replacement chars)
+        dashscope_module.extract_tokens_from_stream(data)
+
+
+# ---------------------------------------------------------------------------
+# StructuredLogFormatter
+# ---------------------------------------------------------------------------
+
+class TestStructuredLogFormatter:
+    def test_json_output_shape(self, dashscope_module):
+        formatter = dashscope_module.StructuredLogFormatter()
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=1,
+            msg="test message", args=(), exc_info=None,
+        )
+        output = formatter.format(record)
+        data = json.loads(output)
+        assert "timestamp" in data
+        assert "level" in data
+        assert "logger" in data
+        assert "message" in data
+        assert data["message"] == "test message"
+
+    def test_extra_context_included(self, dashscope_module):
+        formatter = dashscope_module.StructuredLogFormatter()
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=1,
+            msg="with context", args=(), exc_info=None,
+        )
+        record.extra_context = {"request_id": "abc", "status": 200}
+        output = formatter.format(record)
+        data = json.loads(output)
+        assert data["request_id"] == "abc"
+        assert data["status"] == 200
+
+    def test_exception_included(self, dashscope_module):
+        formatter = dashscope_module.StructuredLogFormatter()
+        try:
+            raise ValueError("test error")
+        except ValueError:
+            exc_info = sys.exc_info()
+        record = logging.LogRecord(
+            name="test", level=logging.ERROR, pathname="", lineno=1,
+            msg="error occurred", args=(), exc_info=exc_info,
+        )
+        output = formatter.format(record)
+        data = json.loads(output)
+        assert "exception" in data
+        assert "ValueError" in data["exception"]
+        assert "test error" in data["exception"]
+
+
+# ---------------------------------------------------------------------------
+# wait_for_slot
+# ---------------------------------------------------------------------------
+
+class TestWaitForSlot:
+    @pytest.mark.asyncio
+    async def test_immediate_success_under_limits(self, dashscope_module):
+        config = {
+            "rpm_limit": 100, "tpm_limit": 1_000_000, "safety_factor": 0.8,
+            "requests_per_5h": 1000, "requests_per_week": 1000,
+            "requests_per_month": 1000, "max_queue_size": 10,
+            "max_retries": 5, "base_backoff": 0.1,
+        }
+        rl = dashscope_module.RateLimiter(config)
+        req = MagicMock()
+        req.transport = MagicMock()
+        req.transport.is_closing.return_value = False
+        result = await dashscope_module.wait_for_slot(rl, req, estimated_tokens=0, deadline_seconds=5.0)
+        assert result is not None  # should succeed immediately
+        assert result == 0.0  # no wait needed
+
+    @pytest.mark.asyncio
+    async def test_none_when_queue_full(self, dashscope_module):
+        config = {
+            "rpm_limit": 100, "tpm_limit": 1_000_000, "safety_factor": 0.8,
+            "requests_per_5h": 1000, "requests_per_week": 1000,
+            "requests_per_month": 1000, "max_queue_size": 0,
+            "max_retries": 5, "base_backoff": 0.1,
+        }
+        rl = dashscope_module.RateLimiter(config)
+        rl.pending_requests = 1  # exceeds max_queue_size (0)
+        req = MagicMock()
+        req.transport = MagicMock()
+        req.transport.is_closing.return_value = False
+        result = await dashscope_module.wait_for_slot(rl, req, estimated_tokens=0, deadline_seconds=5.0)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_none_when_client_disconnects(self, dashscope_module):
+        config = {
+            "rpm_limit": 10,  # after safety_factor 0.8 -> 8, not 0
+            "tpm_limit": 1_000_000, "safety_factor": 0.8,
+            "requests_per_5h": 1000, "requests_per_week": 1000,
+            "requests_per_month": 1000, "max_queue_size": 10,
+            "max_retries": 5, "base_backoff": 0.01,
+        }
+        rl = dashscope_module.RateLimiter(config)
+        # Exhaust RPM so it must wait (RPM limit = int(10 * 0.8) = 8)
+        for _ in range(8):
+            rl.rpm_window.add(now=time.monotonic())
+        req = MagicMock()
+        req.transport = MagicMock()
+        # Client disconnects during wait
+        req.transport.is_closing.return_value = True
+        result = await dashscope_module.wait_for_slot(rl, req, estimated_tokens=0, deadline_seconds=5.0)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# SessionLogWriter
+# ---------------------------------------------------------------------------
+
+class TestSessionLogWriter:
+    def test_creates_directory_and_file(self, dashscope_module, tmp_path):
+        log_dir = tmp_path / "logs"
+        assert not log_dir.exists()
+        writer = dashscope_module.SessionLogWriter(str(log_dir))
+        writer.log({"request_id": "abc123"})
+        writer.close()
+
+        assert log_dir.exists()
+        today = dashscope_module.datetime.now(dashscope_module.timezone.utc).strftime("%Y-%m-%d")
+        log_file = log_dir / f"{today}.jsonl"
+        assert log_file.exists()
+
+        content = log_file.read_text(encoding="utf-8")
+        entry = json.loads(content.strip().split("\n")[0])
+        assert entry["request_id"] == "abc123"
+
+    def test_appends_multiple_entries(self, dashscope_module, tmp_path):
+        log_dir = tmp_path / "logs2"
+        writer = dashscope_module.SessionLogWriter(str(log_dir))
+        writer.log({"request_id": "req1"})
+        writer.log({"request_id": "req2"})
+        writer.log({"request_id": "req3"})
+        writer.close()
+
+        today = dashscope_module.datetime.now(dashscope_module.timezone.utc).strftime("%Y-%m-%d")
+        log_file = log_dir / f"{today}.jsonl"
+        lines = log_file.read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 3
+        assert json.loads(lines[0])["request_id"] == "req1"
+        assert json.loads(lines[2])["request_id"] == "req3"
+
+    def test_each_line_is_valid_json(self, dashscope_module, tmp_path):
+        log_dir = tmp_path / "logs3"
+        writer = dashscope_module.SessionLogWriter(str(log_dir))
+        entries = [
+            {"request_id": "a", "status_code": 200, "model": "qwen3-coder-plus"},
+            {"request_id": "b", "status_code": 429, "error_reason": "max_retries_429"},
+            {"request_id": "c", "status_code": 500, "actual_tokens": 1200},
+        ]
+        for entry in entries:
+            writer.log(entry)
+        writer.close()
+
+        today = dashscope_module.datetime.now(dashscope_module.timezone.utc).strftime("%Y-%m-%d")
+        log_file = log_dir / f"{today}.jsonl"
+        for line in log_file.read_text(encoding="utf-8").strip().split("\n"):
+            parsed = json.loads(line)
+            assert "request_id" in parsed
+
+    def test_close_is_noop_when_already_closed(self, dashscope_module, tmp_path):
+        log_dir = tmp_path / "logs4"
+        writer = dashscope_module.SessionLogWriter(str(log_dir))
+        writer.log({"request_id": "x"})
+        writer.close()
+        writer.close()
+
+    def test_log_entry_schema_fields(self, dashscope_module, tmp_path):
+        log_dir = tmp_path / "logs5"
+        writer = dashscope_module.SessionLogWriter(str(log_dir))
+        entry = {
+            "request_id": "test123",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "model": "qwen3-coder-plus",
+            "is_stream": True,
+            "estimated_tokens": 500,
+            "status_code": 200,
+            "actual_tokens": 620,
+            "duration_ms": 1234.5,
+            "queue_wait_ms": 0.0,
+            "retry_count": 0,
+            "error_reason": None,
+            "timestamp_utc": dashscope_module.datetime.now(dashscope_module.timezone.utc).isoformat(),
+        }
+        writer.log(entry)
+        writer.close()
+
+        today = dashscope_module.datetime.now(dashscope_module.timezone.utc).strftime("%Y-%m-%d")
+        log_file = log_dir / f"{today}.jsonl"
+        parsed = json.loads(log_file.read_text(encoding="utf-8").strip())
+        assert parsed["status_code"] == 200
+        assert parsed["actual_tokens"] == 620
+        assert parsed["duration_ms"] == 1234.5
+        assert parsed["error_reason"] is None
+        assert parsed["is_stream"] is True
+
+
+# ---------------------------------------------------------------------------
+# TUILogHandler
+# ---------------------------------------------------------------------------
+
+class TestTUILogHandler:
+    def test_emit_and_get_logs(self, dashscope_module):
+        handler = dashscope_module.TUILogHandler(max_size=100)
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=1,
+            msg="hello", args=(), exc_info=None,
+        )
+        handler.emit(record)
+        logs = handler.get_logs()
+        assert len(logs) == 1
+        assert logs[0]["message"] == "hello"
+        assert logs[0]["level"] == "INFO"
+        assert "seq" in logs[0]
+
+    def test_sequence_numbers_monotonic(self, dashscope_module):
+        handler = dashscope_module.TUILogHandler(max_size=100)
+        for i in range(5):
+            record = logging.LogRecord(
+                name="test", level=logging.INFO, pathname="", lineno=1,
+                msg=f"msg-{i}", args=(), exc_info=None,
+            )
+            handler.emit(record)
+        logs = handler.get_logs()
+        seqs = [e["seq"] for e in logs]
+        assert seqs == sorted(seqs)
+        assert len(set(seqs)) == 5  # all unique
+
+    def test_get_logs_from_seq(self, dashscope_module):
+        handler = dashscope_module.TUILogHandler(max_size=100)
+        for i in range(5):
+            record = logging.LogRecord(
+                name="test", level=logging.INFO, pathname="", lineno=1,
+                msg=f"msg-{i}", args=(), exc_info=None,
+            )
+            handler.emit(record)
+        # Get only entries with seq >= 3
+        logs = handler.get_logs(from_seq=3)
+        assert len(logs) == 2
+        assert all(e["seq"] >= 3 for e in logs)
+
+    def test_clear_resets_seq(self, dashscope_module):
+        handler = dashscope_module.TUILogHandler(max_size=100)
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=1,
+            msg="hello", args=(), exc_info=None,
+        )
+        handler.emit(record)
+        assert handler._next_seq == 1
+        handler.clear()
+        assert handler._next_seq == 0
+        assert len(handler.get_logs()) == 0
+
+    def test_no_dropped_logs_on_wrap(self, dashscope_module):
+        """When buffer wraps, seq-based retrieval should still work."""
+        handler = dashscope_module.TUILogHandler(max_size=3)
+        for i in range(5):
+            record = logging.LogRecord(
+                name="test", level=logging.INFO, pathname="", lineno=1,
+                msg=f"msg-{i}", args=(), exc_info=None,
+            )
+            handler.emit(record)
+        # Buffer holds last 3: msg-2, msg-3, msg-4
+        logs = handler.get_logs(from_seq=0)
+        assert len(logs) == 3
+        msgs = [e["message"] for e in logs]
+        assert msgs == ["msg-2", "msg-3", "msg-4"]
+
+
+# ---------------------------------------------------------------------------
+# _client_disconnected
+# ---------------------------------------------------------------------------
+
+class TestClientDisconnected:
+    def test_disconnected_when_transport_closing(self, dashscope_module):
+        req = MagicMock()
+        req.transport.is_closing.return_value = True
+        assert dashscope_module._client_disconnected(req) is True
+
+    def test_connected_when_transport_open(self, dashscope_module):
+        req = MagicMock()
+        req.transport.is_closing.return_value = False
+        assert dashscope_module._client_disconnected(req) is False
+
+    def test_no_transport_attribute(self, dashscope_module):
+        req = MagicMock(spec=[])  # no transport attribute
+        assert dashscope_module._client_disconnected(req) is False
+
+    def test_transport_without_is_closing(self, dashscope_module):
+        req = MagicMock()
+        req.transport = MagicMock(spec=[])  # no is_closing
+        assert dashscope_module._client_disconnected(req) is False
+
+
+# ---------------------------------------------------------------------------
+# _make_error_response
+# ---------------------------------------------------------------------------
+
+class TestMakeErrorResponse:
+    def test_basic_response(self, dashscope_module):
+        resp = dashscope_module._make_error_response(400, b'{"error":"bad"}', "req123")
+        assert resp.status == 400
+        assert resp.headers.get("X-Request-ID") == "req123"
+        assert resp.content_type == "application/json"
+
+    def test_response_with_retry_after(self, dashscope_module):
+        resp = dashscope_module._make_error_response(503, b'{"error":"busy"}', "req123", retry_after=30)
+        assert resp.status == 503
+        assert resp.headers.get("Retry-After") == "30"
+
+    def test_response_without_retry_after(self, dashscope_module):
+        resp = dashscope_module._make_error_response(400, b'{"error":"bad"}', "req123", retry_after=None)
+        assert "Retry-After" not in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# RateLimiter token management methods
+# ---------------------------------------------------------------------------
+
+class TestRateLimiterTokenManagement:
+    @pytest.mark.asyncio
+    async def test_reserve_tokens_success(self, rate_limiter):
+        assert await rate_limiter.reserve_tokens(100) is True
+
+    @pytest.mark.asyncio
+    async def test_reserve_tokens_zero(self, rate_limiter):
+        assert await rate_limiter.reserve_tokens(0) is True
+
+    @pytest.mark.asyncio
+    async def test_reconcile_tokens(self, rate_limiter):
+        await rate_limiter.reserve_tokens(100)
+        await rate_limiter.reconcile_tokens(100, 120)
+        # Should release reservation and drain extra 20 from bucket
+
+    @pytest.mark.asyncio
+    async def test_refund_tokens(self, rate_limiter):
+        await rate_limiter.reserve_tokens(100)
+        await rate_limiter.refund_tokens(100)
+        # Should release the reservation
+
+    @pytest.mark.asyncio
+    async def test_remaining_tpm(self, rate_limiter):
+        tpm = await rate_limiter.remaining_tpm()
+        assert isinstance(tpm, int)
+        assert tpm >= 0
+
+    def test_is_queue_full(self, rate_limiter):
+        assert rate_limiter.is_queue_full() is False
+        rate_limiter.pending_requests = rate_limiter.max_queue_size + 1
+        assert rate_limiter.is_queue_full() is True
+
+    def test_is_queue_full_boundary(self, rate_limiter):
+        rate_limiter.pending_requests = rate_limiter.max_queue_size
+        assert rate_limiter.is_queue_full() is False
+        rate_limiter.pending_requests = rate_limiter.max_queue_size + 1
+        assert rate_limiter.is_queue_full() is True
+
+
+# ---------------------------------------------------------------------------
+# Circuit Breaker
+# ---------------------------------------------------------------------------
+
+class TestCircuitBreaker:
+    def test_circuit_closed_initially(self, rate_limiter):
+        assert rate_limiter.circuit_is_open() is False
+
+    def test_circuit_opens_after_threshold(self, rate_limiter):
+        rate_limiter.circuit_threshold = 3
+        rate_limiter.record_circuit_failure()
+        rate_limiter.record_circuit_failure()
+        assert rate_limiter.circuit_is_open() is False  # not yet
+        rate_limiter.record_circuit_failure()
+        assert rate_limiter.circuit_is_open() is True  # opened
+
+    def test_circuit_closes_on_success(self, rate_limiter):
+        rate_limiter.circuit_threshold = 1
+        rate_limiter.record_circuit_failure()
+        assert rate_limiter.circuit_is_open() is True
+        rate_limiter.record_circuit_success()
+        assert rate_limiter.circuit_is_open() is False
+        assert rate_limiter.circuit_failure_count == 0
+
+    def test_status_includes_circuit_fields(self, rate_limiter):
+        status = rate_limiter.status()
+        assert "circuit_open" in status
+        assert "circuit_failure_count" in status
+
+
+# ---------------------------------------------------------------------------
+# SessionLogWriter edge cases
+# ---------------------------------------------------------------------------
+
+class TestSessionLogWriterEdgeCases:
+    def test_file_rotation_across_midnight(self, dashscope_module, tmp_path):
+        log_dir = tmp_path / "rotation_logs"
+        writer = dashscope_module.SessionLogWriter(str(log_dir))
+        # Start with a mocked date
+        old_dt = dashscope_module.datetime(2025, 1, 1, tzinfo=dashscope_module.timezone.utc)
+        new_dt = dashscope_module.datetime(2025, 6, 2, tzinfo=dashscope_module.timezone.utc)
+
+        # First log with old date
+        with patch("dashscope_proxy.datetime") as mock_dt:
+            mock_dt.now.return_value = old_dt
+            mock_dt.timezone = dashscope_module.timezone
+            mock_dt.datetime = dashscope_module.datetime
+            writer.log({"request_id": "req1"})
+
+        # Simulate date change in internal state and log with new date
+        writer._current_date = "2025-01-01"
+        with patch("dashscope_proxy.datetime") as mock_dt:
+            mock_dt.now.return_value = new_dt
+            mock_dt.timezone = dashscope_module.timezone
+            mock_dt.datetime = dashscope_module.datetime
+            writer.log({"request_id": "req2"})
+        writer.close()
+
+        old_file = log_dir / "2025-01-01.jsonl"
+        new_file = log_dir / "2025-06-02.jsonl"
+        assert old_file.exists()
+        assert new_file.exists()
+        assert json.loads(old_file.read_text().strip())["request_id"] == "req1"
+        assert json.loads(new_file.read_text().strip())["request_id"] == "req2"
+
+
+# ---------------------------------------------------------------------------
+# TokenBucket edge cases
+# ---------------------------------------------------------------------------
+
+class TestTokenBucketEdgeCases:
+    def test_refill_with_negative_elapsed(self, dashscope_module):
+        """Clock adjustment: last_refill is in the future."""
+        bucket = dashscope_module.TokenBucket(capacity=1000, window_seconds=60)
+        future = time.monotonic() + 100  # simulate clock went backwards
+        bucket.tokens = 500.0
+        bucket.last_refill = future
+        # available() calls _refill(now) which should handle negative elapsed
+        result = bucket.available(now=time.monotonic())
+        assert result >= 0  # should not go negative
+
+
+# ---------------------------------------------------------------------------
+# SlidingWindowCounter thread safety
+# ---------------------------------------------------------------------------
+
+class TestSlidingWindowCounterThreadSafety:
+    def test_concurrent_add_and_count(self, dashscope_module):
+        """Multiple threads adding and counting simultaneously should not raise."""
+        import threading
+        sw = dashscope_module.SlidingWindowCounter(60, max_size=1000)
+        errors = []
+
+        def add_events():
+            try:
+                for i in range(50):
+                    sw.add(now=100.0 + i)
+            except Exception as e:
+                errors.append(e)
+
+        def count_events():
+            try:
+                for _ in range(50):
+                    sw.count(now=100.0 + 25)
+            except Exception as e:
+                errors.append(e)
+
+        threads = []
+        for _ in range(4):
+            t = threading.Thread(target=add_events)
+            threads.append(t)
+            t = threading.Thread(target=count_events)
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Thread safety errors: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# _load_config
+# ---------------------------------------------------------------------------
+
+class TestLoadConfig:
+    def test_default_config(self, dashscope_module, monkeypatch):
+        # Ensure no env vars interfere
+        for key in dashscope_module.CODING_PLAN_CONFIG:
+            monkeypatch.delenv(f"PROXY_{key.upper()}", raising=False)
+        config = dashscope_module._load_config()
+        assert config == dashscope_module.CODING_PLAN_CONFIG
+
+    def test_env_var_override(self, dashscope_module, monkeypatch):
+        monkeypatch.setenv("PROXY_RPM_LIMIT", "24")
+        monkeypatch.setenv("PROXY_MAX_RETRIES", "10")
+        config = dashscope_module._load_config()
+        assert config["rpm_limit"] == 24
+        assert config["max_retries"] == 10
+        # Other keys unchanged
+        assert config["tpm_limit"] == dashscope_module.CODING_PLAN_CONFIG["tpm_limit"]
+
+    def test_invalid_env_var_uses_default(self, dashscope_module, monkeypatch):
+        monkeypatch.setenv("PROXY_RPM_LIMIT", "not-a-number")
+        config = dashscope_module._load_config()
+        assert config["rpm_limit"] == dashscope_module.CODING_PLAN_CONFIG["rpm_limit"]

@@ -1,6 +1,6 @@
 # Coding Plan Proxy
 
-An HTTP proxy for the DashScope Coding API with rate limiting, request queuing, and automatic retries.
+An HTTP proxy for the DashScope Coding API with rate limiting, request queuing, automatic retries, and a rich Textual TUI dashboard.
 
 ## Quick Start
 
@@ -13,6 +13,52 @@ py dashscope_proxy.py
 ```
 
 Point your OpenAI-compatible client at `http://127.0.0.1:8899`.
+
+## TUI Dashboard
+
+Run the proxy to launch the interactive TUI dashboard. Monitor rate limits, quotas, request metrics, live logs, per-model usage, and configuration in real time.
+
+### Overview Tab
+
+Real-time rate limiter status, RPM/TPM/quotas with progress bars, connection status, request statistics with success rate, and live log feed.
+
+![Overview](screenshots/overview.svg)
+
+### Metrics Tab
+
+Sparkline charts for RPM, tokens-per-minute, and queue depth. Derived metrics (success rate, latency percentiles) and quota reset timers.
+
+![Metrics](screenshots/metrics.svg)
+
+### Logs Tab
+
+Full log viewer with text search and level filtering. Clear and refresh controls.
+
+![Logs](screenshots/logs.svg)
+
+### Models Tab
+
+Per-model usage breakdown: request count, tokens, 429 errors, and average latency.
+
+![Models](screenshots/models.svg)
+
+### Config Tab
+
+Read-only configuration viewer showing current values and whether each setting came from environment or defaults.
+
+![Config](screenshots/config.svg)
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `1` | Overview tab |
+| `2` | Metrics tab |
+| `3` | Logs tab |
+| `4` | Models tab |
+| `5` | Config tab |
+| `r` | Clear logs |
+| `q` | Quit |
 
 ## Features
 
@@ -39,6 +85,9 @@ TPM is enforced via a Token Bucket with reserve/reconcile/refund semantics. Toke
 
 **Deadline-bounded queue waits**
 Queue waits respect a configurable deadline (default 120s). The proxy checks for client disconnects between wait iterations and aborts queued requests if the deadline is exceeded.
+
+**Interactive TUI dashboard**
+Five-tab dashboard with live metrics, sparkline charts, log viewer with filters, per-model analytics, and configuration viewer. Keyboard-driven navigation.
 
 ## Endpoints
 

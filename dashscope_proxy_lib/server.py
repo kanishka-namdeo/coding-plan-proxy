@@ -1,0 +1,160 @@
+"""Server lifecycle: app factory, resource management, and entry point."""
+
+import asyncio
+import logging
+import signal
+import time
+
+import aiohttp
+from aiohttp import web
+
+from dashscope_proxy_lib.config import (
+    DASHSCOPE_API_KEY, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_HOST, PROXY_HOST,
+    PROXY_PORT, TARGET_BASE, UPSTREAM_TIMEOUT_CONNECT, UPSTREAM_TIMEOUT_TOTAL,
+)
+from dashscope_proxy_lib.rate_limiter import RateLimiter
+from dashscope_proxy_lib.session_log import SessionLogWriter, SESSION_LOG_DIR, SESSION_LOG_ENABLED
+from dashscope_proxy_lib.logging_config import _log, tui_handler
+from dashscope_proxy_lib.handlers import handle_request
+from dashscope_proxy_lib.config import _load_config
+
+
+def create_app() -> web.Application:
+    app = web.Application()
+    app.add_routes([web.route("*", "/{tail:.*}", handle_request)])
+    return app
+
+
+async def create_proxy_resources() -> tuple[RateLimiter, web.Application, web.AppRunner]:
+    """Create and start all proxy resources (rate limiter, app, client session, runner).
+
+    Returns (rate_limiter, app, runner) ready for TUI integration.
+    """
+    if not DASHSCOPE_API_KEY:
+        _log(logging.ERROR, "DASHSCOPE_API_KEY not set")
+        raise SystemExit(1)
+
+    config = _load_config()
+    rate_limiter = RateLimiter(config)
+
+    app = create_app()
+    timeout = aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_TOTAL, connect=UPSTREAM_TIMEOUT_CONNECT)
+    connector = aiohttp.TCPConnector(
+        limit=MAX_CONNECTIONS,
+        limit_per_host=MAX_CONNECTIONS_PER_HOST,
+        ttl_dns_cache=300,
+    )
+    app["client_session"] = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    app["rate_limiter"] = rate_limiter
+    app["shutting_down"] = asyncio.Event()
+    if SESSION_LOG_ENABLED:
+        app["session_log"] = SessionLogWriter(SESSION_LOG_DIR)
+        _log(logging.INFO, "session log writer initialized", log_dir=SESSION_LOG_DIR)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, PROXY_HOST, PROXY_PORT)
+    await site.start()
+
+    _log(logging.INFO, "proxy started",
+         host=PROXY_HOST, port=PROXY_PORT, target=TARGET_BASE,
+         rps=rate_limiter.rps_limit, rpm=rate_limiter.rpm_limit,
+         tpm=rate_limiter.tpm_limit,
+         quota_5h=rate_limiter.hour5_limit,
+         quota_week=rate_limiter.week_limit,
+         quota_month=rate_limiter.month_limit,
+         safety_factor=config["safety_factor"])
+
+    # Signal handlers
+    shutdown_event = app["shutting_down"]
+
+    def _handle_signal():
+        if not shutdown_event.is_set():
+            _log(logging.INFO, "shutdown signal received")
+            shutdown_event.set()
+
+    loop = asyncio.get_event_loop()
+    try:
+        loop.add_signal_handler(signal.SIGTERM, _handle_signal)
+        loop.add_signal_handler(signal.SIGINT, _handle_signal)
+    except (NotImplementedError, OSError):
+        _log(logging.INFO, "signal handlers not supported on this platform")
+
+    return rate_limiter, app, runner
+
+
+async def cleanup_proxy_resources(
+    app: web.Application,
+    runner: web.AppRunner,
+) -> None:
+    """Gracefully shut down the proxy: drain requests, close session, cleanup runner."""
+    rate_limiter: RateLimiter = app["rate_limiter"]
+    shutdown_event = app.get("shutting_down")
+    if shutdown_event and not shutdown_event.is_set():
+        shutdown_event.set()
+
+    _log(logging.INFO, "draining in-flight requests")
+    rate_limiter.max_queue_size = 0
+    drain_deadline = time.monotonic() + 30
+    while rate_limiter.pending_requests > 0 and time.monotonic() < drain_deadline:
+        await asyncio.sleep(0.5)
+    if rate_limiter.pending_requests > 0:
+        _log(logging.WARNING, "shutdown timed out with pending requests",
+             pending=rate_limiter.pending_requests)
+    else:
+        _log(logging.INFO, "all in-flight requests drained")
+
+    _log(logging.INFO, "final metrics", metrics=rate_limiter.status())
+
+    session = app.get("client_session")
+    if session and not session.closed:
+        await session.close()
+    session_log = app.get("session_log")
+    if session_log:
+        session_log.close()
+        _log(logging.INFO, "session log writer closed")
+    await runner.cleanup()
+    _log(logging.INFO, "shutdown complete")
+
+
+async def main(headless: bool = False):
+    """Entry point: create proxy resources, then launch TUI with shared event loop."""
+    rate_limiter, app, runner = await create_proxy_resources()
+
+    tui_app = None
+    try:
+        if not headless:
+            from proxy_tui import ProxyTUI
+            import threading
+
+            tui_app = ProxyTUI(
+                rate_limiter=rate_limiter,
+                tui_log_handler=tui_handler,
+                proxy_app=app,
+            )
+
+            def run_tui():
+                tui_app.run()
+
+            tui_thread = threading.Thread(target=run_tui, daemon=True, name="tui-thread")
+            tui_thread.start()
+            _log(logging.INFO, "TUI started in background thread")
+
+            # Wait for shutdown signal
+            await app["shutting_down"].wait()
+            _log(logging.INFO, "shutdown signal received, closing TUI")
+            tui_app.exit()
+            tui_thread.join(timeout=5)
+        else:
+            _log(logging.INFO, "proxy running in headless mode (no TUI)")
+            await app["shutting_down"].wait()
+    finally:
+        await cleanup_proxy_resources(app, runner)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="DashScope API Proxy")
+    parser.add_argument("--headless", action="store_true", help="Run without TUI")
+    args = parser.parse_args()
+    asyncio.run(main(headless=args.headless))

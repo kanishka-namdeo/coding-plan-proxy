@@ -86,3 +86,9 @@ def make_test_config(dashscope_module):
             "base_backoff": 0.05,
         }
     return _make
+
+
+@pytest.fixture
+def token_bucket(dashscope_module):
+    """Create a TokenBucket with small capacity for fast tests."""
+    return dashscope_module.TokenBucket(capacity=1000)
