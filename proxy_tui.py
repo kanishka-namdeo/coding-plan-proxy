@@ -3,6 +3,7 @@
 import time
 import math
 import statistics
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -47,17 +48,21 @@ class MetricHistory:
     rpm_samples: list[int] = field(default_factory=list)
     tpm_used_samples: list[int] = field(default_factory=list)
     queue_samples: list[int] = field(default_factory=list)
+    upstream_latency_samples: list[float] = field(default_factory=list)
 
-    def append(self, rpm: int, tpm_used: int, queue_depth: int):
+    def append(self, rpm: int, tpm_used: int, queue_depth: int, upstream_latency_ms: float = 0.0):
         self.rpm_samples.append(rpm)
         self.tpm_used_samples.append(tpm_used)
         self.queue_samples.append(queue_depth)
+        self.upstream_latency_samples.append(upstream_latency_ms)
         if len(self.rpm_samples) > self.max_length:
             self.rpm_samples = self.rpm_samples[-self.max_length:]
         if len(self.tpm_used_samples) > self.max_length:
             self.tpm_used_samples = self.tpm_used_samples[-self.max_length:]
         if len(self.queue_samples) > self.max_length:
             self.queue_samples = self.queue_samples[-self.max_length:]
+        if len(self.upstream_latency_samples) > self.max_length:
+            self.upstream_latency_samples = self.upstream_latency_samples[-self.max_length:]
 
 
 @dataclass
@@ -123,23 +128,11 @@ class ProxyTUI(App):
         ("q", "quit", "Quit"),
         ("r", "clear_logs", "Clear Logs"),
         ("1", "switch_to('tab-overview')", "Overview"),
-        ("2", "switch_to('tab-metrics')", "Metrics"),
-        ("3", "switch_to('tab-logs')", "Logs"),
+        ("2", "switch_to('tab-logs')", "Logs"),
+        ("3", "switch_to('tab-metrics')", "Metrics"),
         ("4", "switch_to('tab-models')", "Models"),
         ("5", "switch_to('tab-config')", "Config"),
     ]
-
-    last_log_seq: int = 0
-    error_count: int = 0
-    _poll_error_count: int = 0
-
-    _REQUIRED_STATUS_KEYS = {
-        "rps_limit", "rpm_limit", "rpm_current", "tpm_limit", "tpm_available",
-        "tpm_reserved", "requests_5h", "requests_5h_limit", "requests_week",
-        "requests_week_limit", "requests_month", "requests_month_limit",
-        "total_forwarded", "total_queued", "total_429s", "total_rejected",
-        "total_tokens_consumed", "pending_requests",
-    }
 
     def __init__(
         self,
@@ -155,42 +148,63 @@ class ProxyTUI(App):
         self.latency_tracker = LatencyTracker()
         self._config_snapshot: dict = {}
 
+        # Logs tab state
+        self._logs_paused: bool = False
+        self._autoscroll_enabled: bool = True
+        self._log_seqs: dict[str, int] = {}
+        self._displayed_log_count: int = 0
+
+        # Models tab state
+        self._model_filter: str = ""
+        self._model_sort_key: str = "requests"
+
+        # Config tab state
+        self._config_filter: str = ""
+        self._config_grouped: bool = False
+
+        # Alert tracking
+        self._active_alerts: list[dict] = []
+
+        # Cancellable sleep for the poll worker
+        self._shutdown_event = threading.Event()
+
+        # Poller state
+        self.error_count = 0
+        self._poll_error_count = 0
+
+        # Keys that must be present in rate_limiter.status() for metrics updates
+        self._REQUIRED_STATUS_KEYS: set[str] = {
+            "rps_limit", "rpm_limit", "rpm_current",
+            "tpm_limit", "tpm_available", "tpm_reserved",
+            "requests_5h", "requests_5h_limit",
+            "requests_week", "requests_week_limit",
+            "requests_month", "requests_month_limit",
+            "total_forwarded", "queue_drops", "total_429s", "total_rejected",
+            "total_tokens_consumed", "total_request_bytes", "total_response_bytes",
+            "pending_requests", "circuit_open", "circuit_failure_count",
+            "model_usage", "recent_latencies", "uptime_seconds",
+        }
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with TabbedContent(id="main-tabs", initial="tab-overview"):
-            # Tab 1: Overview (enhanced existing dashboard)
+            # Tab 1: Overview (primary operational dashboard)
             with TabPane("Overview", id="tab-overview"):
                 with Horizontal():
                     with Vertical(id="metrics-panel"):
                         yield Static("Proxy: Checking...", id="status-indicator")
+                        yield Static("", id="alert-badge", classes="alert-badge")
                         yield Static("Rate Limiter", classes="panel-title")
                         yield DataTable(id="rl-metrics")
                         yield Static("", classes="spacer")
                         yield Static("Request Statistics", classes="panel-title")
                         yield DataTable(id="request-stats")
                     with Vertical(id="log-panel"):
-                        yield Static("Live Logs", classes="panel-title")
+                        yield Static("Alerts & Warnings", classes="panel-title")
                         yield Static("", id="error-banner", classes="error-banner")
                         yield Log(id="live-log")
-                        yield Static("", id="token-status", classes="token-bar")
 
-            # Tab 2: Metrics (sparklines + derived metrics + timers)
-            with TabPane("Metrics", id="tab-metrics"):
-                with Vertical(id="metrics-tab-content"):
-                    yield Horizontal(
-                        Static("RPM", id="rpm-sparkline-label", classes="sparkline-label"),
-                        Sparkline([], id="rpm-sparkline"),
-                        Static("TPM Used", id="tpm-sparkline-label", classes="sparkline-label"),
-                        Sparkline([], id="tpm-sparkline"),
-                        Static("Queue", id="queue-sparkline-label", classes="sparkline-label"),
-                        Sparkline([], id="queue-sparkline"),
-                        id="sparkline-row",
-                    )
-                    yield Static("", id="derived-metrics-panel", classes="derived-panel")
-                    yield Static("", id="quota-timers-panel", classes="timers-panel")
-                    yield Static("", id="poll-error-banner", classes="poll-error")
-
-            # Tab 3: Logs (full log viewer with filter)
+            # Tab 2: Logs (moved from position 3 - critical for debugging)
             with TabPane("Logs", id="tab-logs"):
                 with Vertical(id="logs-tab-content"):
                     yield Horizontal(
@@ -201,18 +215,67 @@ class ProxyTUI(App):
                             id="log-level-filter",
                             allow_blank=False,
                         ),
+                        Select(
+                            [("All Time", "ALL"), ("Last 5 min", "5m"), ("Last 1 hour", "1h"), ("Last 24 hours", "24h")],
+                            value="ALL",
+                            id="log-time-range",
+                            allow_blank=False,
+                        ),
                         Button("Clear", id="clear-logs-btn", variant="error"),
                         id="filter-bar",
                     )
+                    yield Horizontal(
+                        Button("Pause", id="pause-logs-btn", variant="default"),
+                        Button("Export", id="export-logs-btn", variant="default"),
+                        Button("Auto-scroll: ON", id="autoscroll-btn", variant="default"),
+                        Static("", id="log-entry-count", classes="entry-count"),
+                        id="log-controls-bar",
+                    )
                     yield Log(id="live-log-full")
 
-            # Tab 4: Models (per-model breakdown)
-            with TabPane("Models", id="tab-models"):
-                yield DataTable(id="model-usage-table")
+            # Tab 3: Metrics (sparklines + derived metrics + timers) - REORGANIZED layout
+            with TabPane("Metrics", id="tab-metrics"):
+                with Vertical(id="metrics-tab-content"):
+                    yield Static("", id="derived-metrics-panel", classes="derived-panel")
+                    yield Horizontal(
+                        Static("RPM", id="rpm-sparkline-label", classes="sparkline-label"),
+                        Sparkline([], id="rpm-sparkline"),
+                        Static("TPM Used", id="tpm-sparkline-label", classes="sparkline-label"),
+                        Sparkline([], id="tpm-sparkline"),
+                        Static("Queue", id="queue-sparkline-label", classes="sparkline-label"),
+                        Sparkline([], id="queue-sparkline"),
+                        Static("Upstream Latency", id="upstream-latency-sparkline-label", classes="sparkline-label"),
+                        Sparkline([], id="upstream-latency-sparkline"),
+                        id="sparkline-row",
+                    )
+                    yield Static("", id="latency-histogram-panel", classes="histogram-panel")
+                    yield Static("", id="poll-error-banner", classes="poll-error")
 
-            # Tab 5: Config (read-only config viewer)
+            # Tab 4: Models (per-model breakdown with sort/filter)
+            with TabPane("Models", id="tab-models"):
+                with Vertical(id="models-tab-content"):
+                    yield Horizontal(
+                        Input(placeholder="Filter models by name...", id="model-filter"),
+                        Select(
+                            [("Sort: Requests", "requests"), ("Sort: Tokens", "tokens"), ("Sort: Latency", "latency"), ("Sort: 429s", "429s")],
+                            value="requests",
+                            id="model-sort",
+                            allow_blank=False,
+                        ),
+                        id="model-controls",
+                    )
+                    yield DataTable(id="model-usage-table")
+
+            # Tab 5: Config (config viewer with filter and grouped view)
             with TabPane("Config", id="tab-config"):
-                yield DataTable(id="config-table")
+                with Vertical(id="config-tab-content"):
+                    yield Horizontal(
+                        Input(placeholder="Filter config keys...", id="config-filter"),
+                        Button("Grouped", id="config-grouped-btn", variant="default"),
+                        Button("Refresh", id="config-refresh-btn", variant="default"),
+                        id="config-controls",
+                    )
+                    yield DataTable(id="config-table")
 
         yield Footer()
 
@@ -235,7 +298,7 @@ class ProxyTUI(App):
         # Configure model usage table
         try:
             model_table = self.query_one("#model-usage-table", DataTable)
-            model_table.add_columns("Model", "Requests", "Tokens", "429s", "Avg Latency")
+            model_table.add_columns("Model", "Requests", "Tokens", "429s", "Avg Latency", "p50", "p95")
             model_table.show_header = True
             model_table.zebra_stripes = True
         except NoMatches:
@@ -273,26 +336,34 @@ class ProxyTUI(App):
             interval = base_interval
             status = None
             try:
+                # Respect cancellation even during sleep
+                if worker.is_cancelled:
+                    break
                 status = self.rate_limiter.status()
 
                 # Update history buffers for sparklines
                 tpm_used = status.get("tpm_limit", 0) - status.get("tpm_available", 0)
+                # Compute avg upstream latency from recent latencies
+                recent_lats = status.get("recent_latencies", [])
+                avg_upstream = statistics.mean(recent_lats) if recent_lats else 0.0
                 self.history.append(
                     rpm=status.get("rpm_current", 0),
                     tpm_used=tpm_used,
                     queue_depth=status.get("pending_requests", 0),
+                    upstream_latency_ms=avg_upstream,
                 )
 
-                # Update latency tracker
-                self.latency_tracker.add_batch(status.get("recent_latencies", []))
+                # Update latency tracker with fresh data (replace to avoid duplicates)
+                self.latency_tracker.latencies = list(status.get("recent_latencies", []))
 
                 # Update all UI components
                 self.call_from_thread(self._update_metrics, status)
                 self.call_from_thread(self._poll_logs)
                 self.call_from_thread(self._update_sparklines)
                 self.call_from_thread(self._update_derived_metrics, status)
-                self.call_from_thread(self._update_quota_timers, status)
+                self.call_from_thread(self._update_latency_histogram)
                 self.call_from_thread(self._update_model_table, status)
+                self.call_from_thread(self._update_config_table_filtered)
 
                 consecutive_errors = 0
 
@@ -311,7 +382,11 @@ class ProxyTUI(App):
                 else:
                     interval = base_interval * (2 ** consecutive_errors)
 
-            time.sleep(interval)
+            # Use an event for cancellable sleep (worker.cancel() won't
+            # interrupt time.sleep, so we wait on an event instead).
+            self._shutdown_event.wait(timeout=interval)
+            if self._shutdown_event.is_set():
+                break
 
     def _show_poll_error(self) -> None:
         """Display a transient error banner when polling fails."""
@@ -337,34 +412,38 @@ class ProxyTUI(App):
         status_widget.set_class(is_running, "status-running")
         status_widget.set_class(not is_running, "status-stopped")
 
+        # Update alert badge
+        self._update_alert_badge(status)
+
         rl_table = self.query_one("#rl-metrics", DataTable)
         rl_table.clear()
         rl_table.add_row("RPS Limit", str(status.get("rps_limit", 0)))
 
-        # RPM with reset timer
+        # RPM (sliding window - no fixed reset time)
         rpm_current = status.get("rpm_current", 0)
         rpm_limit = status.get("rpm_limit", 1)
-        rpm_reset_in = max(0, 60 - (time.time() % 60))
         rl_table.add_row(
             "RPM",
-            f"{_progress_bar(rpm_current, rpm_limit)} | resets in {int(rpm_reset_in)}s",
+            _progress_bar(rpm_current, rpm_limit),
         )
 
         rl_table.add_row(
             "TPM Available",
             _progress_bar(status.get("tpm_available", 0), status.get("tpm_limit", 1)),
         )
+
+        # Quota rows (all use sliding windows - no fixed reset times)
         rl_table.add_row(
             "5-Hour Quota",
-            _progress_bar(status.get("requests_5h", 0), status.get("requests_5h_limit", 1)),
+            _progress_bar(status.get('requests_5h', 0), status.get('requests_5h_limit', 1)),
         )
         rl_table.add_row(
             "Weekly Quota",
-            _progress_bar(status.get("requests_week", 0), status.get("requests_week_limit", 1)),
+            _progress_bar(status.get('requests_week', 0), status.get('requests_week_limit', 1)),
         )
         rl_table.add_row(
             "Monthly Quota",
-            _progress_bar(status.get("requests_month", 0), status.get("requests_month_limit", 1)),
+            _progress_bar(status.get('requests_month', 0), status.get('requests_month_limit', 1)),
         )
 
         # Circuit breaker status
@@ -373,12 +452,20 @@ class ProxyTUI(App):
         elif status.get("circuit_failure_count", 0) > 0:
             rl_table.add_row("Circuit", "closed ({} failures)".format(status.get("circuit_failure_count", 0)))
 
+        # Token summary
+        rl_table.add_row(
+            "Tokens",
+            f"{_fmt_number(status.get('total_tokens_consumed', 0))} consumed | "
+            f"{_fmt_number(status.get('tpm_reserved', 0))} reserved | "
+            f"{_fmt_number(status.get('tpm_limit', 0))} capacity",
+        )
+
         # Quota warning row
         warning = self._quota_warning(status)
         if warning:
             rl_table.add_row("Warning", warning)
 
-        # Request statistics with derived success rate
+        # Request statistics (streamlined - removed duplicates that appear in Metrics tab)
         stats_table = self.query_one("#request-stats", DataTable)
         stats_table.clear()
         total_fwd = status.get("total_forwarded", 0)
@@ -387,24 +474,23 @@ class ProxyTUI(App):
         total_attempts = total_fwd + total_rejected + total_429s
         success_rate = (total_fwd / total_attempts * 100) if total_attempts > 0 else 0.0
 
+        total_request_bytes = status.get("total_request_bytes", 0)
+        total_response_bytes = status.get("total_response_bytes", 0)
+        avg_req_size = _fmt_number(total_request_bytes // total_fwd) if total_fwd > 0 else "0"
+        avg_resp_size = _fmt_number(total_response_bytes // total_fwd) if total_fwd > 0 else "0"
+
         stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
-        stats_table.add_row("Success Rate", f"{success_rate:.1f}%")
-        stats_table.add_row("Total Queued", _fmt_number(status.get("total_queued", 0)))
-        stats_table.add_row("Total 429s", _fmt_number(total_429s))
-        stats_table.add_row("Total Rejected", _fmt_number(total_rejected))
-        stats_table.add_row("Pending", str(status.get("pending_requests", 0)))
+        stats_table.add_row("Queue Drops", str(status.get("queue_drops", 0)))
+        queue_p50 = status.get("queue_p50_ms", 0)
+        queue_p95 = status.get("queue_p95_ms", 0)
+        queue_p99 = status.get("queue_p99_ms", 0)
+        stats_table.add_row("Queue Wait (p50/p95/p99)", f"{queue_p50}ms / {queue_p95}ms / {queue_p99}ms")
         stats_table.add_row(
             "Tokens Consumed",
             _fmt_number(status.get("total_tokens_consumed", 0)),
         )
-
-        # Token status bar
-        token_bar = self.query_one("#token-status", Static)
-        token_bar.update(
-            f"TPM: {_fmt_number(status.get('tpm_available', 0))} available | "
-            f"{_fmt_number(status.get('tpm_reserved', 0))} reserved | "
-            f"{_fmt_number(status.get('tpm_limit', 0))} capacity"
-        )
+        stats_table.add_row("Avg Req Size", avg_req_size)
+        stats_table.add_row("Avg Resp Size", avg_resp_size)
 
         # Update error banner
         error_banner = self.query_one("#error-banner", Static)
@@ -434,6 +520,12 @@ class ProxyTUI(App):
         except NoMatches:
             pass
 
+        try:
+            upstream_sparkline = self.query_one("#upstream-latency-sparkline", Sparkline)
+            upstream_sparkline.data = self.history.upstream_latency_samples
+        except NoMatches:
+            pass
+
     @_safe_update
     def _update_derived_metrics(self, status: dict) -> None:
         """Update derived metrics panel (success rate, latency percentiles)."""
@@ -449,63 +541,16 @@ class ProxyTUI(App):
 
         lines = [
             f"  Success Rate: {success_rate:.1f}%  |  Error Rate: {error_rate:.1f}%",
-            f"  Latency -- avg: {self.latency_tracker.avg()}ms  |  p50: {self.latency_tracker.p50()}ms  |  p95: {self.latency_tracker.p95()}ms  |  p99: {self.latency_tracker.p99()}ms",
             f"  Requests: {total_fwd} fwd  |  {total_429s} 429s  |  {total_rejected} rejected  |  {status.get('pending_requests', 0)} pending",
         ]
         panel.update("\n".join(lines))
 
-    @_safe_update
-    def _update_quota_timers(self, status: dict) -> None:
-        """Update quota reset timers panel."""
-        panel = self.query_one("#quota-timers-panel", Static)
-
-        now = time.time()
-        rpm_reset = max(0, 60 - (now % 60))
-
-        # Week/month resets are based on when the window started
-        week_elapsed = now - getattr(self.rate_limiter, 'week_start', now)
-        week_reset = max(0, 7 * 24 * 3600 - week_elapsed)
-        month_elapsed = now - getattr(self.rate_limiter, 'month_start', now)
-        month_reset = max(0, 30 * 24 * 3600 - month_elapsed)
-        # 5-hour window reset
-        hour5_reset = max(0, 5 * 3600 - (now % (5 * 3600)))
-
-        lines = [
-            f"  RPM resets in:       {int(rpm_reset)}s",
-            f"  5-Hour resets in:    {self._fmt_time_delta(hour5_reset)}",
-            f"  Week resets in:      {self._fmt_time_delta(week_reset)}",
-            f"  Month resets in:     {self._fmt_time_delta(month_reset)}",
-        ]
-        panel.update("\n".join(lines))
-
-    @_safe_update
-    def _update_model_table(self, status: dict) -> None:
-        """Update per-model usage DataTable."""
-        table = self.query_one("#model-usage-table", DataTable)
-        table.clear()
-
-        model_usage = status.get("model_usage", {})
-        # Sort by request count descending
-        sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["requests"], reverse=True)
-
-        if not sorted_models:
-            table.add_row("--", "No model data yet", "", "", "")
-        else:
-            for model_name, stats in sorted_models:
-                table.add_row(
-                    model_name,
-                    str(stats["requests"]),
-                    _fmt_number(stats["tokens"]),
-                    str(stats["errors_429"]),
-                    f"{stats['avg_latency_ms']:.0f}ms",
-                )
-
-    def _quota_warning(self, status: dict) -> str:
-        """Return a warning string if any quota is near its limit."""
+    def _check_quota_thresholds(self, status: dict) -> list[str]:
+        """Return list of quota names at >= 90% usage."""
         warnings = []
         thresholds = [
             ("RPM", status.get("rpm_current", 0), status.get("rpm_limit", 1)),
-            ("TPM", status.get("tpm_available", 0), status.get("tpm_limit", 1)),
+            ("TPM", status.get("tpm_limit", 0) - status.get("tpm_available", 0) - status.get("tpm_reserved", 0), status.get("tpm_limit", 1) - status.get("tpm_reserved", 0)),
             ("5H", status.get("requests_5h", 0), status.get("requests_5h_limit", 1)),
             ("Week", status.get("requests_week", 0), status.get("requests_week_limit", 1)),
             ("Month", status.get("requests_month", 0), status.get("requests_month_limit", 1)),
@@ -513,6 +558,11 @@ class ProxyTUI(App):
         for name, used, limit in thresholds:
             if limit > 0 and used / limit >= 0.9:
                 warnings.append(name)
+        return warnings
+
+    def _quota_warning(self, status: dict) -> str:
+        """Return a warning string if any quota is near its limit."""
+        warnings = self._check_quota_thresholds(status)
         if warnings:
             return "WARNING: " + ", ".join(warnings) + " near limit"
         return ""
@@ -526,24 +576,39 @@ class ProxyTUI(App):
 
     def _poll_logs(self) -> None:
         """Append new log entries to the Log widgets."""
-        # Try overview tab log
-        self._append_logs_to_widget("#live-log")
-        # Try full log tab (if filter matches)
-        self._append_logs_to_widget("#live-log-full", apply_filter=True)
+        # Overview tab: errors and warnings only (alert feed)
+        self._append_logs_to_widget("#live-log", severity_filter="warnings_and_above")
+        # Full log tab: all entries with user filters (if not paused)
+        if not self._logs_paused:
+            written = self._append_logs_to_widget("#live-log-full", apply_filter=True)
+            self._displayed_log_count += written
+            self._update_log_entry_count()
 
-    def _append_logs_to_widget(self, widget_id: str, apply_filter: bool = False) -> None:
-        """Append new log entries to a specific Log widget, optionally applying filters."""
+    def _append_logs_to_widget(self, widget_id: str, apply_filter: bool = False, severity_filter: str | None = None) -> int:
+        """Append new log entries to a specific Log widget.
+
+        Args:
+            widget_id: The CSS selector for the Log widget.
+            apply_filter: If True, apply user-level text/level/time filters (Logs tab).
+            severity_filter: If set to "warnings_and_above", only show WARNING and ERROR.
+        """
         try:
             log_widget = self.query_one(widget_id, Log)
         except NoMatches:
-            return
+            return 0
 
-        new_entries = self.log_handler.get_logs(limit=50, from_seq=self.last_log_seq)
+        seq = self._log_seqs.get(widget_id, 0)
+        new_entries = self.log_handler.get_logs(limit=50, from_seq=seq)
+        written_count = 0
         for entry in new_entries:
             level = entry.get("level", "INFO")
             msg = entry.get("message", "")
 
-            # Apply filters for the full log tab
+            # Apply severity filter for the overview alert feed
+            if severity_filter == "warnings_and_above" and level not in ("WARNING", "ERROR"):
+                continue
+
+            # Apply user filters for the full log tab
             if apply_filter:
                 try:
                     level_filter = self.query_one("#log-level-filter", Select).value
@@ -552,6 +617,18 @@ class ProxyTUI(App):
                     text_filter = self.query_one("#log-filter", Input).value
                     if text_filter and text_filter.lower() not in msg.lower():
                         continue
+                    time_range = self.query_one("#log-time-range", Select).value
+                    if time_range != "ALL":
+                        entry_ts = entry.get("timestamp", "")
+                        if entry_ts:
+                            try:
+                                dt = datetime.fromisoformat(entry_ts)
+                                cutoff_map = {"5m": 300, "1h": 3600, "24h": 86400}
+                                if time_range in cutoff_map:
+                                    if time.time() - dt.timestamp() > cutoff_map[time_range]:
+                                        continue
+                            except Exception:
+                                pass
                 except NoMatches:
                     pass
 
@@ -559,12 +636,265 @@ class ProxyTUI(App):
             if isinstance(ts, str) and " " in ts:
                 ts = ts.split(" ")[1] if len(ts.split(" ")) > 1 else ts
             line = f"[{level}] {ts} -- {msg}"
-            log_widget.write(line)
+            log_widget.write_line(line)
+            written_count += 1
             if level == "ERROR" and not apply_filter:
                 self.error_count += 1
 
         if new_entries:
-            self.last_log_seq = max(e.get("seq", 0) for e in new_entries) + 1
+            self._log_seqs[widget_id] = max(e.get("seq", 0) for e in new_entries) + 1
+
+        return written_count
+
+    def _update_alert_badge(self, status: dict) -> None:
+        """Update alert badge based on quota usage and circuit status."""
+        try:
+            badge = self.query_one("#alert-badge", Static)
+            warnings = self._check_quota_thresholds(status)
+            
+            if status.get("circuit_open"):
+                warnings.append("Circuit")
+            
+            if warnings:
+                badge.update("ALERT: " + " | ".join(warnings) + " critical")
+                badge.add_class("alert-active")
+            else:
+                badge.update("")
+                badge.remove_class("alert-active")
+        except NoMatches:
+            pass
+
+    def _update_latency_histogram(self) -> None:
+        """Update latency histogram visualization in Metrics tab."""
+        try:
+            panel = self.query_one("#latency-histogram-panel", Static)
+        except NoMatches:
+            return
+
+        latencies = self.latency_tracker.latencies
+        if not latencies:
+            panel.update("")
+            return
+
+        # Define buckets
+        buckets = [
+            ("0-100ms", 0, 100),
+            ("100-250ms", 100, 250),
+            ("250-500ms", 250, 500),
+            ("500-1s", 500, 1000),
+            ("1s+", 1000, float("inf")),
+        ]
+        
+        counts = []
+        for _, low, high in buckets:
+            count = sum(1 for l in latencies if low <= l < high)
+            counts.append(count)
+        
+        max_count = max(counts) if counts else 1
+        max_bar_width = 40
+        
+        lines = []
+        for i, (label, _, _) in enumerate(buckets):
+            if max_count > 0:
+                bar_len = int((counts[i] / max_count) * max_bar_width)
+            else:
+                bar_len = 0
+            bar = "#" * bar_len
+            lines.append(f"  {label:>10} | {bar} {counts[i]}")
+        
+        p50 = self.latency_tracker.p50()
+        p95 = self.latency_tracker.p95()
+        p99 = self.latency_tracker.p99()
+        avg = self.latency_tracker.avg()
+        lines.append(f"  avg: {avg}ms | p50: {p50}ms | p95: {p95}ms | p99: {p99}ms")
+        
+        panel.update("\n".join(lines))
+
+    def _update_model_table(self, status: dict) -> None:
+        """Update per-model usage DataTable with filtering and sorting."""
+        table = self.query_one("#model-usage-table", DataTable)
+        table.clear()
+
+        model_usage = status.get("model_usage", {})
+        
+        # Apply filter
+        if self._model_filter:
+            filter_lower = self._model_filter.lower()
+            model_usage = {k: v for k, v in model_usage.items() if filter_lower in k.lower()}
+        
+        # Sort by selected key
+        sort_key = self._model_sort_key
+        if sort_key == "requests":
+            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["requests"], reverse=True)
+        elif sort_key == "tokens":
+            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["tokens"], reverse=True)
+        elif sort_key == "latency":
+            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["avg_latency_ms"], reverse=True)
+        elif sort_key == "429s":
+            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["errors_429"], reverse=True)
+        else:
+            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["requests"], reverse=True)
+
+        if not sorted_models:
+            if model_usage:
+                table.add_row("--", "No models match filter", "", "", "", "", "")
+            else:
+                table.add_row("--", "No model data yet", "", "", "", "", "")
+        else:
+            total_requests = sum(v["requests"] for _, v in sorted_models)
+            for model_name, stats in sorted_models:
+                pct = f"{(stats['requests'] / total_requests * 100):.0f}%" if total_requests > 0 else "0%"
+                table.add_row(
+                    model_name,
+                    f"{stats['requests']} ({pct})",
+                    _fmt_number(stats["tokens"]),
+                    str(stats["errors_429"]),
+                    f"{stats['avg_latency_ms']:.0f}ms",
+                    f"{stats.get('p50_latency_ms', 0):.0f}ms",
+                    f"{stats.get('p95_latency_ms', 0):.0f}ms",
+                )
+            
+            # Totals row
+            total_tokens = sum(v["tokens"] for _, v in sorted_models)
+            total_429s = sum(v["errors_429"] for _, v in sorted_models)
+            avg_latency = sum(v["avg_latency_ms"] * v["requests"] for _, v in sorted_models) / total_requests if total_requests > 0 else 0
+            table.add_row(
+                "TOTAL",
+                str(total_requests),
+                _fmt_number(total_tokens),
+                str(total_429s),
+                f"{avg_latency:.0f}ms",
+                "",
+                "",
+            )
+
+    def _update_config_table_filtered(self) -> None:
+        """Update config table with current filter and grouping settings."""
+        try:
+            table = self.query_one("#config-table", DataTable)
+        except NoMatches:
+            return
+
+        table.clear()
+        env_prefix = "PROXY_"
+        
+        # Group config keys
+        config_groups = {
+            "Rate Limits": ["rpm_limit", "tpm_limit", "rps_limit", "requests_per_week", "requests_per_month", "requests_per_5h", "safety_factor"],
+            "Timeouts": ["upstream_timeout_total", "upstream_timeout_connect"],
+            "Connection": ["max_connections", "max_connections_per_host"],
+            "Buffering": ["max_body_size", "max_stream_buffer", "max_queue_size", "max_retries", "base_backoff", "deque_max_size"],
+            "Logging": ["log_level", "log_buffer_size"],
+        }
+        
+        ungrouped_keys = []
+        for key, value in sorted(self._config_snapshot.items()):
+            source = "env" if env_prefix + key.upper() in __import__("os").environ else "default"
+            if self._config_filter and self._config_filter.lower() not in key.lower():
+                continue
+            ungrouped_keys.append((key, str(value), source))
+        
+        if self._config_grouped:
+            # Show grouped view
+            shown_keys = set()
+            for group_name, group_keys in config_groups.items():
+                group_items = [(k, v, s) for k, v, s in ungrouped_keys if k in group_keys]
+                if group_items:
+                    table.add_row(f"--- {group_name} ---", "", "")
+                    for key, value, source in group_items:
+                        table.add_row(key, value, source)
+                        shown_keys.add(key)
+            
+            # Show remaining ungrouped keys
+            remaining = [(k, v, s) for k, v, s in ungrouped_keys if k not in shown_keys]
+            if remaining:
+                table.add_row("--- Other ---", "", "")
+                for key, value, source in remaining:
+                    table.add_row(key, value, source)
+        else:
+            for key, value, source in ungrouped_keys:
+                table.add_row(key, value, source)
+
+    def _update_log_entry_count(self) -> None:
+        """Update the log entry count indicator."""
+        try:
+            count_widget = self.query_one("#log-entry-count", Static)
+            count_widget.update(f"{self._displayed_log_count} entries")
+        except NoMatches:
+            pass
+
+    def _export_logs(self) -> None:
+        """Export filtered logs to a file in session_logs directory."""
+        import os
+        import json
+        
+        log_dir = "session_logs"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(log_dir, f"tui_export_{timestamp}.log")
+        
+        # Get all logs from buffer
+        all_logs = list(self.log_handler.buffer)
+        
+        # Apply current filters
+        try:
+            level_filter = self.query_one("#log-level-filter", Select).value
+            text_filter = self.query_one("#log-filter", Input).value
+            time_range = self.query_one("#log-time-range", Select).value
+        except NoMatches:
+            level_filter = "ALL"
+            text_filter = ""
+            time_range = "ALL"
+        
+        # Apply time range filter
+        now = time.time()
+        if time_range == "5m":
+            cutoff = now - 300
+        elif time_range == "1h":
+            cutoff = now - 3600
+        elif time_range == "24h":
+            cutoff = now - 86400
+        else:
+            cutoff = 0
+        
+        filtered = []
+        for entry in all_logs:
+            # Time filter
+            try:
+                entry_ts = entry.get("timestamp", "")
+                if cutoff > 0 and entry_ts:
+                    # Parse timestamp and compare
+                    dt = datetime.fromisoformat(entry_ts)
+                    if dt.timestamp() < cutoff:
+                        continue
+            except Exception:
+                pass
+            
+            # Level filter
+            if level_filter != "ALL" and entry.get("level", "INFO") != level_filter:
+                continue
+            
+            # Text filter
+            if text_filter and text_filter.lower() not in entry.get("message", "").lower():
+                continue
+            
+            filtered.append(entry)
+        
+        # Write to file
+        with open(filepath, "w", encoding="utf-8") as f:
+            for entry in filtered:
+                ts = entry.get("timestamp", "")
+                level = entry.get("level", "INFO")
+                msg = entry.get("message", "")
+                f.write(f"[{level}] {ts} -- {msg}\n")
+        
+        # Show confirmation in entry count
+        try:
+            count_widget = self.query_one("#log-entry-count", Static)
+            count_widget.update(f"Exported {len(filtered)} entries to {os.path.basename(filepath)}")
+        except NoMatches:
+            pass
 
     def _format_uptime(self, seconds: float) -> str:
         """Format uptime as human-readable string."""
@@ -598,8 +928,9 @@ class ProxyTUI(App):
                 log_widget.clear()
             except NoMatches:
                 pass
-        self.last_log_seq = 0
+        self._log_seqs.clear()
         self.error_count = 0
+        self._displayed_log_count = 0
         self.log_handler.clear()
 
     def switch_to(self, tab_id: str) -> None:
@@ -611,14 +942,104 @@ class ProxyTUI(App):
             pass
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Handle button presses (e.g., clear logs button)."""
+        """Handle button presses."""
         if event.button.id == "clear-logs-btn":
             self.action_clear_logs()
+        elif event.button.id == "pause-logs-btn":
+            self._logs_paused = not self._logs_paused
+            event.button.label = "Resume" if self._logs_paused else "Pause"
+            event.button.variant = "warning" if self._logs_paused else "default"
+        elif event.button.id == "export-logs-btn":
+            self._export_logs()
+        elif event.button.id == "autoscroll-btn":
+            self._autoscroll_enabled = not self._autoscroll_enabled
+            event.button.label = "Auto-scroll: ON" if self._autoscroll_enabled else "Auto-scroll: OFF"
+            event.button.variant = "primary" if self._autoscroll_enabled else "default"
+        elif event.button.id == "config-refresh-btn":
+            self._config_snapshot = dashscope_proxy._load_config()
+            self._update_config_table_filtered()
+        elif event.button.id == "config-grouped-btn":
+            self._config_grouped = not self._config_grouped
+            event.button.variant = "primary" if self._config_grouped else "default"
+            self._update_config_table_filtered()
+
+    async def on_input_changed(self, event: Input.Changed) -> None:
+        """Handle input field changes for filters."""
+        if event.input.id == "log-filter":
+            # Clear log widget and re-poll from the start to apply filter to all entries
+            try:
+                log_widget = self.query_one("#live-log-full", Log)
+                log_widget.clear()
+                self._log_seqs["#live-log-full"] = 0
+                self._displayed_log_count = 0
+                self._poll_logs()
+            except NoMatches:
+                pass
+        elif event.input.id == "model-filter":
+            self._model_filter = event.value
+            try:
+                status = self.rate_limiter.status()
+                self._update_model_table(status)
+            except NoMatches:
+                pass
+        elif event.input.id == "config-filter":
+            self._config_filter = event.value
+            self._update_config_table_filtered()
+
+    async def on_select_changed(self, event: Select.Changed) -> None:
+        """Handle select widget changes."""
+        if event.select.id == "log-level-filter":
+            # Clear log widget and re-poll from the start to apply filter to all entries
+            try:
+                log_widget = self.query_one("#live-log-full", Log)
+                log_widget.clear()
+                self._log_seqs["#live-log-full"] = 0
+                self._displayed_log_count = 0
+                self._poll_logs()
+            except NoMatches:
+                pass
+        elif event.select.id == "log-time-range":
+            # Clear log widget and re-poll from the start to apply time filter
+            try:
+                log_widget = self.query_one("#live-log-full", Log)
+                log_widget.clear()
+                self._log_seqs["#live-log-full"] = 0
+                self._displayed_log_count = 0
+                self._poll_logs()
+            except NoMatches:
+                pass
+        elif event.select.id == "model-sort":
+            self._model_sort_key = event.value
+            try:
+                status = self.rate_limiter.status()
+                self._update_model_table(status)
+            except NoMatches:
+                pass
 
     async def on_shutdown(self) -> None:
         """Signal proxy shutdown and cancel background worker when TUI exits."""
+        self._signal_proxy_shutdown()
+
+    def _signal_proxy_shutdown(self) -> None:
+        """Signal the proxy server to shut down (cross-thread safe)."""
+        self._shutdown_event.set()
+
         for worker in self.workers:
             worker.cancel()
+
         shutdown_event = self.proxy_app.get("shutting_down")
+        event_loop = self.proxy_app.get("event_loop")
         if shutdown_event and not shutdown_event.is_set():
-            shutdown_event.set()
+            if event_loop and event_loop.is_running():
+                event_loop.call_soon_threadsafe(shutdown_event.set)
+            else:
+                shutdown_event.set()
+
+    def action_quit(self) -> None:
+        """Override quit to signal proxy shutdown before exiting the TUI."""
+        self._signal_proxy_shutdown()
+        self.exit()
+
+    async def on_shutdown(self) -> None:
+        """Signal proxy shutdown and cancel background worker when TUI exits."""
+        self._signal_proxy_shutdown()

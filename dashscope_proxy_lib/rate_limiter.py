@@ -47,13 +47,15 @@ class SlidingWindowCounter:
                 self.events.popleft()
 
 
-class TokenBucket:
+class TokenWindowCounter:
     """
-    Token bucket algorithm for TPM enforcement.
+    Sliding window counter for TPM enforcement.
 
-    Tokens refill at a constant rate. Each request drains tokens proportional
-    to its estimated size. Burst capacity equals the full bucket (tpm_limit).
-    O(1) state — tracks only current tokens and last refill time.
+    Tracks token consumption events with timestamps and amounts within a
+    configurable time window (default 60 seconds). Unlike TokenBucket's
+    continuous refill model, this accurately reflects tokens consumed in
+    the actual TPM window — tokens remain 'used' until they age out of
+    the window.
 
     Pattern: reserve before send, reconcile after response, refund on error.
     """
@@ -61,51 +63,88 @@ class TokenBucket:
     def __init__(self, capacity: int, window_seconds: int = 60):
         self.capacity = capacity
         self.window_seconds = window_seconds
-        self.refill_rate = capacity / window_seconds  # tokens per second
-        self.tokens = float(capacity)
-        self.last_refill = time.monotonic()
+        self.window: deque[tuple[float, int]] = deque()
         self.reserved = 0  # tokens reserved for in-flight requests
+        self._lock = threading.Lock()
 
-    def _refill(self, now: float) -> None:
-        elapsed = now - self.last_refill
-        if elapsed > 0:
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
-            self.last_refill = now
+    def _prune(self, now: float) -> None:
+        """Must be called with self._lock held."""
+        cutoff = now - self.window_seconds
+        while self.window and self.window[0][0] < cutoff:
+            self.window.popleft()
+
+    def _tokens_used(self, now: float) -> int:
+        """Must be called with self._lock held."""
+        self._prune(now)
+        return sum(amount for _, amount in self.window)
 
     def available(self, now: float | None = None) -> float:
-        """Return currently available tokens (after refill, minus reservations)."""
+        """Return currently available tokens (capacity minus tokens used in window, minus reservations)."""
         now = now or time.monotonic()
-        self._refill(now)
-        return max(0.0, self.tokens - self.reserved)
+        with self._lock:
+            used = self._tokens_used(now)
+            return max(0.0, self.capacity - used - self.reserved)
 
     def try_reserve(self, tokens: int, now: float | None = None) -> bool:
         """Reserve tokens if available. Returns True on success."""
         now = now or time.monotonic()
-        self._refill(now)
-        if self.tokens - self.reserved >= tokens:
-            self.reserved += tokens
-            return True
-        return False
+        with self._lock:
+            used = self._tokens_used(now)
+            if self.capacity - used - self.reserved >= tokens:
+                self.reserved += tokens
+                return True
+            return False
 
-    def reconcile(self, estimated: int, actual: int) -> None:
-        """Adjust bucket after response. If actual > estimated, drain extra. If less, refund."""
-        diff = actual - estimated
-        self.reserved = max(0, self.reserved - estimated)
-        if diff > 0:
-            self.tokens = max(0, self.tokens - diff)
+    def reconcile(self, estimated: int, actual: int, now: float | None = None) -> None:
+        """
+        Release the reservation and record actual token usage in the window.
+        The reservation covers `estimated`; actual consumption is recorded
+        so the window accurately reflects real usage.
+        """
+        with self._lock:
+            self.reserved = max(0, self.reserved - estimated)
+            ts = now if now is not None else time.monotonic()
+            self.window.append((ts, actual))
 
     def refund(self, tokens: int) -> None:
         """Release reserved tokens back (on upstream error)."""
-        self.reserved = max(0, self.reserved - tokens)
+        with self._lock:
+            self.reserved = max(0, self.reserved - tokens)
+
+    def wait_seconds_for(self, tokens: int, now: float | None = None) -> float:
+        """Return how long until enough tokens become available.
+
+        Computes when the oldest consumed tokens will expire from the window,
+        freeing up enough capacity for the requested amount.
+        """
+        now = now or time.monotonic()
+        with self._lock:
+            used = self._tokens_used(now)
+            needed = tokens + self.reserved - (self.capacity - used)
+            if needed <= 0:
+                return 0.0
+            # Walk through events in order, find when enough will expire
+            cumulative = 0
+            for ts, amount in self.window:
+                cumulative += amount
+                if cumulative >= needed:
+                    wait = ts + self.window_seconds - now
+                    return max(0.0, wait)
+            # If even expiring all events isn't enough (shouldn't happen normally),
+            # return the time until the window fully clears
+            if self.window:
+                return max(0.0, self.window[0][0] + self.window_seconds - now)
+            return 0.0
 
     def status(self) -> dict:
         now = time.monotonic()
-        self._refill(now)
-        return {
-            "tpm_capacity": self.capacity,
-            "tpm_available": int(self.tokens - self.reserved),
-            "tpm_reserved": self.reserved,
-        }
+        with self._lock:
+            used = self._tokens_used(now)
+            return {
+                "tpm_capacity": self.capacity,
+                "tpm_available": int(self.capacity - used - self.reserved),
+                "tpm_reserved": self.reserved,
+            }
 
 
 @dataclass
@@ -115,6 +154,7 @@ class ModelStats:
     tokens: int = 0
     errors_429: int = 0
     total_latency_ms: float = 0.0
+    recent_latencies: deque = field(default_factory=lambda: deque(maxlen=100))
 
 
 class RateLimiter:
@@ -130,7 +170,7 @@ class RateLimiter:
         self.rps_limit = max(1, int(self.rpm_limit / 60))
 
         self.rpm_window = SlidingWindowCounter(60)
-        self.tpm_bucket = TokenBucket(self.tpm_limit)
+        self.tpm_bucket = TokenWindowCounter(self.tpm_limit)
         self.hour5_window = SlidingWindowCounter(5 * 3600)
 
         self.week_count = 0
@@ -148,10 +188,14 @@ class RateLimiter:
         self.pending_requests = 0
 
         self.total_forwarded = 0
-        self.total_queued = 0
+        self.queue_drops = 0
         self.total_429s = 0
         self.total_rejected = 0
         self.total_tokens_consumed = 0
+        self.total_request_bytes = 0
+        self.total_response_bytes = 0
+
+        self.queue_wait_times: deque = deque(maxlen=1000)
 
         self.last_request_time: float = 0.0
         self._lock = asyncio.Lock()
@@ -212,10 +256,10 @@ class RateLimiter:
             if estimated_tokens > 0:
                 avail = self.tpm_bucket.available(now_mono)
                 if avail < estimated_tokens:
-                    shortfall = estimated_tokens - avail
-                    wait = max(1.0, shortfall / self.tpm_bucket.refill_rate)
+                    wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, now_mono)
+                    wait = max(1.0, wait)
                     _log(logging.DEBUG, "can_proceed denied: TPM limit reached", wait_seconds=wait,
-                         estimated_tokens=estimated_tokens, available_tokens=int(avail), shortfall=shortfall)
+                         estimated_tokens=estimated_tokens, available_tokens=int(avail), shortfall=estimated_tokens - avail)
                     return False, "TPM limit reached", wait
 
             min_gap = 1.0 / self.rps_limit
@@ -259,11 +303,17 @@ class RateLimiter:
         stats.requests += 1
         stats.tokens += tokens
         stats.total_latency_ms += latency_ms
+        stats.recent_latencies.append(latency_ms)
         if is_429:
             stats.errors_429 += 1
         self.recent_latencies.append(latency_ms)
 
-    async def reconcile_tokens(self, estimated: int, actual: int) -> None:
+    def record_body_sizes(self, request_bytes: int, response_bytes: int) -> None:
+        """Record request/response body sizes for aggregate metrics."""
+        self.total_request_bytes += request_bytes
+        self.total_response_bytes += response_bytes
+
+    async def reconcile_tokens(self, estimated: int, actual: int, now: float | None = None) -> None:
         """
         Release the reservation and adjust the bucket after receiving the real
         token count. The reservation is always for `estimated`; actual usage
@@ -272,7 +322,7 @@ class RateLimiter:
         async with self._lock:
             if estimated <= 0:
                 return
-            self.tpm_bucket.reconcile(estimated, actual)
+            self.tpm_bucket.reconcile(estimated, actual, now=now)
 
     async def refund_tokens(self, estimated_tokens: int) -> None:
         """Refund reserved tokens when an upstream request fails permanently."""
@@ -315,6 +365,17 @@ class RateLimiter:
     def status(self) -> dict:
         now = time.monotonic()
         tpm_status = self.tpm_bucket.status()
+
+        queue_p50 = 0.0
+        queue_p95 = 0.0
+        queue_p99 = 0.0
+        if self.queue_wait_times:
+            sorted_waits = sorted(self.queue_wait_times)
+            n = len(sorted_waits)
+            queue_p50 = sorted_waits[int(n * 0.50)]
+            queue_p95 = sorted_waits[int(n * 0.95)]
+            queue_p99 = sorted_waits[int(n * 0.99)]
+
         return {
             "rps_limit": self.rps_limit,
             "rpm_limit": self.rpm_limit,
@@ -329,14 +390,39 @@ class RateLimiter:
             "requests_month": self.month_count,
             "requests_month_limit": self.month_limit,
             "total_forwarded": self.total_forwarded,
-            "total_queued": self.total_queued,
+            "queue_drops": self.queue_drops,
+            "queue_p50_ms": round(queue_p50, 1),
+            "queue_p95_ms": round(queue_p95, 1),
+            "queue_p99_ms": round(queue_p99, 1),
             "total_429s": self.total_429s,
             "total_rejected": self.total_rejected,
             "total_tokens_consumed": self.total_tokens_consumed,
+            "total_request_bytes": self.total_request_bytes,
+            "total_response_bytes": self.total_response_bytes,
             "pending_requests": self.pending_requests,
             "circuit_open": self.circuit_is_open(),
             "circuit_failure_count": self.circuit_failure_count,
-            "model_usage": {k: {"requests": v.requests, "tokens": v.tokens, "errors_429": v.errors_429, "avg_latency_ms": round(v.total_latency_ms / v.requests, 1) if v.requests > 0 else 0.0} for k, v in self.model_usage.items()},
+            "model_usage": {k: {
+                "requests": v.requests,
+                "tokens": v.tokens,
+                "errors_429": v.errors_429,
+                "avg_latency_ms": round(v.total_latency_ms / v.requests, 1) if v.requests > 0 else 0.0,
+                "p50_latency_ms": self._compute_percentile(v.recent_latencies, 50) if v.recent_latencies else 0.0,
+                "p95_latency_ms": self._compute_percentile(v.recent_latencies, 95) if v.recent_latencies else 0.0,
+            } for k, v in self.model_usage.items()},
             "recent_latencies": list(self.recent_latencies)[-100:],
             "uptime_seconds": round(time.time() - self.start_time, 1),
         }
+
+    @staticmethod
+    def _compute_percentile(latencies: deque, p: float) -> float:
+        """Compute percentile from a deque of latencies."""
+        if not latencies:
+            return 0.0
+        sorted_vals = sorted(latencies)
+        k = (len(sorted_vals) - 1) * (p / 100.0)
+        f = int(k)
+        c = f + 1
+        if c >= len(sorted_vals):
+            return round(sorted_vals[f], 1)
+        return round(sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f), 1)

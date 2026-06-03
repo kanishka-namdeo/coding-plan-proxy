@@ -52,11 +52,18 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     is_stream = False
     estimated_tokens = 0
     actual_tokens = 0
+    prompt_tokens = 0
+    completion_tokens = 0
+    cached_tokens = 0
     queue_wait_ms = 0.0
     retry_count = 0
     retry_5xx = 0
     error_reason = None
     status_code = 200
+    request_body_bytes = 0
+    response_body_bytes = 0
+    remote_addr = None
+    upstream_latency_ms = 0.0
 
     session_entry = {
         "request_id": request_id,
@@ -102,6 +109,8 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         return resp
 
     body_bytes = await request.read()
+    request_body_bytes = len(body_bytes)
+    remote_addr = request.remote
 
     if method == "POST" and not body_bytes:
         error_reason = "empty_body"
@@ -214,6 +223,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     try:
         wait_time = await wait_for_slot(rate_limiter, request, estimated_tokens)
         if wait_time is None:
+            rate_limiter.queue_drops += 1
             rate_limiter.total_rejected += 1
             error_reason = "queue_full"
             status_code = 503
@@ -234,6 +244,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
         # Reserve TPM before forwarding (post-queue guard — bucket may have drained)
         if estimated_tokens > 0 and not await rate_limiter.reserve_tokens(estimated_tokens):
+            rate_limiter.queue_drops += 1
             error_reason = "tpm_reservation_failed"
             status_code = 503
             _log(logging.WARNING, "request rejected: TPM reservation failed after queue",
@@ -251,8 +262,8 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
             )
 
         if wait_time > 0:
-            rate_limiter.total_queued += 1
             queue_wait_ms = round(wait_time * 1000, 1)
+            rate_limiter.queue_wait_times.append(queue_wait_ms)
             _log(logging.INFO, "request queued",
                  request_id=request_id, wait_ms=queue_wait_ms)
 
@@ -412,17 +423,25 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         await resp.write_eof()
 
                         duration_ms = round((time.monotonic() - request_start) * 1000, 1)
-                        tokens_from_stream = extract_tokens_from_stream(stream_buffer)
-                        if tokens_from_stream == 0:
+                        token_info = extract_tokens_from_stream(stream_buffer)
+                        if token_info["total_tokens"] == 0:
                             _log(logging.WARNING, "no token usage found in stream, using estimate",
                                  request_id=request_id, estimated=estimated_tokens)
                             tokens_from_stream = estimated_tokens
+                        else:
+                            tokens_from_stream = token_info["total_tokens"]
 
                         await rate_limiter.reconcile_tokens(estimated_tokens, tokens_from_stream)
                         await rate_limiter.record_request(tokens_from_stream)
                         rate_limiter.record_circuit_success()
                         rate_limiter.record_model_stats(model_name or "unknown", tokens_from_stream, duration_ms)
+                        rate_limiter.record_body_sizes(request_body_bytes, len(stream_buffer))
                         actual_tokens = tokens_from_stream
+                        prompt_tokens = token_info.get("prompt_tokens", 0)
+                        completion_tokens = token_info.get("completion_tokens", 0)
+                        cached_tokens = token_info.get("cached_tokens", 0)
+                        upstream_latency_ms = round(max(0, duration_ms - queue_wait_ms), 1)
+                        response_body_bytes = len(stream_buffer)
                         status_code = upstream.status
                         _log(logging.INFO, "stream complete",
                              request_id=request_id, method=method, path=path,
@@ -431,7 +450,9 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                              estimated_tokens=estimated_tokens,
                              actual_tokens=tokens_from_stream,
                              duration_ms=duration_ms, queue_wait_ms=queue_wait_ms,
-                             retry_count=retry + retry_5xx)
+                             retry_count=retry + retry_5xx,
+                             upstream_latency_ms=upstream_latency_ms,
+                             response_body_bytes=response_body_bytes)
                         return resp
                     except Exception:
                         if not stream_prepared:
@@ -514,18 +535,19 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         continue
 
                     tokens_used = extract_tokens_from_response(resp_body)
-                    if tokens_used == 0:
-                        tokens_used = estimated_tokens
+                    if tokens_used["total_tokens"] == 0:
+                        tokens_used = {**tokens_used, "total_tokens": estimated_tokens}
                     duration_ms = round((time.monotonic() - request_start) * 1000, 1)
-                    await rate_limiter.reconcile_tokens(estimated_tokens, tokens_used)
-                    await rate_limiter.record_request(tokens_used)
+                    await rate_limiter.reconcile_tokens(estimated_tokens, tokens_used["total_tokens"])
+                    await rate_limiter.record_request(tokens_used["total_tokens"])
                     rate_limiter.record_circuit_success()
-                    rate_limiter.record_model_stats(model_name or "unknown", tokens_used, duration_ms)
+                    rate_limiter.record_model_stats(model_name or "unknown", tokens_used["total_tokens"], duration_ms)
+                    rate_limiter.record_body_sizes(request_body_bytes, len(resp_body))
 
                     _log(logging.DEBUG, "token reconciliation",
                          request_id=request_id, estimated=estimated_tokens,
-                         actual=tokens_used,
-                         diff=tokens_used - estimated_tokens)
+                         actual=tokens_used["total_tokens"],
+                         diff=tokens_used["total_tokens"] - estimated_tokens)
 
                     if status_code != 200:
                         _log(logging.ERROR, "upstream non-200 response",
@@ -545,7 +567,12 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                     _add_ratelimit_headers(out, rate_limiter)
 
                     duration_ms = round((time.monotonic() - request_start) * 1000, 1)
-                    actual_tokens = tokens_used
+                    actual_tokens = tokens_used["total_tokens"]
+                    prompt_tokens = tokens_used.get("prompt_tokens", 0)
+                    completion_tokens = tokens_used.get("completion_tokens", 0)
+                    cached_tokens = tokens_used.get("cached_tokens", 0)
+                    response_body_bytes = len(resp_body)
+                    upstream_latency_ms = round(max(0, duration_ms - queue_wait_ms), 1)
                     _log(logging.INFO, "request complete",
                          request_id=request_id, method=method, path=path,
                          model=model_name, status_code=status_code,
@@ -553,7 +580,9 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                          estimated_tokens=estimated_tokens,
                          actual_tokens=actual_tokens,
                          duration_ms=duration_ms, queue_wait_ms=queue_wait_ms,
-                         retry_count=retry + retry_5xx)
+                         retry_count=retry + retry_5xx,
+                         upstream_latency_ms=upstream_latency_ms,
+                         response_body_bytes=response_body_bytes)
                     return out
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -582,11 +611,18 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         if session_log is not None:
             session_entry["status_code"] = status_code
             session_entry["actual_tokens"] = actual_tokens
+            session_entry["prompt_tokens"] = prompt_tokens
+            session_entry["completion_tokens"] = completion_tokens
+            session_entry["cached_tokens"] = cached_tokens
             duration_ms = round((time.monotonic() - request_start) * 1000, 1)
             session_entry["duration_ms"] = duration_ms
             session_entry["queue_wait_ms"] = queue_wait_ms
+            session_entry["upstream_latency_ms"] = upstream_latency_ms
             session_entry["retry_count"] = retry + retry_5xx
             session_entry["error_reason"] = error_reason
+            session_entry["request_body_bytes"] = request_body_bytes
+            session_entry["response_body_bytes"] = response_body_bytes
+            session_entry["remote_addr"] = remote_addr
             session_entry["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
             try:
                 with session_log._lock:
@@ -601,9 +637,16 @@ def _maybe_flush_session_log(app: web.Application, entry: dict) -> None:
     if session_log is None:
         return
     entry.setdefault("actual_tokens", 0)
+    entry.setdefault("prompt_tokens", 0)
+    entry.setdefault("completion_tokens", 0)
+    entry.setdefault("cached_tokens", 0)
     entry.setdefault("duration_ms", 0.0)
     entry.setdefault("queue_wait_ms", 0.0)
+    entry.setdefault("upstream_latency_ms", 0.0)
     entry.setdefault("retry_count", 0)
+    entry.setdefault("request_body_bytes", 0)
+    entry.setdefault("response_body_bytes", 0)
+    entry.setdefault("remote_addr", None)
     entry.setdefault("timestamp_utc", datetime.now(timezone.utc).isoformat())
     try:
         with session_log._lock:

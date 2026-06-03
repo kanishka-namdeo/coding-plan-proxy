@@ -47,7 +47,7 @@ HOP_BY_HOP_HEADERS = frozenset({
 # Rate limiting configuration (DashScope Coding Plan)
 # ---------------------------------------------------------------------------
 CODING_PLAN_CONFIG = {
-    "rpm_limit": 12,
+    "rpm_limit": 15,
     "tpm_limit": 4_000_000,
     "safety_factor": 0.8,
     "requests_per_5h": 6000,

@@ -75,7 +75,7 @@ from dashscope_proxy_lib.session_log import (
 # --- rate limiter ------------------------------------------------------------
 from dashscope_proxy_lib.rate_limiter import (
     SlidingWindowCounter,
-    TokenBucket,
+    TokenWindowCounter,
     ModelStats,
     RateLimiter,
 )
@@ -124,7 +124,6 @@ from dashscope_proxy_lib.server import (
 )
 
 __all__ = [
-    # config
     "PROXY_HOST", "PROXY_PORT", "TARGET_BASE", "DASHSCOPE_API_KEY",
     "UPSTREAM_TIMEOUT_TOTAL", "UPSTREAM_TIMEOUT_CONNECT", "MAX_CONNECTIONS",
     "MAX_CONNECTIONS_PER_HOST", "MAX_BODY_SIZE", "MAX_STREAM_BUFFER",
@@ -136,7 +135,7 @@ __all__ = [
     # session log
     "SESSION_LOG_DIR", "SESSION_LOG_ENABLED", "SessionLogWriter",
     # rate limiter
-    "SlidingWindowCounter", "TokenBucket", "ModelStats", "RateLimiter",
+    "SlidingWindowCounter", "TokenWindowCounter", "ModelStats", "RateLimiter",
     # token utils
     "extract_tokens_from_response", "extract_tokens_from_stream",
     "estimate_tokens_for_request",
@@ -153,3 +152,12 @@ __all__ = [
     # server
     "create_app", "create_proxy_resources", "cleanup_proxy_resources", "main",
 ]
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DashScope API Proxy")
+    parser.add_argument("--headless", action="store_true", help="Run without TUI")
+    args = parser.parse_args()
+    import asyncio
+    asyncio.run(main(headless=args.headless))

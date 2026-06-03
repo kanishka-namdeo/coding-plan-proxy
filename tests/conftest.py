@@ -90,5 +90,5 @@ def make_test_config(dashscope_module):
 
 @pytest.fixture
 def token_bucket(dashscope_module):
-    """Create a TokenBucket with small capacity for fast tests."""
-    return dashscope_module.TokenBucket(capacity=1000)
+    """Create a TokenWindowCounter with small capacity for fast tests."""
+    return dashscope_module.TokenWindowCounter(capacity=1000)

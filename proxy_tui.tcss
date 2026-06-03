@@ -4,14 +4,14 @@
 }
 
 #metrics-panel {
-    width: 35%;
+    width: 50%;
     border: tall green;
     padding: 0 1;
     margin: 0;
 }
 
 #log-panel {
-    width: 65%;
+    width: 50%;
     border: tall blue;
     padding: 0 1;
     margin: 0;
@@ -55,13 +55,6 @@
 
 #live-log {
     height: 1fr;
-}
-
-#token-status {
-    dock: bottom;
-    padding: 0 1;
-    color: $success;
-    height: 1;
 }
 
 DataTable {
@@ -116,13 +109,6 @@ Sparkline {
     border: round $primary;
 }
 
-.timers-panel {
-    height: auto;
-    padding: 0 1;
-    margin: 1 0;
-    border: round $warning;
-}
-
 .poll-error {
     height: auto;
     padding: 0 1;
@@ -169,4 +155,93 @@ Sparkline {
 /* Config tab */
 #config-table {
     height: 1fr;
+}
+
+#config-tab-content {
+    height: 1fr;
+}
+
+#config-controls {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#config-filter {
+    width: 1fr;
+}
+
+/* Alert badge */
+.alert-badge {
+    dock: top;
+    padding: 0 1;
+    color: $warning;
+    height: 1;
+}
+
+.alert-badge.alert-active {
+    color: $error;
+    background: $error 20%;
+    text-style: bold;
+}
+
+/* Models tab */
+#models-tab-content {
+    height: 1fr;
+}
+
+#model-controls {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#model-filter {
+    width: 1fr;
+    margin: 0 1 0 0;
+}
+
+#model-sort {
+    width: 1fr;
+}
+
+/* Log controls */
+#log-controls-bar {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#pause-logs-btn {
+    width: auto;
+}
+
+#export-logs-btn {
+    width: auto;
+}
+
+#autoscroll-btn {
+    width: auto;
+}
+
+.entry-count {
+    width: 1fr;
+    content-align: right middle;
+    padding: 0 1;
+    color: $primary;
+}
+
+/* Time range filter */
+#log-time-range {
+    width: 1fr;
+    margin: 0 1 0 1;
+}
+
+/* Latency histogram */
+.histogram-panel {
+    height: auto;
+    padding: 0 1;
+    margin: 1 0;
+    border: round $success;
+}
+
+.histogram-panel:empty {
+    display: none;
 }

@@ -47,6 +47,7 @@ async def create_proxy_resources() -> tuple[RateLimiter, web.Application, web.Ap
     app["client_session"] = aiohttp.ClientSession(timeout=timeout, connector=connector)
     app["rate_limiter"] = rate_limiter
     app["shutting_down"] = asyncio.Event()
+    app["event_loop"] = asyncio.get_event_loop()
     if SESSION_LOG_ENABLED:
         app["session_log"] = SessionLogWriter(SESSION_LOG_DIR)
         _log(logging.INFO, "session log writer initialized", log_dir=SESSION_LOG_DIR)
@@ -93,11 +94,13 @@ async def cleanup_proxy_resources(
     if shutdown_event and not shutdown_event.is_set():
         shutdown_event.set()
 
-    _log(logging.INFO, "draining in-flight requests")
+    # Stop accepting new queued work immediately
     rate_limiter.max_queue_size = 0
-    drain_deadline = time.monotonic() + 30
+
+    # Brief drain window — don't block indefinitely on pending work
+    drain_deadline = time.monotonic() + 5
     while rate_limiter.pending_requests > 0 and time.monotonic() < drain_deadline:
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.2)
     if rate_limiter.pending_requests > 0:
         _log(logging.WARNING, "shutdown timed out with pending requests",
              pending=rate_limiter.pending_requests)
@@ -122,6 +125,7 @@ async def main(headless: bool = False):
     rate_limiter, app, runner = await create_proxy_resources()
 
     tui_app = None
+    tui_thread = None
     try:
         if not headless:
             from proxy_tui import ProxyTUI
@@ -143,8 +147,10 @@ async def main(headless: bool = False):
             # Wait for shutdown signal
             await app["shutting_down"].wait()
             _log(logging.INFO, "shutdown signal received, closing TUI")
-            tui_app.exit()
-            tui_thread.join(timeout=5)
+            if tui_app:
+                tui_app.exit()
+            if tui_thread:
+                tui_thread.join(timeout=5)
         else:
             _log(logging.INFO, "proxy running in headless mode (no TUI)")
             await app["shutting_down"].wait()

@@ -164,87 +164,103 @@ class TestRateLimiterConcurrency:
 
 
 # ---------------------------------------------------------------------------
-# TokenBucket
+# TokenWindowCounter
 # ---------------------------------------------------------------------------
 
-class TestTokenBucket:
+class TestTokenWindowCounter:
     def test_reserve_success(self, dashscope_module):
-        bucket = dashscope_module.TokenBucket(capacity=1000)
-        now = bucket.last_refill
-        assert bucket.try_reserve(100, now=now) is True
-        assert bucket.reserved == 100
-        assert bucket.available(now=now) == 900.0
+        counter = dashscope_module.TokenWindowCounter(capacity=1000)
+        now = time.monotonic()
+        assert counter.try_reserve(100, now=now) is True
+        assert counter.reserved == 100
+        assert counter.available(now=now) == 900.0
 
     def test_reserve_failure_insufficient_tokens(self, dashscope_module):
-        bucket = dashscope_module.TokenBucket(capacity=1000)
-        now = bucket.last_refill
-        assert bucket.try_reserve(900, now=now) is True
-        assert bucket.available(now=now) == 100.0
-        assert bucket.try_reserve(200, now=now) is False
+        counter = dashscope_module.TokenWindowCounter(capacity=1000)
+        now = time.monotonic()
+        assert counter.try_reserve(900, now=now) is True
+        assert counter.available(now=now) == 100.0
+        assert counter.try_reserve(200, now=now) is False
 
     def test_reserve_zero_tokens_always_succeeds(self, dashscope_module):
-        bucket = dashscope_module.TokenBucket(capacity=100)
-        bucket.tokens = 0.0
-        bucket.last_refill = time.monotonic()
-        assert bucket.try_reserve(0) is True
+        counter = dashscope_module.TokenWindowCounter(capacity=100)
+        assert counter.try_reserve(0) is True
 
     def test_reconcile_actual_greater_than_estimated(self, dashscope_module):
-        """If actual usage > estimated, drain the extra from the bucket."""
-        bucket = dashscope_module.TokenBucket(capacity=1000)
-        now = bucket.last_refill
-        bucket.try_reserve(100, now=now)
-        bucket.reconcile(estimated=100, actual=150)
-        assert bucket.reserved == 0
-        # tokens = 1000 - (150 - 100) = 950; reconcile drains diff from tokens, not estimated
-        assert bucket.tokens == 950.0
+        """If actual usage > estimated, record full actual amount in the window."""
+        counter = dashscope_module.TokenWindowCounter(capacity=1000)
+        now = time.monotonic()
+        counter.try_reserve(100, now=now)
+        counter.reconcile(estimated=100, actual=150, now=now)
+        assert counter.reserved == 0
+        # Full actual amount (150) recorded in the window
+        avail = counter.available(now=now)
+        assert avail == 850.0
 
     def test_reconcile_actual_less_than_estimated(self, dashscope_module):
-        """If actual usage < estimated, refund unused tokens."""
-        bucket = dashscope_module.TokenBucket(capacity=1000)
-        now = bucket.last_refill
-        bucket.try_reserve(100, now=now)
-        bucket.reconcile(estimated=100, actual=60)
-        assert bucket.reserved == 0
-        assert bucket.tokens == 1000.0  # no extra drain since we used less
+        """If actual usage < estimated, only actual amount is recorded."""
+        counter = dashscope_module.TokenWindowCounter(capacity=1000)
+        now = time.monotonic()
+        counter.try_reserve(100, now=now)
+        counter.reconcile(estimated=100, actual=60, now=now)
+        assert counter.reserved == 0
+        # Only 60 recorded (actual usage), not the estimated 100
+        assert counter.available(now=now) == 940.0
 
     def test_refund_tokens(self, dashscope_module):
-        bucket = dashscope_module.TokenBucket(capacity=1000)
-        now = bucket.last_refill
-        bucket.try_reserve(200, now=now)
-        assert bucket.reserved == 200
-        bucket.refund(200)
-        assert bucket.reserved == 0
-        assert bucket.available(now=now) == 1000.0
+        counter = dashscope_module.TokenWindowCounter(capacity=1000)
+        now = time.monotonic()
+        counter.try_reserve(200, now=now)
+        assert counter.reserved == 200
+        counter.refund(200)
+        assert counter.reserved == 0
+        assert counter.available(now=now) == 1000.0
 
-    def test_available_after_refill(self, dashscope_module):
-        """Tokens refill over time at the correct rate."""
-        bucket = dashscope_module.TokenBucket(capacity=1000, window_seconds=60)
-        now = bucket.last_refill
-        bucket.tokens = 500.0
-        assert bucket.available(now=now + 30) == 1000.0  # 500 + 30 * (1000/60) = 1000 (capped)
+    def test_available_decreases_as_tokens_consumed(self, dashscope_module):
+        """TPM available should decrease as tokens are consumed, not refill instantly."""
+        counter = dashscope_module.TokenWindowCounter(capacity=10000, window_seconds=60)
+        now = time.monotonic()
+        # Consume 3000 tokens
+        counter.try_reserve(3000, now=now)
+        counter.reconcile(estimated=3000, actual=3000, now=now)
+        # Available should be 7000, not back to 10000
+        assert counter.available(now=now) == 7000.0
+        # Consume another 2000
+        counter.try_reserve(2000, now=now)
+        counter.reconcile(estimated=2000, actual=2000, now=now)
+        assert counter.available(now=now) == 5000.0
+
+    def test_tokens_expire_after_window(self, dashscope_module):
+        """Tokens should become available again after the window passes."""
+        counter = dashscope_module.TokenWindowCounter(capacity=1000, window_seconds=10)
+        now = time.monotonic()
+        counter.try_reserve(500, now=now)
+        counter.reconcile(estimated=500, actual=500, now=now)
+        assert counter.available(now=now) == 500.0
+        # After 11 seconds, the consumption event should have expired
+        assert counter.available(now=now + 11) == 1000.0
 
     def test_status_dict_shape(self, dashscope_module):
-        bucket = dashscope_module.TokenBucket(capacity=1000)
-        status = bucket.status()
+        counter = dashscope_module.TokenWindowCounter(capacity=1000)
+        status = counter.status()
         assert "tpm_capacity" in status
         assert "tpm_available" in status
         assert "tpm_reserved" in status
         assert status["tpm_capacity"] == 1000
 
     def test_available_never_negative(self, dashscope_module):
-        bucket = dashscope_module.TokenBucket(capacity=100)
-        now = bucket.last_refill
-        bucket.tokens = 0.0
-        # available() calls _refill(now) first, which adds a tiny amount
-        # so we just check it doesn't go below 0
-        assert bucket.available(now=now) >= 0.0
+        counter = dashscope_module.TokenWindowCounter(capacity=100)
+        now = time.monotonic()
+        counter.try_reserve(100, now=now)
+        counter.reconcile(estimated=100, actual=100)
+        assert counter.available(now=now) >= 0.0
 
     def test_refund_cannot_go_negative(self, dashscope_module):
         """Refunding more than reserved should clamp to 0."""
-        bucket = dashscope_module.TokenBucket(capacity=1000)
-        bucket.reserved = 50
-        bucket.refund(200)
-        assert bucket.reserved == 0
+        counter = dashscope_module.TokenWindowCounter(capacity=1000)
+        counter.reserved = 50
+        counter.refund(200)
+        assert counter.reserved == 0
 
 
 # ---------------------------------------------------------------------------
@@ -256,22 +272,56 @@ class TestTokenExtraction:
         body = json.dumps({
             "usage": {"total_tokens": 42, "prompt_tokens": 10, "completion_tokens": 32}
         }).encode()
-        assert dashscope_module.extract_tokens_from_response(body) == 42
+        result = dashscope_module.extract_tokens_from_response(body)
+        assert isinstance(result, dict)
+        assert result["total_tokens"] == 42
+        assert result["prompt_tokens"] == 10
+        assert result["completion_tokens"] == 32
 
     def test_extract_tokens_missing_usage(self, dashscope_module):
         body = json.dumps({"choices": []}).encode()
-        assert dashscope_module.extract_tokens_from_response(body) == 0
+        result = dashscope_module.extract_tokens_from_response(body)
+        assert isinstance(result, dict)
+        assert result["total_tokens"] == 0
 
     def test_extract_tokens_invalid_json(self, dashscope_module):
-        assert dashscope_module.extract_tokens_from_response(b"not json") == 0
+        result = dashscope_module.extract_tokens_from_response(b"not json")
+        assert isinstance(result, dict)
+        assert result["total_tokens"] == 0
 
     def test_extract_tokens_from_stream(self, dashscope_module):
         sse = b'data: {"choices": [{"delta": {"content": "hi"}}]}\n\ndata: {"usage": {"total_tokens": 55}}\n\ndata: [DONE]\n\n'
-        assert dashscope_module.extract_tokens_from_stream(sse) == 55
+        result = dashscope_module.extract_tokens_from_stream(sse)
+        assert isinstance(result, dict)
+        assert result["total_tokens"] == 55
 
     def test_extract_tokens_from_stream_no_usage(self, dashscope_module):
         sse = b'data: {"choices": []}\n\ndata: [DONE]\n\n'
-        assert dashscope_module.extract_tokens_from_stream(sse) == 0
+        result = dashscope_module.extract_tokens_from_stream(sse)
+        assert isinstance(result, dict)
+        assert result["total_tokens"] == 0
+
+    def test_extract_tokens_cached_tokens(self, dashscope_module):
+        body = json.dumps({
+            "usage": {
+                "total_tokens": 100,
+                "prompt_tokens": 60,
+                "completion_tokens": 40,
+                "input_tokens_details": {"cached_tokens": 20}
+            }
+        }).encode()
+        result = dashscope_module.extract_tokens_from_response(body)
+        assert result["cached_tokens"] == 20
+
+    def test_extract_tokens_cached_direct(self, dashscope_module):
+        body = json.dumps({
+            "usage": {
+                "total_tokens": 100,
+                "cached_tokens": 15
+            }
+        }).encode()
+        result = dashscope_module.extract_tokens_from_response(body)
+        assert result["cached_tokens"] == 15
 
     def test_estimate_tokens(self, dashscope_module):
         body = json.dumps({
@@ -524,16 +574,21 @@ class TestEstimateTokensEdgeCases:
 
 class TestExtractStreamTokensEdgeCases:
     def test_empty_buffer(self, dashscope_module):
-        assert dashscope_module.extract_tokens_from_stream(b"") == 0
+        result = dashscope_module.extract_tokens_from_stream(b"")
+        assert isinstance(result, dict)
+        assert result["total_tokens"] == 0
 
     def test_only_done_marker(self, dashscope_module):
-        assert dashscope_module.extract_tokens_from_stream(b"data: [DONE]\n\n") == 0
+        result = dashscope_module.extract_tokens_from_stream(b"data: [DONE]\n\n")
+        assert isinstance(result, dict)
+        assert result["total_tokens"] == 0
 
     def test_malformed_utf8(self, dashscope_module):
         # Invalid UTF-8 bytes
         data = b'\xff\xfe data: {"usage": {"total_tokens": 10}}'
-        # Should not raise, return 0 (or parse with replacement chars)
-        dashscope_module.extract_tokens_from_stream(data)
+        # Should not raise, return dict with total_tokens=0
+        result = dashscope_module.extract_tokens_from_stream(data)
+        assert isinstance(result, dict)
 
 
 # ---------------------------------------------------------------------------
@@ -962,19 +1017,35 @@ class TestSessionLogWriterEdgeCases:
 
 
 # ---------------------------------------------------------------------------
-# TokenBucket edge cases
+# TokenWindowCounter edge cases
 # ---------------------------------------------------------------------------
 
-class TestTokenBucketEdgeCases:
-    def test_refill_with_negative_elapsed(self, dashscope_module):
-        """Clock adjustment: last_refill is in the future."""
-        bucket = dashscope_module.TokenBucket(capacity=1000, window_seconds=60)
-        future = time.monotonic() + 100  # simulate clock went backwards
-        bucket.tokens = 500.0
-        bucket.last_refill = future
-        # available() calls _refill(now) which should handle negative elapsed
-        result = bucket.available(now=time.monotonic())
-        assert result >= 0  # should not go negative
+class TestTokenWindowCounterEdgeCases:
+    def test_prune_with_negative_elapsed(self, dashscope_module):
+        """Clock adjustment: should handle time going backwards gracefully."""
+        counter = dashscope_module.TokenWindowCounter(capacity=1000, window_seconds=60)
+        future = time.monotonic() + 100
+        counter.try_reserve(500, now=future)
+        counter.reconcile(estimated=500, actual=500)
+        # available() should handle and not go negative
+        result = counter.available(now=time.monotonic())
+        assert result >= 0
+
+    def test_wait_seconds_for_no_wait_needed(self, dashscope_module):
+        """When tokens are available, wait should be 0."""
+        counter = dashscope_module.TokenWindowCounter(capacity=1000)
+        now = time.monotonic()
+        assert counter.wait_seconds_for(100, now=now) == 0.0
+
+    def test_wait_seconds_for_when_window_full(self, dashscope_module):
+        """Wait should indicate when oldest tokens expire."""
+        counter = dashscope_module.TokenWindowCounter(capacity=1000, window_seconds=60)
+        now = time.monotonic()
+        counter.try_reserve(800, now=now)
+        counter.reconcile(estimated=800, actual=800, now=now)
+        # Need 500 more but only 200 available; must wait for the 800 to expire
+        wait = counter.wait_seconds_for(500, now=now)
+        assert wait > 0
 
 
 # ---------------------------------------------------------------------------
