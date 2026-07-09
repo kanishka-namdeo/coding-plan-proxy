@@ -8,6 +8,65 @@
     border: tall green;
     padding: 0 1;
     margin: 0;
+    overflow-y: auto;
+}
+
+#secondary-overview {
+    display: none;
+    margin: 1 0 0 0;
+    border-top: heavy $primary 30%;
+    padding-top: 1;
+}
+
+#secondary-overview.visible {
+    display: block;
+}
+
+#tertiary-overview {
+    display: none;
+    margin: 1 0 0 0;
+    border-top: heavy $primary 30%;
+    padding-top: 1;
+}
+
+#tertiary-overview.visible {
+    display: block;
+}
+
+#secondary-status-line {
+    padding: 0 1;
+    text-style: bold;
+    height: 1;
+}
+
+#secondary-status-line.status-running {
+    color: $success;
+}
+
+#secondary-status-line.status-stopped {
+    color: $error;
+}
+
+#secondary-rl-metrics {
+    height: auto;
+}
+
+#tertiary-status-line {
+    padding: 0 1;
+    text-style: bold;
+    height: 1;
+}
+
+#tertiary-status-line.status-running {
+    color: $success;
+}
+
+#tertiary-status-line.status-stopped {
+    color: $error;
+}
+
+#tertiary-rl-metrics {
+    height: auto;
 }
 
 #log-panel {

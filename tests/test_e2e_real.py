@@ -68,7 +68,7 @@ async def proxy_server(real_api_key, e2e_config):
     # Set the API key in the module before loading
     dashscope_proxy.DASHSCOPE_API_KEY = real_api_key
 
-    rate_limiter = dashscope_proxy.RateLimiter(e2e_config)
+    rate_limiter = dashscope_proxy.MultiProviderRateLimiter(e2e_config)
     app = dashscope_proxy.create_app()
     app["rate_limiter"] = rate_limiter
     app["client_session"] = aiohttp.ClientSession()
@@ -131,7 +131,7 @@ class TestRealProxyForwarding:
         assert "usage" in data
         assert data["usage"]["total_tokens"] > 0
         # Rate limiter should have recorded the request
-        assert rl.total_forwarded >= 1
+        assert rl.primary.total_forwarded >= 1
 
     def test_streaming_request(self, proxy_server):
         port, rl = proxy_server
@@ -233,8 +233,12 @@ class TestRealProxyForwarding:
                     return resp.status, await resp.json()
         status, data = asyncio.get_event_loop().run_until_complete(_do(proxy_server[0]))
         assert status == 200
-        assert "total_forwarded" in data
-        assert "rpm_limit" in data
+        # New multi-provider response structure
+        assert "rate_limits" in data
+        assert "providers" in data
+        assert "primary" in data["rate_limits"]
+        assert "total_forwarded" in data["rate_limits"]["primary"]
+        assert "rpm_limit" in data["rate_limits"]["primary"]
 
     def test_validation_empty_body(self, proxy_server):
         """Verify 400 for empty POST body."""

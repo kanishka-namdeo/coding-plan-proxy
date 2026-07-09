@@ -22,6 +22,18 @@ def map_developer_to_system(body: dict) -> dict:
     return body
 
 
+def normalize_model_name(model_name: str) -> str:
+    """Map client model aliases to canonical upstream model IDs.
+
+    Cursor and other clients often send MIMO v2.5 models with hyphens
+    (e.g. ``mimo-v2-5-pro``) while the upstream API expects dots
+    (``mimo-v2.5-pro``).
+    """
+    if model_name.startswith("mimo-v2-5"):
+        return "mimo-v2.5" + model_name[len("mimo-v2-5"):]
+    return model_name
+
+
 def _is_chat_endpoint(path: str) -> bool:
     """Check if path is a chat completion endpoint."""
     return "chat/completions" in path.lower()

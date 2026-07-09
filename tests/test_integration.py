@@ -8,6 +8,31 @@ from aiohttp import web
 import pytest
 
 import dashscope_proxy
+import dashscope_proxy_lib.handlers as _handlers_mod
+import dashscope_proxy_lib.config as _config_mod
+import dashscope_proxy_lib.provider_router as _provider_router_mod
+
+
+def _patch_target_base(new_url):
+    """Context manager to patch TARGET_BASE across all modules that reference it."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        orig_facade = dashscope_proxy.TARGET_BASE
+        orig_config = _config_mod.TARGET_BASE
+        orig_pr = _provider_router_mod.TARGET_BASE
+        dashscope_proxy.TARGET_BASE = new_url
+        _config_mod.TARGET_BASE = new_url
+        _provider_router_mod.TARGET_BASE = new_url
+        try:
+            yield
+        finally:
+            dashscope_proxy.TARGET_BASE = orig_facade
+            _config_mod.TARGET_BASE = orig_config
+            _provider_router_mod.TARGET_BASE = orig_pr
+
+    return _ctx()
 
 
 def make_test_config():
@@ -22,6 +47,14 @@ def make_test_config():
         "max_retries": 2,
         "base_backoff": 0.05,
     }
+
+
+@pytest.fixture(autouse=True)
+def _reset_provider_router():
+    """Reset the lazy provider router singleton before each test."""
+    _handlers_mod._provider_router = None
+    yield
+    _handlers_mod._provider_router = None
 
 
 @pytest.fixture
@@ -415,8 +448,25 @@ class TestProxyStatus:
         resp = await client.get("/v1/proxy/status")
         assert resp.status == 200
         data = await resp.json()
-        assert "total_forwarded" in data
-        assert "rpm_limit" in data
+        # The status endpoint returns a nested structure with rate_limits and providers
+        assert "rate_limits" in data
+        assert "providers" in data
+        # rate_limits may be flat (plain RateLimiter) or nested (MultiProviderRateLimiter)
+        rate_limits = data["rate_limits"]
+        if "primary" in rate_limits:
+            # MultiProviderRateLimiter mode
+            primary_stats = rate_limits["primary"]
+            assert "total_forwarded" in primary_stats
+            assert "rpm_limit" in primary_stats
+        else:
+            # Plain RateLimiter mode (backward compatibility)
+            assert "total_forwarded" in rate_limits
+            assert "rpm_limit" in rate_limits
+        # providers should contain primary, secondary, and tertiary availability
+        providers = data["providers"]
+        assert "primary" in providers
+        assert "secondary" in providers
+        assert "tertiary" in providers
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +609,111 @@ class TestQueueEnforcement:
         )
         assert "Retry-After" in resp.headers
 
+    async def test_queue_full_with_session_log_does_not_crash(self, aiohttp_client, proxy_app, tmp_path):
+        """Queue-full path must not crash when session logging is enabled (retry in finally)."""
+        app, rl = proxy_app
+        rl.max_queue_size = 0
+        rl.rpm_limit = 0
+        writer = dashscope_proxy.SessionLogWriter(str(tmp_path / "logs"))
+        app["session_log"] = writer
+        client = await aiohttp_client(app)
+        resp = await client.post(
+            "/v1/chat/completions",
+            data=json.dumps({
+                "model": "qwen3-coder-plus",
+                "messages": [{"role": "user", "content": "hi"}],
+            }).encode(),
+        )
+        assert resp.status == 503
+        writer.close()
+        log_files = list((tmp_path / "logs").glob("*.jsonl"))
+        assert len(log_files) == 1
+        lines = log_files[0].read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry["error_reason"] == "queue_full"
+        assert entry["retry_count"] == 0
+
+    async def test_disconnect_during_queue_returns_499(self, aiohttp_client, proxy_app, monkeypatch):
+        """Client disconnect while queued must return 499, not 503 queue full."""
+        app, rl = proxy_app
+        rl.rpm_limit = 1
+        rl.rps_limit = 1
+        rl.max_queue_size = 50
+        rl.rpm_window.add()
+
+        disconnected = True
+
+        def fake_disconnected(request):
+            return disconnected
+
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.queue._client_disconnected",
+            fake_disconnected,
+        )
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.handlers._client_disconnected",
+            fake_disconnected,
+        )
+
+        client = await aiohttp_client(app)
+        resp = await client.post(
+            "/v1/chat/completions",
+            data=json.dumps({
+                "model": "qwen3-coder-plus",
+                "messages": [{"role": "user", "content": "hi"}],
+            }).encode(),
+        )
+        assert resp.status == 499
+        assert rl.queue_drops == 0
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker token cleanup
+# ---------------------------------------------------------------------------
+
+class TestCircuitBreakerCleanup:
+    async def test_circuit_open_refunds_reserved_tokens(self, aiohttp_client, proxy_app):
+        """Reserved TPM must be released when circuit breaker rejects a queued request."""
+        app, rl = proxy_app
+        rl.circuit_threshold = 1
+        rl.record_circuit_failure()
+        assert rl.circuit_is_open()
+
+        upstream_app = web.Application()
+
+        async def mock_upstream(request):
+            return web.json_response({"choices": [], "usage": {"total_tokens": 5}})
+
+        upstream_app.router.add_post("/v1/chat/completions", mock_upstream)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }).encode(),
+                    )
+                    assert resp.status == 503
+                    assert rl.tpm_bucket.reserved == 0
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
+
 
 # ---------------------------------------------------------------------------
 # Graceful shutdown
@@ -635,6 +790,49 @@ class TestStreamingErrors:
                     assert resp.status == 200
                     text = await resp.text()
                     assert "data:" in text
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
+
+    async def test_streaming_4xx_forwarded_not_500(self, aiohttp_client, proxy_app):
+        """Streaming request: upstream 400 must be forwarded, not crash with 500."""
+        upstream_app = web.Application()
+
+        async def bad_request_upstream(request):
+            return web.Response(
+                status=400,
+                body=b'{"error":{"message":"invalid request"}}',
+                content_type="application/json",
+            )
+
+        upstream_app.router.add_post("/v1/chat/completions", bad_request_upstream)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                app, _ = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": True,
+                        }).encode(),
+                    )
+                    assert resp.status == 400
+                    data = await resp.json()
+                    assert "invalid request" in data["error"]["message"]
             finally:
                 dashscope_proxy.TARGET_BASE = original_target
         finally:
@@ -892,6 +1090,52 @@ class TestMaxRetriesExhausted:
         finally:
             await upstream_runner.cleanup()
 
+    async def test_quota_exceeded_429_not_retried(self, aiohttp_client, proxy_app):
+        """Hard quota 429 from upstream is passed through immediately without retry."""
+        upstream_app = web.Application()
+        quota_body = json.dumps({
+            "error": {
+                "code": "throttling",
+                "message": "usage allocated quota exceeded. please try again later.",
+            }
+        }).encode()
+
+        async def quota_429(request):
+            return web.Response(status=429, body=quota_body, content_type="application/json")
+
+        upstream_app.router.add_post("/v1/chat/completions", quota_429)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                app, rl = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }).encode(),
+                    )
+                    assert resp.status == 429
+                    data = await resp.json()
+                    assert "quota exceeded" in data["error"]["message"].lower()
+                    limiter = rl.primary if hasattr(rl, "primary") else rl
+                    assert limiter.total_429s == 1
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
+
 
 # ---------------------------------------------------------------------------
 # ClientError handling
@@ -904,6 +1148,7 @@ class TestClientError:
         rl.max_retries = 1
 
         mock_session = MagicMock()
+        mock_session.closed = False
         mock_session.request = MagicMock(side_effect=aiohttp.ClientError("connection refused"))
 
         async with mock_session:
@@ -1035,8 +1280,8 @@ class TestUnserializableBody:
                 "messages": [{"role": "user", "content": "hi"}],
             }).encode(),
         )
-        # Normal path works -> 200 or some error
-        assert resp.status in (200, 400, 500, 503)
+        # Normal path works -> 200 or some error (502 when mock session cannot forward)
+        assert resp.status in (200, 400, 500, 502, 503)
 
 
 # ---------------------------------------------------------------------------
@@ -1442,3 +1687,270 @@ class TestRequestLifecycle:
                 dashscope_proxy.TARGET_BASE = original_target
         finally:
             await upstream_runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Secondary provider routing
+# ---------------------------------------------------------------------------
+
+class TestSecondaryProviderRouting:
+    """Integration tests for secondary provider routing via model name."""
+
+    async def test_secondary_model_forwarded_to_secondary_upstream(self, aiohttp_client, proxy_app, monkeypatch):
+        """A request with a secondary model name should be forwarded to the secondary upstream."""
+        import dashscope_proxy_lib.config as cfg
+
+        # Set up a mock secondary upstream
+        secondary_app = web.Application()
+        received_headers = {}
+
+        async def secondary_handler(request):
+            nonlocal received_headers
+            received_headers = dict(request.headers)
+            return web.json_response({
+                "id": "resp-secondary",
+                "choices": [{"message": {"role": "assistant", "content": "from secondary"}}],
+                "usage": {"total_tokens": 15},
+            })
+
+        secondary_app.router.add_post("/v1/chat/completions", secondary_handler)
+        secondary_runner = web.AppRunner(secondary_app)
+        await secondary_runner.setup()
+        secondary_site = web.TCPSite(secondary_runner, "127.0.0.1", 0)
+        await secondary_site.start()
+        secondary_port = secondary_site._server.sockets[0].getsockname()[1]
+
+        # Patch secondary provider config
+        monkeypatch.setattr(cfg, "SECONDARY_API_KEY", "sk-secondary-test")
+        monkeypatch.setattr(cfg, "SECONDARY_BASE_URL", f"http://127.0.0.1:{secondary_port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "mimo-v2.5-pro",
+                        "messages": [{"role": "user", "content": "hello secondary"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["id"] == "resp-secondary"
+                # Verify the secondary API key was used
+                assert received_headers.get("Authorization") == "Bearer sk-secondary-test"
+        finally:
+            await secondary_runner.cleanup()
+
+    async def test_mimo_hyphen_alias_forwarded_to_secondary_upstream(
+        self, aiohttp_client, proxy_app, monkeypatch,
+    ):
+        """Cursor sends mimo-v2-5 (hyphens) — must route to secondary, not primary."""
+        import dashscope_proxy_lib.config as cfg
+
+        secondary_app = web.Application()
+        received = {}
+
+        async def secondary_handler(request):
+            received["headers"] = dict(request.headers)
+            received["body"] = await request.json()
+            return web.json_response({
+                "id": "resp-secondary-alias",
+                "choices": [{"message": {"role": "assistant", "content": "from secondary alias"}}],
+                "usage": {"total_tokens": 12},
+            })
+
+        secondary_app.router.add_post("/v1/chat/completions", secondary_handler)
+        secondary_runner = web.AppRunner(secondary_app)
+        await secondary_runner.setup()
+        secondary_site = web.TCPSite(secondary_runner, "127.0.0.1", 0)
+        await secondary_site.start()
+        secondary_port = secondary_site._server.sockets[0].getsockname()[1]
+
+        monkeypatch.setattr(cfg, "SECONDARY_API_KEY", "sk-secondary-test")
+        monkeypatch.setattr(cfg, "SECONDARY_BASE_URL", f"http://127.0.0.1:{secondary_port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                for model in ("mimo-v2-5", "mimo-v2-5-pro"):
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": model,
+                            "messages": [{"role": "user", "content": f"hello {model}"}],
+                        }).encode(),
+                    )
+                    assert resp.status == 200, f"{model} should reach secondary upstream"
+                    data = await resp.json()
+                    assert data["id"] == "resp-secondary-alias"
+                    assert received["headers"].get("Authorization") == "Bearer sk-secondary-test"
+                    # Upstream body should use canonical dotted model name
+                    assert received["body"]["model"].startswith("mimo-v2.5")
+        finally:
+            await secondary_runner.cleanup()
+
+    async def test_primary_model_still_forwarded_to_primary(self, aiohttp_client, proxy_app, monkeypatch):
+        """A request with a primary model should still go to primary even when secondary is configured."""
+        primary_app = web.Application()
+
+        async def primary_handler(request):
+            return web.json_response({
+                "id": "resp-primary",
+                "choices": [{"message": {"role": "assistant", "content": "from primary"}}],
+                "usage": {"total_tokens": 10},
+            })
+
+        primary_app.router.add_post("/v1/chat/completions", primary_handler)
+        primary_runner = web.AppRunner(primary_app)
+        await primary_runner.setup()
+        primary_site = web.TCPSite(primary_runner, "127.0.0.1", 0)
+        await primary_site.start()
+        primary_port = primary_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{primary_port}"
+            try:
+                app, _ = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hello primary"}],
+                        }).encode(),
+                    )
+                    assert resp.status == 200
+                    data = await resp.json()
+                    assert data["id"] == "resp-primary"
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await primary_runner.cleanup()
+
+    async def test_models_endpoint_includes_secondary_when_configured(self, aiohttp_client, proxy_app, monkeypatch):
+        """GET /v1/models should include secondary models when secondary is configured."""
+        import dashscope_proxy_lib.config as cfg
+
+        monkeypatch.setattr(cfg, "SECONDARY_API_KEY", "sk-secondary-test")
+        monkeypatch.setattr(cfg, "SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+
+        app, _ = proxy_app
+        client = await aiohttp_client(app)
+        resp = await client.get("/v1/models")
+        assert resp.status == 200
+        data = await resp.json()
+        model_ids = [m["id"] for m in data["data"]]
+        assert "qwen3-coder-plus" in model_ids
+        assert "mimo-v2.5-pro" in model_ids
+
+    async def test_status_endpoint_shows_secondary_provider(self, aiohttp_client, proxy_app, monkeypatch):
+        """Status endpoint should show secondary provider availability."""
+        import dashscope_proxy_lib.config as cfg
+
+        monkeypatch.setattr(cfg, "SECONDARY_API_KEY", "sk-secondary-test")
+        monkeypatch.setattr(cfg, "SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+
+        app, _ = proxy_app
+        client = await aiohttp_client(app)
+        resp = await client.get("/v1/proxy/status")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "providers" in data
+        assert data["providers"]["secondary"]["available"] is True
+
+
+# ---------------------------------------------------------------------------
+# Tertiary provider routing (StreamLake)
+# ---------------------------------------------------------------------------
+
+class TestTertiaryProviderRouting:
+    """Integration tests for tertiary (StreamLake) provider routing via model name."""
+
+    async def test_tertiary_model_forwarded_to_tertiary_upstream(self, aiohttp_client, proxy_app, monkeypatch):
+        """A request with kat-coder-pro-v2 should be forwarded to the StreamLake upstream."""
+        import dashscope_proxy_lib.config as cfg
+
+        tertiary_app = web.Application()
+        received_headers = {}
+
+        async def tertiary_handler(request):
+            nonlocal received_headers
+            received_headers = dict(request.headers)
+            return web.json_response({
+                "id": "resp-tertiary",
+                "choices": [{"message": {"role": "assistant", "content": "from streamlake"}}],
+                "usage": {"total_tokens": 15},
+            })
+
+        tertiary_app.router.add_post("/v1/chat/completions", tertiary_handler)
+        tertiary_runner = web.AppRunner(tertiary_app)
+        await tertiary_runner.setup()
+        tertiary_site = web.TCPSite(tertiary_runner, "127.0.0.1", 0)
+        await tertiary_site.start()
+        tertiary_port = tertiary_site._server.sockets[0].getsockname()[1]
+
+        monkeypatch.setattr(cfg, "TERTIARY_API_KEY", "sk-streamlake-test")
+        monkeypatch.setattr(cfg, "TERTIARY_BASE_URL", f"http://127.0.0.1:{tertiary_port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "kat-coder-pro-v2",
+                        "messages": [{"role": "user", "content": "hello streamlake"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["id"] == "resp-tertiary"
+                assert received_headers.get("Authorization") == "Bearer sk-streamlake-test"
+        finally:
+            await tertiary_runner.cleanup()
+
+    async def test_models_endpoint_includes_tertiary_when_configured(self, aiohttp_client, proxy_app, monkeypatch):
+        """GET /v1/models should include StreamLake models when tertiary is configured."""
+        import dashscope_proxy_lib.config as cfg
+
+        monkeypatch.setattr(cfg, "TERTIARY_API_KEY", "sk-streamlake-test")
+        monkeypatch.setattr(
+            cfg, "TERTIARY_BASE_URL",
+            "https://vanchin.streamlake.ai/api/gateway/coding/v1",
+        )
+
+        app, _ = proxy_app
+        client = await aiohttp_client(app)
+        resp = await client.get("/v1/models")
+        assert resp.status == 200
+        data = await resp.json()
+        model_ids = [m["id"] for m in data["data"]]
+        assert "kat-coder-pro-v2" in model_ids
+
+    async def test_status_endpoint_shows_tertiary_provider(self, aiohttp_client, proxy_app, monkeypatch):
+        """Status endpoint should show tertiary provider availability."""
+        import dashscope_proxy_lib.config as cfg
+
+        monkeypatch.setattr(cfg, "TERTIARY_API_KEY", "sk-streamlake-test")
+        monkeypatch.setattr(
+            cfg, "TERTIARY_BASE_URL",
+            "https://vanchin.streamlake.ai/api/gateway/coding/v1",
+        )
+
+        app, _ = proxy_app
+        client = await aiohttp_client(app)
+        resp = await client.get("/v1/proxy/status")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "providers" in data
+        assert data["providers"]["tertiary"]["available"] is True

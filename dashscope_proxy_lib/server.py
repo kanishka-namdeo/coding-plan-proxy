@@ -7,25 +7,43 @@ import time
 
 import aiohttp
 from aiohttp import web
+from aiohttp.web_exceptions import HTTPRequestEntityTooLarge
 
 from dashscope_proxy_lib.config import (
-    DASHSCOPE_API_KEY, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_HOST, PROXY_HOST,
-    PROXY_PORT, TARGET_BASE, UPSTREAM_TIMEOUT_CONNECT, UPSTREAM_TIMEOUT_TOTAL,
+    DASHSCOPE_API_KEY, MAX_BODY_SIZE, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_HOST,
+    PROXY_HOST, PROXY_PORT, TARGET_BASE, UPSTREAM_TIMEOUT_CONNECT,
+    UPSTREAM_TIMEOUT_TOTAL, SECONDARY_API_KEY, SECONDARY_BASE_URL,
+    SECONDARY_CODING_PLAN_CONFIG, TERTIARY_API_KEY, TERTIARY_BASE_URL,
+    TERTIARY_CODING_PLAN_CONFIG,
 )
-from dashscope_proxy_lib.rate_limiter import RateLimiter
+from dashscope_proxy_lib.rate_limiter import RateLimiter, MultiProviderRateLimiter
 from dashscope_proxy_lib.session_log import SessionLogWriter, SESSION_LOG_DIR, SESSION_LOG_ENABLED
 from dashscope_proxy_lib.logging_config import _log, tui_handler
 from dashscope_proxy_lib.handlers import handle_request
 from dashscope_proxy_lib.config import _load_config
 
 
+@web.middleware
+async def error_middleware(request: web.Request, handler):
+    """Catch unhandled exceptions so clients get JSON errors instead of aiohttp 500 pages."""
+    try:
+        return await handler(request)
+    except HTTPRequestEntityTooLarge:
+        return web.json_response({"error": "payload too large"}, status=413)
+    except Exception:
+        _log(logging.ERROR, "unhandled proxy exception",
+             path=request.path, method=request.method, exc_info=True)
+        return web.json_response({"error": "internal proxy error"}, status=502)
+
+
 def create_app() -> web.Application:
-    app = web.Application()
+    # Allow slightly over MAX_BODY_SIZE so the handler can return a proper 413 JSON body.
+    app = web.Application(middlewares=[error_middleware], client_max_size=MAX_BODY_SIZE + 1024)
     app.add_routes([web.route("*", "/{tail:.*}", handle_request)])
     return app
 
 
-async def create_proxy_resources() -> tuple[RateLimiter, web.Application, web.AppRunner]:
+async def create_proxy_resources() -> tuple[MultiProviderRateLimiter, web.Application, web.AppRunner]:
     """Create and start all proxy resources (rate limiter, app, client session, runner).
 
     Returns (rate_limiter, app, runner) ready for TUI integration.
@@ -35,7 +53,18 @@ async def create_proxy_resources() -> tuple[RateLimiter, web.Application, web.Ap
         raise SystemExit(1)
 
     config = _load_config()
-    rate_limiter = RateLimiter(config)
+
+    # Create multi-provider rate limiter
+    secondary_config = SECONDARY_CODING_PLAN_CONFIG if (SECONDARY_API_KEY and SECONDARY_BASE_URL) else None
+    tertiary_config = TERTIARY_CODING_PLAN_CONFIG if (TERTIARY_API_KEY and TERTIARY_BASE_URL) else None
+    rate_limiter = MultiProviderRateLimiter(config, secondary_config, tertiary_config)
+
+    if secondary_config or tertiary_config:
+        _log(logging.INFO, "multi-provider mode enabled",
+             secondary_url=SECONDARY_BASE_URL if secondary_config else None,
+             tertiary_url=TERTIARY_BASE_URL if tertiary_config else None)
+    else:
+        _log(logging.INFO, "single-provider mode (secondary/tertiary not configured)")
 
     app = create_app()
     timeout = aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_TOTAL, connect=UPSTREAM_TIMEOUT_CONNECT)
@@ -43,8 +72,10 @@ async def create_proxy_resources() -> tuple[RateLimiter, web.Application, web.Ap
         limit=MAX_CONNECTIONS,
         limit_per_host=MAX_CONNECTIONS_PER_HOST,
         ttl_dns_cache=300,
+        enable_cleanup_closed=True,
     )
     app["client_session"] = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    app["connector"] = connector
     app["rate_limiter"] = rate_limiter
     app["shutting_down"] = asyncio.Event()
     app["event_loop"] = asyncio.get_event_loop()
@@ -59,11 +90,11 @@ async def create_proxy_resources() -> tuple[RateLimiter, web.Application, web.Ap
 
     _log(logging.INFO, "proxy started",
          host=PROXY_HOST, port=PROXY_PORT, target=TARGET_BASE,
-         rps=rate_limiter.rps_limit, rpm=rate_limiter.rpm_limit,
-         tpm=rate_limiter.tpm_limit,
-         quota_5h=rate_limiter.hour5_limit,
-         quota_week=rate_limiter.week_limit,
-         quota_month=rate_limiter.month_limit,
+         rps=rate_limiter.primary.rps_limit, rpm=rate_limiter.primary.rpm_limit,
+         tpm=rate_limiter.primary.tpm_limit,
+         quota_5h=rate_limiter.primary.hour5_limit,
+         quota_week=rate_limiter.primary.week_limit,
+         quota_month=rate_limiter.primary.month_limit,
          safety_factor=config["safety_factor"])
 
     # Signal handlers
@@ -110,8 +141,13 @@ async def cleanup_proxy_resources(
     _log(logging.INFO, "final metrics", metrics=rate_limiter.status())
 
     session = app.get("client_session")
+    connector = app.get("connector")
     if session and not session.closed:
         await session.close()
+        # Allow in-flight transports to finish closing before runner teardown.
+        await asyncio.sleep(0.25)
+    if connector is not None and not connector.closed:
+        await connector.close()
     session_log = app.get("session_log")
     if session_log:
         session_log.close()

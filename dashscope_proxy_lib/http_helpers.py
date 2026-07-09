@@ -1,5 +1,7 @@
 """HTTP helper utilities for the DashScope proxy."""
 
+import asyncio
+import json
 import random
 import time
 from email.utils import parsedate_to_datetime
@@ -10,6 +12,15 @@ from aiohttp import web
 
 from dashscope_proxy_lib.config import HOP_BY_HOP_HEADERS
 from dashscope_proxy_lib.rate_limiter import RateLimiter
+
+# Substrings in 429 bodies that indicate a hard quota limit (not transient rate limiting).
+_NON_RETRYABLE_429_MARKERS = (
+    "quota exceeded",
+    "allocated quota",
+    "insufficient_quota",
+    "billing_hard_limit",
+    "exceeded your current quota",
+)
 
 
 def parse_retry_after(header_value: str) -> float | None:
@@ -66,6 +77,55 @@ def _compute_backoff(rate_limiter: RateLimiter, attempt: int) -> float:
     return rate_limiter.base_backoff * (2 ** attempt) * random.uniform(0.5, 1.5)
 
 
+def should_retry_429(error_body: bytes) -> bool:
+    """Return False when upstream 429 indicates a hard quota limit (do not retry)."""
+    if not error_body:
+        return True
+    text = error_body.decode(errors="replace").lower()
+    if any(marker in text for marker in _NON_RETRYABLE_429_MARKERS):
+        return False
+    try:
+        payload = json.loads(error_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return True
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = str(error.get("code", "")).lower()
+        message = str(error.get("message", "")).lower()
+        if code in ("insufficient_quota", "billing_hard_limit", "quota_exceeded"):
+            return False
+        if any(marker in message for marker in _NON_RETRYABLE_429_MARKERS):
+            return False
+    return True
+
+
+async def _sleep_interruptible(request: web.Request, seconds: float, chunk: float = 0.5) -> bool:
+    """Sleep up to *seconds*, checking for client disconnect. Returns False if disconnected."""
+    remaining = max(0.0, seconds)
+    while remaining > 0:
+        if _client_disconnected(request):
+            return False
+        step = min(chunk, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+    return not _client_disconnected(request)
+
+
+def _upstream_error_response(
+    status: int,
+    body: bytes,
+    upstream_headers: dict,
+    request_id: str,
+) -> web.Response:
+    """Build a proxied error response from upstream status/body/headers."""
+    content_type = upstream_headers.get("Content-Type", "application/json")
+    content_type = content_type.split(";")[0].strip()
+    resp = web.Response(status=status, body=body, content_type=content_type)
+    resp.headers["X-Request-ID"] = request_id
+    _add_forwarded_headers(resp, upstream_headers)
+    return resp
+
+
 def _add_forwarded_headers(response: web.Response, upstream_headers: dict | aiohttp.ClientResponse) -> None:
     """Forward meaningful upstream headers, stripping hop-by-hop."""
     if isinstance(upstream_headers, aiohttp.ClientResponse):
@@ -74,5 +134,24 @@ def _add_forwarded_headers(response: web.Response, upstream_headers: dict | aioh
         hdrs = dict(upstream_headers)
     clean = _strip_hop_by_hop(hdrs)
     for k, v in clean.items():
-        if k.lower() not in ("content-type", "content-length", "transfer-encoding"):
+        if k.lower() not in ("content-type", "content-length", "transfer-encoding", "content-encoding"):
             response.headers[k] = v
+
+
+def _sse_response_headers() -> dict[str, str]:
+    """Headers required for SSE to stream correctly through reverse proxies/tunnels."""
+    return {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+
+async def _finalize_stream_response(resp: web.StreamResponse) -> web.StreamResponse:
+    """Finish a prepared stream response; ignore errors if the client already left."""
+    try:
+        await resp.write_eof()
+    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, asyncio.CancelledError):
+        pass
+    return resp

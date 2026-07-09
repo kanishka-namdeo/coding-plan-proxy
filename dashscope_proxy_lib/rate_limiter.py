@@ -60,9 +60,10 @@ class TokenWindowCounter:
     Pattern: reserve before send, reconcile after response, refund on error.
     """
 
-    def __init__(self, capacity: int, window_seconds: int = 60):
+    def __init__(self, capacity: int, window_seconds: int = 60, max_size: int = 100_000):
         self.capacity = capacity
         self.window_seconds = window_seconds
+        self.max_size = max_size
         self.window: deque[tuple[float, int]] = deque()
         self.reserved = 0  # tokens reserved for in-flight requests
         self._lock = threading.Lock()
@@ -71,6 +72,9 @@ class TokenWindowCounter:
         """Must be called with self._lock held."""
         cutoff = now - self.window_seconds
         while self.window and self.window[0][0] < cutoff:
+            self.window.popleft()
+        # Enforce max_size to prevent unbounded growth
+        while len(self.window) > self.max_size:
             self.window.popleft()
 
     def _tokens_used(self, now: float) -> int:
@@ -105,6 +109,7 @@ class TokenWindowCounter:
             self.reserved = max(0, self.reserved - estimated)
             ts = now if now is not None else time.monotonic()
             self.window.append((ts, actual))
+            self._prune(ts)
 
     def refund(self, tokens: int) -> None:
         """Release reserved tokens back (on upstream error)."""
@@ -206,8 +211,9 @@ class RateLimiter:
         self.circuit_cooldown = 30.0
         self.circuit_threshold = config.get("circuit_threshold", 10)
 
-        # Per-model usage tracking
+        # Per-model usage tracking (capped to prevent unbounded growth)
         self.model_usage: dict[str, ModelStats] = {}
+        self.model_usage_max = 100  # Evict least-recently-used models beyond this
 
         # Recent request latencies for percentile computation
         self.recent_latencies: deque = deque(maxlen=1000)
@@ -298,6 +304,11 @@ class RateLimiter:
     def record_model_stats(self, model: str, tokens: int, latency_ms: float, is_429: bool = False) -> None:
         """Record per-model usage statistics. Thread-safe for async callers."""
         if model not in self.model_usage:
+            # Evict oldest entries if at capacity
+            if len(self.model_usage) >= self.model_usage_max:
+                oldest_keys = sorted(self.model_usage, key=lambda k: self.model_usage[k].requests)[:10]
+                for k in oldest_keys:
+                    del self.model_usage[k]
             self.model_usage[model] = ModelStats()
         stats = self.model_usage[model]
         stats.requests += 1
@@ -426,3 +437,184 @@ class RateLimiter:
         if c >= len(sorted_vals):
             return round(sorted_vals[f], 1)
         return round(sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f), 1)
+
+
+class MultiProviderRateLimiter:
+    """
+    Container for multiple rate limiters (one per provider).
+    
+    When secondary provider has different limits than primary,
+    maintains independent rate limiters for each provider.
+    Otherwise, uses shared limits for backward compatibility.
+    
+    Duck-types as RateLimiter for queue management (pending_requests,
+    is_queue_full, max_queue_size) while delegating rate limiting
+    decisions to the provider-specific sub-limiter.
+    """
+
+    def __init__(
+        self,
+        primary_config: dict,
+        secondary_config: dict | None = None,
+        tertiary_config: dict | None = None,
+    ):
+        self.primary = RateLimiter(primary_config)
+        self.primary_config = primary_config
+
+        self.secondary: RateLimiter | None = None
+        self.secondary_config = secondary_config
+
+        self.tertiary: RateLimiter | None = None
+        self.tertiary_config = tertiary_config
+
+        if secondary_config:
+            self.secondary = RateLimiter(secondary_config)
+            limits_differ = any(
+                primary_config.get(k) != secondary_config.get(k)
+                for k in ["rpm_limit", "tpm_limit", "requests_per_5h",
+                         "requests_per_week", "requests_per_month"]
+            )
+            if limits_differ:
+                _log(logging.INFO, "secondary rate limiter created with independent limits")
+            else:
+                _log(logging.INFO, "secondary rate limiter created with shared limits")
+
+        if tertiary_config:
+            self.tertiary = RateLimiter(tertiary_config)
+            limits_differ = any(
+                primary_config.get(k) != tertiary_config.get(k)
+                for k in ["rpm_limit", "tpm_limit", "requests_per_5h",
+                         "requests_per_week", "requests_per_month"]
+            )
+            if limits_differ:
+                _log(logging.INFO, "tertiary rate limiter created with independent limits")
+            else:
+                _log(logging.INFO, "tertiary rate limiter created with shared limits")
+
+        # Global pending request counter (shared across providers for queue management)
+        self._pending_requests = 0
+
+    def get_limiter_for_provider(self, provider_name: str) -> RateLimiter:
+        """Get the appropriate rate limiter for a provider."""
+        if provider_name == "tertiary" and self.tertiary:
+            return self.tertiary
+        if provider_name == "secondary" and self.secondary:
+            return self.secondary
+        return self.primary
+
+    # --- Queue management (global, shared across providers) ---
+
+    @property
+    def pending_requests(self) -> int:
+        return self._pending_requests
+
+    @pending_requests.setter
+    def pending_requests(self, value: int):
+        self._pending_requests = max(0, value)
+
+    @property
+    def max_queue_size(self) -> int:
+        return self.primary.max_queue_size
+
+    @max_queue_size.setter
+    def max_queue_size(self, value: int):
+        self.primary.max_queue_size = value
+        if self.secondary:
+            self.secondary.max_queue_size = value
+        if self.tertiary:
+            self.tertiary.max_queue_size = value
+
+    def is_queue_full(self) -> bool:
+        return self._pending_requests > self.primary.max_queue_size
+
+    # --- Provider-aware rate limiting ---
+
+    async def can_proceed_for_provider(self, estimated_tokens: int = 0, provider_name: str = "primary") -> tuple[bool, str, float]:
+        """Check if a request can proceed for a specific provider."""
+        limiter = self.get_limiter_for_provider(provider_name)
+        return await limiter.can_proceed(estimated_tokens)
+
+    async def reserve_tokens_for_provider(self, estimated_tokens: int, provider_name: str = "primary") -> bool:
+        limiter = self.get_limiter_for_provider(provider_name)
+        return await limiter.reserve_tokens(estimated_tokens)
+
+    async def reconcile_tokens_for_provider(self, estimated: int, actual: int, provider_name: str = "primary") -> None:
+        limiter = self.get_limiter_for_provider(provider_name)
+        await limiter.reconcile_tokens(estimated, actual)
+
+    async def refund_tokens_for_provider(self, estimated_tokens: int, provider_name: str = "primary") -> None:
+        limiter = self.get_limiter_for_provider(provider_name)
+        await limiter.refund_tokens(estimated_tokens)
+
+    # --- Backward-compatible delegates (use primary) ---
+    # These allow existing code that calls rate_limiter.can_proceed() etc.
+    # to work without changes when no provider is specified.
+
+    async def can_proceed(self, estimated_tokens: int = 0) -> tuple[bool, str, float]:
+        return await self.primary.can_proceed(estimated_tokens)
+
+    async def reserve_tokens(self, estimated_tokens: int) -> bool:
+        return await self.primary.reserve_tokens(estimated_tokens)
+
+    async def reconcile_tokens(self, estimated: int, actual: int) -> None:
+        await self.primary.reconcile_tokens(estimated, actual)
+
+    async def refund_tokens(self, estimated_tokens: int) -> None:
+        await self.primary.refund_tokens(estimated_tokens)
+
+    async def record_request(self, tokens_used: int = 0) -> None:
+        await self.primary.record_request(tokens_used)
+
+    async def remaining_tpm(self) -> int:
+        return await self.primary.remaining_tpm()
+
+    # --- Delegated to primary (used by handler for shared stats) ---
+
+    @property
+    def rps_limit(self) -> int:
+        return self.primary.rps_limit
+
+    @property
+    def max_retries(self) -> int:
+        return self.primary.max_retries
+
+    @property
+    def queue_drops(self) -> int:
+        return self.primary.queue_drops
+
+    @queue_drops.setter
+    def queue_drops(self, value: int):
+        self.primary.queue_drops = value
+
+    @property
+    def total_rejected(self) -> int:
+        return self.primary.total_rejected
+
+    @total_rejected.setter
+    def total_rejected(self, value: int):
+        self.primary.total_rejected = value
+
+    @property
+    def queue_wait_times(self):
+        return self.primary.queue_wait_times
+
+    # --- Status ---
+
+    def status(self) -> dict:
+        """Return combined status from all limiters."""
+        result = {
+            "primary": self.primary.status(),
+            "shared_limits": self.secondary is None and self.tertiary is None,
+        }
+
+        if self.secondary:
+            result["secondary"] = self.secondary.status()
+        else:
+            result["secondary"] = None
+
+        if self.tertiary:
+            result["tertiary"] = self.tertiary.status()
+        else:
+            result["tertiary"] = None
+
+        return result

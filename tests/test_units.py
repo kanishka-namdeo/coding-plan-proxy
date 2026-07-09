@@ -374,6 +374,25 @@ class TestMapDeveloperToSystem:
 
 
 # ---------------------------------------------------------------------------
+# normalize_model_name
+# ---------------------------------------------------------------------------
+
+class TestNormalizeModelName:
+    def test_mimo_v25_hyphen_alias(self, dashscope_module):
+        assert dashscope_module.normalize_model_name("mimo-v2-5") == "mimo-v2.5"
+
+    def test_mimo_v25_pro_hyphen_alias(self, dashscope_module):
+        assert dashscope_module.normalize_model_name("mimo-v2-5-pro") == "mimo-v2.5-pro"
+
+    def test_canonical_mimo_names_unchanged(self, dashscope_module):
+        assert dashscope_module.normalize_model_name("mimo-v2.5-pro") == "mimo-v2.5-pro"
+        assert dashscope_module.normalize_model_name("mimo-v2-pro") == "mimo-v2-pro"
+
+    def test_primary_models_unchanged(self, dashscope_module):
+        assert dashscope_module.normalize_model_name("qwen3-coder-plus") == "qwen3-coder-plus"
+
+
+# ---------------------------------------------------------------------------
 # parse_retry_after
 # ---------------------------------------------------------------------------
 
@@ -415,6 +434,27 @@ class TestParseRetryAfter:
 
     def test_empty_string(self, dashscope_module):
         assert dashscope_module.parse_retry_after("") is None
+
+
+# ---------------------------------------------------------------------------
+# should_retry_429
+# ---------------------------------------------------------------------------
+
+class TestShouldRetry429:
+    def test_transient_rate_limit_retries(self, dashscope_module):
+        body = b'{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached"}}'
+        assert dashscope_module.should_retry_429(body) is True
+
+    def test_quota_exceeded_no_retry(self, dashscope_module):
+        body = b'{"error":{"code":"throttling","message":"usage allocated quota exceeded. please try again later."}}'
+        assert dashscope_module.should_retry_429(body) is False
+
+    def test_insufficient_quota_code_no_retry(self, dashscope_module):
+        body = b'{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}'
+        assert dashscope_module.should_retry_429(body) is False
+
+    def test_empty_body_retries(self, dashscope_module):
+        assert dashscope_module.should_retry_429(b"") is True
 
 
 # ---------------------------------------------------------------------------
@@ -1113,3 +1153,300 @@ class TestLoadConfig:
         monkeypatch.setenv("PROXY_RPM_LIMIT", "not-a-number")
         config = dashscope_module._load_config()
         assert config["rpm_limit"] == dashscope_module.CODING_PLAN_CONFIG["rpm_limit"]
+
+
+# ---------------------------------------------------------------------------
+# ProviderRouter
+# ---------------------------------------------------------------------------
+
+class TestProviderRouter:
+    def test_primary_always_available(self, dashscope_module):
+        router = dashscope_module.ProviderRouter()
+        assert router.primary.is_available is True
+
+    def test_get_provider_for_model_defaults_to_primary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model("qwen3-coder-plus")
+        assert provider.name == "primary"
+
+    def test_secondary_model_routed_to_secondary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+        router = dashscope_module.ProviderRouter()
+        assert router.secondary.is_available is True
+        provider = router.get_provider_for_model("mimo-v2.5-pro")
+        assert provider.name == "secondary"
+
+    def test_secondary_model_hyphen_alias_routed_to_secondary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model("mimo-v2-5-pro")
+        assert provider.name == "secondary"
+
+    def test_mimo_v25_base_hyphen_alias_routed_to_secondary(self, dashscope_module, monkeypatch):
+        """Cursor sends 'mimo-v2-5' (no suffix) for the base model."""
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model("mimo-v2-5")
+        assert provider.name == "secondary"
+
+    @pytest.mark.parametrize("model_id", [
+        "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2.5-asr", "mimo-v2.5-tts",
+        "mimo-v2.5-tts-voiceclone", "mimo-v2.5-tts-voicedesign",
+        "mimo-v2-pro", "mimo-v2-omni", "mimo-v2-tts",
+    ])
+    def test_all_secondary_models_routed_to_secondary(self, dashscope_module, monkeypatch, model_id):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model(model_id).name == "secondary"
+
+    @pytest.mark.parametrize("model_id", [
+        "qwen3.6-plus", "qwen3.7-plus", "qwen3.5-plus", "qwen3-max",
+        "qwen3-coder-plus", "qwen3-coder-next", "kimi-k2-5", "glm-5-0", "MiniMax-M2.5",
+    ])
+    def test_all_primary_models_routed_to_primary(self, dashscope_module, monkeypatch, model_id):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model(model_id).name == "primary"
+
+    def test_unknown_model_defaults_to_primary_even_with_secondary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model("qwen3-coder-plus")
+        assert provider.name == "primary"
+
+    def test_secondary_unconfigured_returns_primary_for_secondary_models(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model("mimo-v2.5-pro")
+        assert provider.name == "primary"
+
+    def test_get_all_models_includes_secondary_when_configured(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        model_ids = [m["id"] for m in models["data"]]
+        assert "qwen3-coder-plus" in model_ids
+        assert "mimo-v2.5-pro" in model_ids
+
+    def test_get_all_models_excludes_secondary_when_not_configured(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        model_ids = [m["id"] for m in models["data"]]
+        assert "qwen3-coder-plus" in model_ids
+        assert "mimo-v2.5-pro" not in model_ids
+
+    def test_get_provider_status(self, dashscope_module):
+        router = dashscope_module.ProviderRouter()
+        status = router.get_provider_status()
+        assert "primary" in status
+        assert "secondary" in status
+        assert "tertiary" in status
+        assert "available" in status["primary"]
+        assert "base_url" in status["primary"]
+
+    def test_tertiary_model_routed_to_tertiary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-streamlake")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.TERTIARY_BASE_URL",
+            "https://vanchin.streamlake.ai/api/gateway/coding/v1",
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.tertiary.is_available is True
+        provider = router.get_provider_for_model("kat-coder-pro-v2")
+        assert provider.name == "tertiary"
+
+    def test_tertiary_unconfigured_returns_primary_for_tertiary_models(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model("kat-coder-pro-v2")
+        assert provider.name == "primary"
+
+    def test_get_all_models_includes_tertiary_when_configured(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-streamlake")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.TERTIARY_BASE_URL",
+            "https://vanchin.streamlake.ai/api/gateway/coding/v1",
+        )
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        model_ids = [m["id"] for m in models["data"]]
+        assert "kat-coder-pro-v2" in model_ids
+
+    def test_get_all_models_excludes_tertiary_when_not_configured(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        model_ids = [m["id"] for m in models["data"]]
+        assert "kat-coder-pro-v2" not in model_ids
+
+    def test_model_provider_map_tertiary_override(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-streamlake")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.TERTIARY_BASE_URL",
+            "https://vanchin.streamlake.ai/api/gateway/coding/v1",
+        )
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.MODEL_PROVIDER_MAP",
+            {"kat-coder-pro-v2": "tertiary"},
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("kat-coder-pro-v2").name == "tertiary"
+
+
+# ---------------------------------------------------------------------------
+# MultiProviderRateLimiter
+# ---------------------------------------------------------------------------
+
+class TestMultiProviderRateLimiter:
+    def _make_config(self):
+        return {
+            "rpm_limit": 60, "tpm_limit": 100_000, "safety_factor": 0.8,
+            "requests_per_5h": 100, "requests_per_week": 100,
+            "requests_per_month": 100, "max_queue_size": 5,
+            "max_retries": 3, "base_backoff": 0.1,
+        }
+
+    def test_creates_primary_only(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        assert mpl.primary is not None
+        assert mpl.secondary is None
+        assert mpl.tertiary is None
+
+    def test_creates_both_when_secondary_config_provided(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), self._make_config())
+        assert mpl.primary is not None
+        assert mpl.secondary is not None
+        assert mpl.tertiary is None
+
+    def test_creates_tertiary_when_tertiary_config_provided(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None, self._make_config())
+        assert mpl.primary is not None
+        assert mpl.secondary is None
+        assert mpl.tertiary is not None
+
+    def test_get_limiter_for_provider_returns_secondary(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), self._make_config())
+        limiter = mpl.get_limiter_for_provider("secondary")
+        assert limiter is mpl.secondary
+
+    def test_get_limiter_for_provider_returns_tertiary(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None, self._make_config())
+        limiter = mpl.get_limiter_for_provider("tertiary")
+        assert limiter is mpl.tertiary
+
+    def test_get_limiter_for_provider_returns_primary_by_default(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        limiter = mpl.get_limiter_for_provider("primary")
+        assert limiter is mpl.primary
+
+    def test_pending_requests_shared(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        mpl.pending_requests = 5
+        assert mpl.pending_requests == 5
+
+    def test_max_queue_size_delegates_to_primary(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        assert mpl.max_queue_size == 5
+
+    def test_is_queue_full(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        assert mpl.is_queue_full() is False
+        mpl.pending_requests = 10
+        assert mpl.is_queue_full() is True
+
+    @pytest.mark.asyncio
+    async def test_backward_compat_can_proceed(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        allowed, reason, _ = await mpl.can_proceed()
+        assert allowed is True
+        assert reason == "ok"
+
+    @pytest.mark.asyncio
+    async def test_provider_specific_can_proceed(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), self._make_config())
+        allowed, reason, _ = await mpl.can_proceed_for_provider(0, "secondary")
+        assert allowed is True
+
+    def test_status_returns_nested_structure(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        status = mpl.status()
+        assert "primary" in status
+        assert "secondary" in status
+        assert "tertiary" in status
+        assert "shared_limits" in status
+        assert status["shared_limits"] is True
+        assert status["secondary"] is None
+        assert status["tertiary"] is None
+
+    def test_status_shows_secondary_when_configured(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), self._make_config())
+        status = mpl.status()
+        assert status["secondary"] is not None
+        assert "rpm_limit" in status["secondary"]
+
+    def test_status_shows_tertiary_when_configured(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None, self._make_config())
+        status = mpl.status()
+        assert status["tertiary"] is not None
+        assert "rpm_limit" in status["tertiary"]
+
+    @pytest.mark.asyncio
+    async def test_provider_specific_can_proceed_tertiary(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None, self._make_config())
+        allowed, reason, _ = await mpl.can_proceed_for_provider(0, "tertiary")
+        assert allowed is True
+
+    def test_queue_drops_property(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        mpl.queue_drops = 5
+        assert mpl.queue_drops == 5
+        assert mpl.primary.queue_drops == 5
+
+    def test_total_rejected_property(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        mpl.total_rejected = 3
+        assert mpl.total_rejected == 3
+        assert mpl.primary.total_rejected == 3
+
+    def test_rps_limit_property(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        assert isinstance(mpl.rps_limit, int)
+        assert mpl.rps_limit > 0
+
+    def test_max_retries_property(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        assert mpl.max_retries == 3
+
+    def test_provider_limiter_survives_module_reload(self, dashscope_module):
+        """After rate_limiter module reload, duck-typing must still resolve sub-limiters.
+
+        TUI mode imports dashscope_proxy after the app creates MultiProviderRateLimiter.
+        reload() replaces the class object so isinstance checks fail; handlers must use
+        get_limiter_for_provider() instead.
+        """
+        import importlib
+        import dashscope_proxy_lib.rate_limiter as rl_mod
+
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), self._make_config())
+        importlib.reload(rl_mod)
+
+        assert not isinstance(mpl, rl_mod.MultiProviderRateLimiter)
+        limiter = mpl.get_limiter_for_provider("primary")
+        assert hasattr(limiter, "circuit_is_open")
+        assert limiter.circuit_is_open() is False
+        secondary = mpl.get_limiter_for_provider("secondary")
+        assert secondary is mpl.secondary

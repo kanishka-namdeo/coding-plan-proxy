@@ -24,15 +24,21 @@ _LIB_MODULES = [
     "dashscope_proxy_lib.request_transform",
     "dashscope_proxy_lib.http_helpers",
     "dashscope_proxy_lib.queue",
+    "dashscope_proxy_lib.provider_router",
     "dashscope_proxy_lib.handlers",
     "dashscope_proxy_lib.server",
 ]
 
-for _mod_name in _LIB_MODULES:
-    _existing = sys.modules.get(_mod_name)
-    if _existing is not None:
-        import importlib as _il
-        _il.reload(_existing)
+# --- reload sub-modules when this facade is explicitly reloaded (tests) ---
+# Do NOT cascade-reload on first import — that breaks live instances created
+# before the facade loads (e.g. rate_limiter on app when TUI starts).
+if globals().get("_FACADE_RELOAD_MARKER") is not None:
+    import importlib as _il
+    for _mod_name in _LIB_MODULES:
+        _existing = sys.modules.get(_mod_name)
+        if _existing is not None:
+            _il.reload(_existing)
+_FACADE_RELOAD_MARKER = True
 
 # --- configuration -----------------------------------------------------------
 from dashscope_proxy_lib.config import (
@@ -51,6 +57,10 @@ from dashscope_proxy_lib.config import (
     HOP_BY_HOP_HEADERS,
     CODING_PLAN_CONFIG,
     MOCK_MODELS,
+    TERTIARY_API_KEY,
+    TERTIARY_BASE_URL,
+    TERTIARY_CODING_PLAN_CONFIG,
+    TERTIARY_MODELS,
     _load_config,
 )
 
@@ -78,6 +88,13 @@ from dashscope_proxy_lib.rate_limiter import (
     TokenWindowCounter,
     ModelStats,
     RateLimiter,
+    MultiProviderRateLimiter,
+)
+
+# --- provider router ---------------------------------------------------------
+from dashscope_proxy_lib.provider_router import (
+    ProviderRouter,
+    ProviderConfig,
 )
 
 # --- token utils -------------------------------------------------------------
@@ -90,12 +107,14 @@ from dashscope_proxy_lib.token_utils import (
 # --- request transform -------------------------------------------------------
 from dashscope_proxy_lib.request_transform import (
     map_developer_to_system,
+    normalize_model_name,
     _is_chat_endpoint,
 )
 
 # --- http helpers ------------------------------------------------------------
 from dashscope_proxy_lib.http_helpers import (
     parse_retry_after,
+    should_retry_429,
     _make_error_response,
     _add_ratelimit_headers,
     _strip_hop_by_hop,
@@ -128,7 +147,9 @@ __all__ = [
     "UPSTREAM_TIMEOUT_TOTAL", "UPSTREAM_TIMEOUT_CONNECT", "MAX_CONNECTIONS",
     "MAX_CONNECTIONS_PER_HOST", "MAX_BODY_SIZE", "MAX_STREAM_BUFFER",
     "MAX_5XX_RETRIES", "DEQUE_MAX_SIZE", "HOP_BY_HOP_HEADERS",
-    "CODING_PLAN_CONFIG", "MOCK_MODELS", "_load_config",
+    "CODING_PLAN_CONFIG", "MOCK_MODELS",
+    "TERTIARY_API_KEY", "TERTIARY_BASE_URL", "TERTIARY_CODING_PLAN_CONFIG", "TERTIARY_MODELS",
+    "_load_config",
     # logging
     "LOG_LEVEL", "LOG_BUFFER_SIZE",
     "StructuredLogFormatter", "TUILogHandler", "_log", "logger", "tui_handler",
@@ -136,13 +157,16 @@ __all__ = [
     "SESSION_LOG_DIR", "SESSION_LOG_ENABLED", "SessionLogWriter",
     # rate limiter
     "SlidingWindowCounter", "TokenWindowCounter", "ModelStats", "RateLimiter",
+    "MultiProviderRateLimiter",
+    # provider router
+    "ProviderRouter", "ProviderConfig",
     # token utils
     "extract_tokens_from_response", "extract_tokens_from_stream",
     "estimate_tokens_for_request",
     # request transform
     "map_developer_to_system", "_is_chat_endpoint",
     # http helpers
-    "parse_retry_after", "_make_error_response", "_add_ratelimit_headers",
+    "parse_retry_after", "should_retry_429", "_make_error_response", "_add_ratelimit_headers",
     "_strip_hop_by_hop", "_client_disconnected", "_compute_backoff",
     "_add_forwarded_headers",
     # queue

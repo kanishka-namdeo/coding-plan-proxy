@@ -48,3 +48,8 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+# Session logs
+session_logs/
+
+# Cursor IDE
+.cursor/
