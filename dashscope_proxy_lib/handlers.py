@@ -282,6 +282,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         # Reserve TPM before forwarding (post-queue guard — bucket may have drained)
         if estimated_tokens > 0 and not await limiter.reserve_tokens(estimated_tokens):
             rate_limiter.queue_drops += 1
+            rate_limiter.total_rejected += 1
             error_reason = "tpm_reservation_failed"
             status_code = 503
             _log(logging.WARNING, "request rejected: TPM reservation failed after queue",
@@ -299,7 +300,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
         if wait_time > 0:
             queue_wait_ms = round(wait_time * 1000, 1)
-            rate_limiter.queue_wait_times.append(queue_wait_ms)
+            rate_limiter.record_queue_wait(queue_wait_ms)
             _log(logging.INFO, "request queued",
                  request_id=request_id, wait_ms=queue_wait_ms)
 
@@ -390,6 +391,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         # Check for error status codes BEFORE streaming
                         if upstream.status == 429:
                             limiter.total_429s += 1
+                            await limiter.record_model_stats(model_name or "unknown", 0, 0.0, is_429=True)
                             error_body = await upstream.read()
                             # Capture headers before closing
                             upstream_headers = dict(upstream.headers)
@@ -451,7 +453,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             upstream_headers = dict(upstream.headers)
                             upstream.close()
                             retry_5xx += 1
-                            limiter.record_circuit_failure()
+                            await limiter.record_circuit_failure()
                             if retry_5xx > _cfg("MAX_5XX_RETRIES"):
                                 error_reason = "upstream_5xx"
                                 status_code = upstream.status
@@ -549,9 +551,9 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         await limiter.reconcile_tokens(estimated_tokens, tokens_from_stream)
                         tokens_reserved = False
                         await limiter.record_request(tokens_from_stream)
-                        limiter.record_circuit_success()
-                        limiter.record_model_stats(model_name or "unknown", tokens_from_stream, duration_ms)
-                        limiter.record_body_sizes(request_body_bytes, response_body_bytes)
+                        await limiter.record_circuit_success()
+                        await limiter.record_model_stats(model_name or "unknown", tokens_from_stream, duration_ms)
+                        await limiter.record_body_sizes(request_body_bytes, response_body_bytes)
                         actual_tokens = tokens_from_stream
                         prompt_tokens = token_info.get("prompt_tokens", 0)
                         completion_tokens = token_info.get("completion_tokens", 0)
@@ -621,6 +623,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
                     if status_code == 429:
                         limiter.total_429s += 1
+                        await limiter.record_model_stats(model_name or "unknown", 0, 0.0, is_429=True)
                         if not should_retry_429(resp_body):
                             error_reason = "upstream_quota_exceeded"
                             _log(logging.WARNING, "upstream quota exceeded, not retrying",
@@ -668,7 +671,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
                     if 500 <= status_code < 600:
                         retry_5xx += 1
-                        limiter.record_circuit_failure()
+                        await limiter.record_circuit_failure()
                         if retry_5xx > _cfg("MAX_5XX_RETRIES"):
                             error_reason = "upstream_5xx"
                             _log(logging.WARNING, "upstream 5xx after max retries",
@@ -701,9 +704,9 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                     await limiter.reconcile_tokens(estimated_tokens, tokens_used["total_tokens"])
                     tokens_reserved = False
                     await limiter.record_request(tokens_used["total_tokens"])
-                    limiter.record_circuit_success()
-                    limiter.record_model_stats(model_name or "unknown", tokens_used["total_tokens"], duration_ms)
-                    limiter.record_body_sizes(request_body_bytes, len(resp_body))
+                    await limiter.record_circuit_success()
+                    await limiter.record_model_stats(model_name or "unknown", tokens_used["total_tokens"], duration_ms)
+                    await limiter.record_body_sizes(request_body_bytes, len(resp_body))
 
                     _log(logging.DEBUG, "token reconciliation",
                          request_id=request_id, estimated=estimated_tokens,
@@ -752,7 +755,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                      model=model_name, target_url=target_url,
                      attempt=retry + 1, error_type=type(e).__name__,
                      error=str(e))
-                limiter.record_circuit_failure()
+                await limiter.record_circuit_failure()
                 retry += 1
                 if retry > limiter.max_retries:
                     error_reason = "max_retries_exceeded"

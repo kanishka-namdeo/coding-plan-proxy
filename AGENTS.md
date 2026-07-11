@@ -1,146 +1,86 @@
-# Coding Plan Proxy — Agent Instructions
+# DOX framework
 
-## Project Context
+- DOX is highly performant AGENTS.md hierarchy installed here
+- Agent must follow DOX instructions across any edits
 
-Single-file Python async HTTP reverse proxy (`dashscope_proxy.py`) built with `aiohttp`. It sits between developer tools (Cursor IDE, etc.) and Alibaba's DashScope AI API to prevent rate-limit lockouts.
+## Core Contract
 
-**What it does:**
-- Proxies OpenAI-compatible API calls to `https://coding-intl.dashscope.aliyuncs.com`
-- Multi-layer rate limiting (RPS, RPM, TPM, 5-hour/weekly/monthly quotas)
-- Request queuing with bounded queue size
-- Automatic retries with exponential backoff on 429 and 5xx
-- SSE streaming support with client-disconnect detection
-- `developer` → `system` role mapping
-- Mock model list at `GET /v1/models`
+- AGENTS.md files are binding work contracts for their subtrees
+- Work products, source materials, instructions, records, assets, and durable docs must stay understandable from the nearest applicable AGENTS.md plus every parent AGENTS.md above it
 
-**Tech Stack:**
-- Python 3.13.13 with `aiohttp` (server + HTTP client)
-- `pytest` with `pytest-asyncio` for testing
-- Single-file architecture: `dashscope_proxy.py` is the entire app
-- Tests live in `tests/` directory
+## Read Before Editing
 
-**Key Files:**
-| File | Purpose |
-|---|---|
-| `dashscope_proxy.py` | The entire proxy application (~739 lines) |
-| `tests/test_units.py` | Unit tests for individual components |
-| `tests/test_integration.py` | Integration tests with app fixtures |
-| `tests/test_e2e_real.py` | End-to-end tests against real upstream |
-| `requirements.txt` | Dependencies |
+1. Read the root AGENTS.md
+2. Identify every file or folder you expect to touch
+3. Walk from the repository root to each target path
+4. Read every AGENTS.md found along each route
+5. If a parent AGENTS.md lists a child AGENTS.md whose scope contains the path, read that child and continue from there
+6. Use the nearest AGENTS.md as the local contract and parent docs for repo-wide rules
+7. If docs conflict, the closer doc controls local work details, but no child doc may weaken DOX
 
-## Python Environment (Windows)
+Do not rely on memory. Re-read the applicable DOX chain in the current session before editing.
 
-This system runs **Windows** with **Python 3.13.13** installed via the `py` launcher.
+## Update After Editing
 
-- **ALWAYS** use the `.venv` virtual environment at the project root for ALL Python operations
-- **NEVER** use `python`, `python3`, or bare `py` directly — always use `.venv\Scripts\python.exe`
-- **NEVER** use `pip` directly — use `.venv\Scripts\python.exe -m pip` instead
-- Virtual environment path: `.venv\Scripts\python.exe` (relative to project root)
+Every meaningful change requires a DOX pass before the task is done.
 
-## Security Rules
+Update the closest owning AGENTS.md when a change affects:
 
-- **NEVER** hardcode API keys, tokens, or secrets in source code
-- **ALWAYS** load secrets from environment variables (`os.environ.get()`)
-- **NEVER** commit `.env` files or credential files to git
+- purpose, scope, ownership, or responsibilities
+- durable structure, contracts, workflows, or operating rules
+- required inputs, outputs, permissions, constraints, side effects, or artifacts
+- user preferences about behavior, communication, process, organization, or quality
+- AGENTS.md creation, deletion, move, rename, or index contents
 
-## Architecture Constraints
+Update parent docs when parent-level structure, ownership, workflow, or child index changes. Update child docs when parent changes alter local rules. Remove stale or contradictory text immediately. Small edits that do not change behavior or contracts may leave docs unchanged, but the DOX pass still must happen.
 
-- Keep the single-file architecture (don't split `dashscope_proxy.py` unless explicitly asked)
-- All configuration is in `CODING_PLAN_CONFIG` dict and module-level constants
-- The aiohttp `ClientSession` is stored on `app["client_session"]` and must be properly closed on shutdown
-- Rate limiter state lives on `app["rate_limiter"]`
-- Shutdown signal is `app["shutting_down"]` (asyncio.Event)
+## Hierarchy
 
-## Critical Safety Rules
+- Root AGENTS.md is the DOX rail: project-wide instructions, global preferences, durable workflow rules, and the top-level Child DOX Index
+- Child AGENTS.md files own domain-specific instructions and their own Child DOX Index
+- Each parent explains what its direct children cover and what stays owned by the parent
+- The closer a doc is to the work, the more specific and practical it must be
 
-### Trace ALL Code Paths for Resource Cleanup
+## Child Doc Shape
 
-When writing code with retry loops, conditionals, or error handlers, trace every possible execution path and verify resources are properly cleaned up on ALL paths, not just the happy path.
+- Create a child AGENTS.md when a folder becomes a durable boundary with its own purpose, rules, responsibilities, workflow, materials, or quality standards
+- Work Guidance must reflect the current standards of the project or user instructions; if there are no specific standards or instructions yet, leave it empty
+- Verification must reflect an existing check; if no verification framework exists yet, leave it empty and update it when one exists
 
-**Resources to track:**
-- HTTP connections (`upstream.close()`)
-- aiohttp `ClientResponse` objects (`response.release()` or `response.close()`)
-- Counters (`pending_requests` must be incremented/decremented exactly once per request)
-- File handles, locks, any acquired resource
+Default section order:
+- Purpose
+- Ownership
+- Local Contracts
+- Work Guidance
+- Verification
+- Child DOX Index
 
-**Before committing any code change involving retries, verify:**
-1. Every `continue` in a retry loop cleans up resources first
-2. Every `return` in error paths cleans up resources first
-3. Every exception handler cleans up resources first
-4. The `finally` block does not double-clean (causing errors on already-released resources)
+## Style
 
-### Never Double-Decrement or Double-Cleanup
+- Keep docs concise, current, and operational
+- Document stable contracts, not diary entries
+- Put broad rules in parent docs and concrete details in child docs
+- Prefer direct bullets with explicit names
+- Do not duplicate rules across many files unless each scope needs a local version
+- Delete stale notes instead of explaining history
+- Trim obvious statements, repeated rules, misplaced detail, and warnings for risks that no longer exist
 
-If a resource is cleaned up in both an `except` block AND a `finally` block, it will be cleaned up twice. This causes errors. Always consolidate cleanup into a single `finally` block with a guard.
+## Closeout
 
-### Verify Logical Reachability of Branches
+1. Re-check changed paths against the DOX chain
+2. Update nearest owning docs and any affected parents or children
+3. Refresh every affected Child DOX Index
+4. Remove stale or contradictory text
+5. Run existing verification when relevant
+6. Report any docs intentionally left unchanged and why
 
-After writing nested conditionals, verify that all branches are reachable. Check for contradictory conditions like `if is_stream:` followed by `if not is_stream:` inside it.
+## User Preferences
 
-### Counters Must Be Balanced
+When the user requests a durable behavior change, record it here or in the relevant child AGENTS.md
 
-Every increment must have exactly one corresponding decrement. If a counter is incremented before entering a retry loop, it must be decremented exactly once when the request completes (success, error, or exception). Use a `finally` block for the decrement, not both `except` and `finally`.
+## Child DOX Index
 
-### Read Your Own Output Before Continuing
-
-Before making tool calls that depend on code you just wrote, re-read the code you just generated. Check for:
-- Duplicate method calls on the same object
-- Calls on consumed resources (e.g., `.read()` after `.release()`)
-- Typos in variable names, missing imports
-
-### aiohttp Content-Type Must Not Include Charset
-
-When creating `web.Response` objects, strip the charset from `Content-Type`. aiohttp's `content_type` parameter rejects values containing `; charset=`.
-
-```python
-content_type = upstream_content_type.split(";")[0].strip()
-resp = web.Response(content_type=content_type)
-```
-
-### Use Correct Shell Syntax
-
-This project runs on **Windows with PowerShell**. Do NOT use bash heredocs, `$()` substitution, or bash pipes. Use PowerShell-native syntax.
-
-### Verification Checklist
-
-Before declaring any code change complete:
-- All retry loop paths clean up resources before `continue`
-- No double-cleanup (except blocks + finally blocks)
-- All conditional branches are reachable
-- Counter increments/decrements are balanced (net zero per request)
-- aiohttp `content_type` values have charset stripped
-- Shell commands use PowerShell syntax, not bash
-
-## Verification and Workflow Rules
-
-### Test End-to-End Before Claiming Success
-
-After implementing any feature involving external services, always test the actual forwarding path end-to-end. Testing mock endpoints alone (`/health`, `/v1/models`, `/v1/proxy/status`) is insufficient.
-
-### Clarify Before Acting on Ambiguous Requests
-
-When a user request seems off-topic or ambiguous, ask for clarification first. Do NOT dispatch subagents to search for functionality you already know doesn't exist. Do NOT install tools without confirming the user wants them.
-
-### Identify Critical Bugs and Fix Them Immediately
-
-When evaluating code and finding CRITICAL or HIGH severity bugs, fix them immediately in the same session. Do NOT defer critical fixes to "future work."
-
-### Run Tests and Linters Before Committing
-
-Before running `git commit`:
-1. Run `pytest tests/ -v` — all tests must pass
-2. Run any available linter — no new errors
-3. If tests fail, fix them first
-4. Only commit when the codebase is in a passing state
-
-### Do Not Add TODO Comments
-
-If something needs to be done, do it. TODO comments accumulate and are rarely completed.
-
-### Write Technical Documentation, Not Marketing Copy
-
-When writing README or documentation, state facts about what the proxy does and how to use it. Keep it concise and technical.
-
-### Implement Identified Improvements, Not Just Recommend Them
-
-When asked to evaluate reliability or code quality, identify issues AND implement the critical ones. Don't stop at producing a recommendation list.
+- `dashscope_proxy_lib/` — proxy core: rate limiter (sliding window, token bucket, multi-provider), request queue, HTTP handlers, provider routing (DashScope/MIMO/StreamLake), request transformation, token utilities, session logging, logging infrastructure
+- `tests/` — pytest test suite: unit tests (rate limiter, token utils, request transform, HTTP helpers), integration tests (handler with mock upstream), e2e tests (real API calls, requires API key)
+- `screenshots/` — TUI dashboard screenshots (SVG format) and SVG→PNG conversion script
+- Root-owned files: `dashscope_proxy.py` (facade re-exporting lib), `proxy_tui.py` + `proxy_tui.tcss` (Textual TUI dashboard), `test_live_server.py` (manual live server test), `capture_screenshots.py` (screenshot automation), `.env.example`, `requirements.txt`, `pyproject.toml`

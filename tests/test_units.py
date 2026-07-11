@@ -995,30 +995,29 @@ class TestRateLimiterTokenManagement:
 # ---------------------------------------------------------------------------
 
 class TestCircuitBreaker:
-    def test_circuit_closed_initially(self, rate_limiter):
+    async def test_circuit_closed_initially(self, rate_limiter):
         assert rate_limiter.circuit_is_open() is False
 
-    def test_circuit_opens_after_threshold(self, rate_limiter):
+    async def test_circuit_opens_after_threshold(self, rate_limiter):
         rate_limiter.circuit_threshold = 3
-        rate_limiter.record_circuit_failure()
-        rate_limiter.record_circuit_failure()
+        await rate_limiter.record_circuit_failure()
+        await rate_limiter.record_circuit_failure()
         assert rate_limiter.circuit_is_open() is False  # not yet
-        rate_limiter.record_circuit_failure()
+        await rate_limiter.record_circuit_failure()
         assert rate_limiter.circuit_is_open() is True  # opened
 
-    def test_circuit_closes_on_success(self, rate_limiter):
+    async def test_circuit_closes_on_success(self, rate_limiter):
         rate_limiter.circuit_threshold = 1
-        rate_limiter.record_circuit_failure()
+        await rate_limiter.record_circuit_failure()
         assert rate_limiter.circuit_is_open() is True
-        rate_limiter.record_circuit_success()
+        await rate_limiter.record_circuit_success()
         assert rate_limiter.circuit_is_open() is False
         assert rate_limiter.circuit_failure_count == 0
 
-    def test_status_includes_circuit_fields(self, rate_limiter):
+    async def test_status_includes_circuit_fields(self, rate_limiter):
         status = rate_limiter.status()
         assert "circuit_open" in status
         assert "circuit_failure_count" in status
-
 
 # ---------------------------------------------------------------------------
 # SessionLogWriter edge cases

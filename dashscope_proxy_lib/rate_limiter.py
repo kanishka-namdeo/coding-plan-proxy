@@ -204,6 +204,7 @@ class RateLimiter:
 
         self.last_request_time: float = 0.0
         self._lock = asyncio.Lock()
+        self._thread_lock = threading.Lock()  # For cross-thread safety (TUI polling)
 
         # Circuit breaker: rejects requests immediately when upstream is unhealthy
         self.circuit_failure_count = 0
@@ -301,28 +302,37 @@ class RateLimiter:
             self.total_tokens_consumed += tokens_used
             self.last_request_time = now
 
-    def record_model_stats(self, model: str, tokens: int, latency_ms: float, is_429: bool = False) -> None:
-        """Record per-model usage statistics. Thread-safe for async callers."""
-        if model not in self.model_usage:
-            # Evict oldest entries if at capacity
-            if len(self.model_usage) >= self.model_usage_max:
-                oldest_keys = sorted(self.model_usage, key=lambda k: self.model_usage[k].requests)[:10]
-                for k in oldest_keys:
-                    del self.model_usage[k]
-            self.model_usage[model] = ModelStats()
-        stats = self.model_usage[model]
-        stats.requests += 1
-        stats.tokens += tokens
-        stats.total_latency_ms += latency_ms
-        stats.recent_latencies.append(latency_ms)
-        if is_429:
-            stats.errors_429 += 1
-        self.recent_latencies.append(latency_ms)
+    async def record_model_stats(self, model: str, tokens: int, latency_ms: float, is_429: bool = False) -> None:
+        """Record per-model usage statistics. Thread-safe via locks."""
+        async with self._lock:
+            with self._thread_lock:  # Cross-thread safety for status() reads
+                if model not in self.model_usage:
+                    # Evict oldest entries if at capacity
+                    if len(self.model_usage) >= self.model_usage_max:
+                        oldest_keys = sorted(self.model_usage, key=lambda k: self.model_usage[k].requests)[:10]
+                        for k in oldest_keys:
+                            del self.model_usage[k]
+                    self.model_usage[model] = ModelStats()
+                stats = self.model_usage[model]
+                stats.requests += 1
+                stats.tokens += tokens
+                stats.total_latency_ms += latency_ms
+                stats.recent_latencies.append(latency_ms)
+                if is_429:
+                    stats.errors_429 += 1
+                self.recent_latencies.append(latency_ms)
 
-    def record_body_sizes(self, request_bytes: int, response_bytes: int) -> None:
-        """Record request/response body sizes for aggregate metrics."""
-        self.total_request_bytes += request_bytes
-        self.total_response_bytes += response_bytes
+    async def record_body_sizes(self, request_bytes: int, response_bytes: int) -> None:
+        """Record request/response body sizes. Thread-safe via locks."""
+        async with self._lock:
+            with self._thread_lock:  # Cross-thread safety for status() reads
+                self.total_request_bytes += request_bytes
+                self.total_response_bytes += response_bytes
+
+    def record_queue_wait(self, wait_ms: float) -> None:
+        """Record queue wait time. Thread-safe for cross-thread status() reads."""
+        with self._thread_lock:
+            self.queue_wait_times.append(wait_ms)
 
     async def reconcile_tokens(self, estimated: int, actual: int, now: float | None = None) -> None:
         """
@@ -351,37 +361,62 @@ class RateLimiter:
         return self.pending_requests > self.max_queue_size
 
     def circuit_is_open(self) -> bool:
-        """Check if the circuit breaker is open (upstream unhealthy)."""
-        if self.circuit_open_until > time.monotonic():
-            return True
-        self.circuit_open_until = 0.0
-        return False
+        """Check if the circuit breaker is open (upstream unhealthy). Read-only."""
+        return self.circuit_open_until > time.monotonic()
 
-    def record_circuit_success(self) -> None:
+    async def record_circuit_success(self) -> None:
         """Reset failure counter on a successful upstream response."""
-        self.circuit_failure_count = 0
-        self.circuit_open_until = 0.0
+        async with self._lock:
+            self.circuit_failure_count = 0
+            self.circuit_open_until = 0.0
 
-    def record_circuit_failure(self) -> None:
+    async def record_circuit_failure(self) -> bool:
         """Record an upstream failure. Returns True if circuit should open."""
-        self.circuit_failure_count += 1
-        if self.circuit_failure_count >= self.circuit_threshold:
-            self.circuit_open_until = time.monotonic() + self.circuit_cooldown
-            _log(logging.WARNING, "circuit breaker opened after consecutive failures",
-                 failure_count=self.circuit_failure_count, threshold=self.circuit_threshold,
-                 cooldown_seconds=self.circuit_cooldown)
-            return True
-        return False
+        async with self._lock:
+            self.circuit_failure_count += 1
+            if self.circuit_failure_count >= self.circuit_threshold:
+                self.circuit_open_until = time.monotonic() + self.circuit_cooldown
+                _log(logging.WARNING, "circuit breaker opened after consecutive failures",
+                     failure_count=self.circuit_failure_count, threshold=self.circuit_threshold,
+                     cooldown_seconds=self.circuit_cooldown)
+                return True
+            return False
 
     def status(self) -> dict:
         now = time.monotonic()
         tpm_status = self.tpm_bucket.status()
 
+        # Protect cross-thread reads of all shared state
+        with self._thread_lock:
+            # Snapshot queue_wait_times to avoid mutation during sort
+            queue_wait_snapshot = list(self.queue_wait_times)
+            model_usage_snapshot = {k: {
+                "requests": v.requests,
+                "tokens": v.tokens,
+                "errors_429": v.errors_429,
+                "avg_latency_ms": round(v.total_latency_ms / v.requests, 1) if v.requests > 0 else 0.0,
+                "p50_latency_ms": self._compute_percentile(v.recent_latencies, 50) if v.recent_latencies else 0.0,
+                "p95_latency_ms": self._compute_percentile(v.recent_latencies, 95) if v.recent_latencies else 0.0,
+            } for k, v in self.model_usage.items()}
+            recent_latencies_snapshot = list(self.recent_latencies)[-100:]
+            # Snapshot circuit breaker state for consistent read
+            circuit_open = self.circuit_open_until > time.monotonic()
+            circuit_failure_count = self.circuit_failure_count
+            # Snapshot counters for consistency
+            total_forwarded = self.total_forwarded
+            queue_drops = self.queue_drops
+            total_429s = self.total_429s
+            total_rejected = self.total_rejected
+            total_tokens_consumed = self.total_tokens_consumed
+            total_request_bytes = self.total_request_bytes
+            total_response_bytes = self.total_response_bytes
+            pending_requests = self.pending_requests
+
         queue_p50 = 0.0
         queue_p95 = 0.0
         queue_p99 = 0.0
-        if self.queue_wait_times:
-            sorted_waits = sorted(self.queue_wait_times)
+        if queue_wait_snapshot:
+            sorted_waits = sorted(queue_wait_snapshot)
             n = len(sorted_waits)
             queue_p50 = sorted_waits[int(n * 0.50)]
             queue_p95 = sorted_waits[int(n * 0.95)]
@@ -400,28 +435,21 @@ class RateLimiter:
             "requests_week_limit": self.week_limit,
             "requests_month": self.month_count,
             "requests_month_limit": self.month_limit,
-            "total_forwarded": self.total_forwarded,
-            "queue_drops": self.queue_drops,
+            "total_forwarded": total_forwarded,
+            "queue_drops": queue_drops,
             "queue_p50_ms": round(queue_p50, 1),
             "queue_p95_ms": round(queue_p95, 1),
             "queue_p99_ms": round(queue_p99, 1),
-            "total_429s": self.total_429s,
-            "total_rejected": self.total_rejected,
-            "total_tokens_consumed": self.total_tokens_consumed,
-            "total_request_bytes": self.total_request_bytes,
-            "total_response_bytes": self.total_response_bytes,
-            "pending_requests": self.pending_requests,
-            "circuit_open": self.circuit_is_open(),
-            "circuit_failure_count": self.circuit_failure_count,
-            "model_usage": {k: {
-                "requests": v.requests,
-                "tokens": v.tokens,
-                "errors_429": v.errors_429,
-                "avg_latency_ms": round(v.total_latency_ms / v.requests, 1) if v.requests > 0 else 0.0,
-                "p50_latency_ms": self._compute_percentile(v.recent_latencies, 50) if v.recent_latencies else 0.0,
-                "p95_latency_ms": self._compute_percentile(v.recent_latencies, 95) if v.recent_latencies else 0.0,
-            } for k, v in self.model_usage.items()},
-            "recent_latencies": list(self.recent_latencies)[-100:],
+            "total_429s": total_429s,
+            "total_rejected": total_rejected,
+            "total_tokens_consumed": total_tokens_consumed,
+            "total_request_bytes": total_request_bytes,
+            "total_response_bytes": total_response_bytes,
+            "pending_requests": pending_requests,
+            "circuit_open": circuit_open,
+            "circuit_failure_count": circuit_failure_count,
+            "model_usage": model_usage_snapshot,
+            "recent_latencies": recent_latencies_snapshot,
             "uptime_seconds": round(time.time() - self.start_time, 1),
         }
 
@@ -602,19 +630,80 @@ class MultiProviderRateLimiter:
 
     def status(self) -> dict:
         """Return combined status from all limiters."""
+        primary_status = self.primary.status()
         result = {
-            "primary": self.primary.status(),
+            "primary": primary_status,
             "shared_limits": self.secondary is None and self.tertiary is None,
         }
 
+        secondary_status = self.secondary.status() if self.secondary else None
+        tertiary_status = self.tertiary.status() if self.tertiary else None
+
         if self.secondary:
-            result["secondary"] = self.secondary.status()
+            result["secondary"] = secondary_status
         else:
             result["secondary"] = None
 
         if self.tertiary:
-            result["tertiary"] = self.tertiary.status()
+            result["tertiary"] = tertiary_status
         else:
             result["tertiary"] = None
+
+        # Aggregate stats across all providers (using thread-safe status dicts)
+        all_statuses = [primary_status]
+        if secondary_status:
+            all_statuses.append(secondary_status)
+        if tertiary_status:
+            all_statuses.append(tertiary_status)
+
+        # Sum counters across all providers
+        total_forwarded = sum(s.get("total_forwarded", 0) for s in all_statuses)
+        total_429s = sum(s.get("total_429s", 0) for s in all_statuses)
+        total_rejected = sum(s.get("total_rejected", 0) for s in all_statuses)
+        total_tokens_consumed = sum(s.get("total_tokens_consumed", 0) for s in all_statuses)
+        total_request_bytes = sum(s.get("total_request_bytes", 0) for s in all_statuses)
+        total_response_bytes = sum(s.get("total_response_bytes", 0) for s in all_statuses)
+
+        # Merge model_usage dicts (already thread-safe snapshots from status())
+        merged_model_usage = {}
+        for status_dict in all_statuses:
+            for model, stats in status_dict.get("model_usage", {}).items():
+                if model not in merged_model_usage:
+                    merged_model_usage[model] = {
+                        "requests": 0,
+                        "tokens": 0,
+                        "errors_429": 0,
+                        "avg_latency_ms": 0.0,
+                        "p50_latency_ms": 0.0,
+                        "p95_latency_ms": 0.0,
+                    }
+                merged = merged_model_usage[model]
+                merged["requests"] += stats.get("requests", 0)
+                merged["tokens"] += stats.get("tokens", 0)
+                merged["errors_429"] += stats.get("errors_429", 0)
+                # Weighted average of latency
+                if merged["requests"] > 0:
+                    merged["avg_latency_ms"] = round(
+                        (merged["avg_latency_ms"] * (merged["requests"] - stats.get("requests", 0)) +
+                         stats.get("avg_latency_ms", 0) * stats.get("requests", 0)) / merged["requests"], 1)
+
+        # Combine recent latencies across all providers (already thread-safe snapshots)
+        all_recent_latencies = []
+        for status_dict in all_statuses:
+            all_recent_latencies.extend(status_dict.get("recent_latencies", []))
+        combined_recent_latencies = all_recent_latencies[-100:]
+
+        # Add aggregated stats to result at top level for backward compatibility
+        result["total_forwarded"] = total_forwarded
+        result["total_429s"] = total_429s
+        result["total_rejected"] = total_rejected
+        result["total_tokens_consumed"] = total_tokens_consumed
+        result["total_request_bytes"] = total_request_bytes
+        result["total_response_bytes"] = total_response_bytes
+        result["model_usage"] = merged_model_usage
+        result["recent_latencies"] = combined_recent_latencies
+        result["pending_requests"] = self._pending_requests
+        result["queue_drops"] = primary_status.get("queue_drops", 0)
+        result["uptime_seconds"] = primary_status.get("uptime_seconds", 0.0)
 
         return result
