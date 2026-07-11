@@ -30,10 +30,10 @@ async def error_middleware(request: web.Request, handler):
         return await handler(request)
     except HTTPRequestEntityTooLarge:
         return web.json_response({"error": "payload too large"}, status=413)
-    except Exception:
+    except Exception as e:
         _log(logging.ERROR, "unhandled proxy exception",
              path=request.path, method=request.method, exc_info=True)
-        return web.json_response({"error": "internal proxy error"}, status=502)
+        return web.json_response({"error": "internal proxy error", "details": f"{type(e).__name__}: {str(e)}"}, status=502)
 
 
 def create_app() -> web.Application:

@@ -53,3 +53,8 @@ session_logs/
 
 # Cursor IDE
 .cursor/
+
+# Session artifacts
+session_logs/
+*.log
+crush.json

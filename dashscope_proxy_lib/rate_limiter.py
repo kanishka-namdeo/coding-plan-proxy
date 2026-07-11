@@ -555,6 +555,9 @@ class MultiProviderRateLimiter:
     def is_queue_full(self) -> bool:
         return self._pending_requests > self.primary.max_queue_size
 
+    def record_queue_wait(self, wait_ms: float) -> None:
+        """Record queue wait time on the primary limiter."""
+        self.primary.record_queue_wait(wait_ms)
     # --- Provider-aware rate limiting ---
 
     async def can_proceed_for_provider(self, estimated_tokens: int = 0, provider_name: str = "primary") -> tuple[bool, str, float]:
