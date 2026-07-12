@@ -677,7 +677,7 @@ class TestCircuitBreakerCleanup:
         """Reserved TPM must be released when circuit breaker rejects a queued request."""
         app, rl = proxy_app
         rl.circuit_threshold = 1
-        rl.record_circuit_failure()
+        await rl.record_circuit_failure()
         assert rl.circuit_is_open()
 
         upstream_app = web.Application()

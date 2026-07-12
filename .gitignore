@@ -58,3 +58,6 @@ session_logs/
 session_logs/
 *.log
 crush.json
+# PID file
+proxy.pid
+

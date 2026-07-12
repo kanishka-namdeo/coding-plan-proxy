@@ -21,6 +21,49 @@ from dashscope_proxy_lib.session_log import SessionLogWriter, SESSION_LOG_DIR, S
 from dashscope_proxy_lib.logging_config import _log, tui_handler
 from dashscope_proxy_lib.handlers import handle_request
 from dashscope_proxy_lib.config import _load_config
+import os
+
+PID_FILE = "proxy.pid"
+
+
+def _write_pid_file() -> None:
+    """Write current PID to file for process identification."""
+    try:
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        _log(logging.INFO, "PID file written", pid=os.getpid(), path=PID_FILE)
+    except OSError as e:
+        _log(logging.WARNING, "failed to write PID file", error=str(e))
+
+
+def _remove_pid_file() -> None:
+    """Remove PID file on shutdown."""
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+            _log(logging.INFO, "PID file removed", path=PID_FILE)
+    except OSError as e:
+        _log(logging.WARNING, "failed to remove PID file", error=str(e))
+
+
+def _check_stale_pid_file() -> None:
+    """Warn if a PID file exists but the process is no longer running."""
+    if not os.path.exists(PID_FILE):
+        return
+    try:
+        with open(PID_FILE, "r") as f:
+            old_pid = int(f.read().strip())
+        # Check if process is still running (cross-platform)
+        import psutil
+        if psutil.pid_exists(old_pid):
+            _log(logging.WARNING, "stale PID file found — proxy may already be running",
+                 pid=old_pid, path=PID_FILE)
+        else:
+            _log(logging.INFO, "removing stale PID file", pid=old_pid, path=PID_FILE)
+            os.remove(PID_FILE)
+    except (ValueError, ImportError, OSError) as e:
+        _log(logging.WARNING, "could not check stale PID file", error=str(e))
+
 
 
 @web.middleware
@@ -48,9 +91,12 @@ async def create_proxy_resources() -> tuple[MultiProviderRateLimiter, web.Applic
 
     Returns (rate_limiter, app, runner) ready for TUI integration.
     """
+    _check_stale_pid_file()
+
     if not DASHSCOPE_API_KEY:
         _log(logging.ERROR, "DASHSCOPE_API_KEY not set")
         raise SystemExit(1)
+
 
     config = _load_config()
 
@@ -87,6 +133,7 @@ async def create_proxy_resources() -> tuple[MultiProviderRateLimiter, web.Applic
     await runner.setup()
     site = web.TCPSite(runner, PROXY_HOST, PROXY_PORT)
     await site.start()
+    _write_pid_file()
 
     _log(logging.INFO, "proxy started",
          host=PROXY_HOST, port=PROXY_PORT, target=TARGET_BASE,
@@ -153,7 +200,9 @@ async def cleanup_proxy_resources(
         session_log.close()
         _log(logging.INFO, "session log writer closed")
     await runner.cleanup()
+    _remove_pid_file()
     _log(logging.INFO, "shutdown complete")
+
 
 
 async def main(headless: bool = False):

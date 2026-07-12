@@ -1140,6 +1140,7 @@ class TestLoadConfig:
         assert config == dashscope_module.CODING_PLAN_CONFIG
 
     def test_env_var_override(self, dashscope_module, monkeypatch):
+        monkeypatch.delenv("PROXY_TPM_LIMIT", raising=False)
         monkeypatch.setenv("PROXY_RPM_LIMIT", "24")
         monkeypatch.setenv("PROXY_MAX_RETRIES", "10")
         config = dashscope_module._load_config()
