@@ -1875,7 +1875,7 @@ class TestTertiaryProviderRouting:
     """Integration tests for tertiary (StreamLake) provider routing via model name."""
 
     async def test_tertiary_model_forwarded_to_tertiary_upstream(self, aiohttp_client, proxy_app, monkeypatch):
-        """A request with kat-coder-pro-v2 should be forwarded to the StreamLake upstream."""
+        """A request with kat-coder-pro-v2.5 should be forwarded to the StreamLake upstream."""
         import dashscope_proxy_lib.config as cfg
 
         tertiary_app = web.Application()
@@ -1908,7 +1908,7 @@ class TestTertiaryProviderRouting:
                 resp = await client.post(
                     "/v1/chat/completions",
                     data=json.dumps({
-                        "model": "kat-coder-pro-v2",
+                        "model": "kat-coder-pro-v2.5",
                         "messages": [{"role": "user", "content": "hello streamlake"}],
                     }).encode(),
                 )
@@ -1935,7 +1935,7 @@ class TestTertiaryProviderRouting:
         assert resp.status == 200
         data = await resp.json()
         model_ids = [m["id"] for m in data["data"]]
-        assert "kat-coder-pro-v2" in model_ids
+        assert "kat-coder-pro-v2.5" in model_ids
 
     async def test_status_endpoint_shows_tertiary_provider(self, aiohttp_client, proxy_app, monkeypatch):
         """Status endpoint should show tertiary provider availability."""

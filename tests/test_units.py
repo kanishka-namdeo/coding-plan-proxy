@@ -1264,14 +1264,14 @@ class TestProviderRouter:
         )
         router = dashscope_module.ProviderRouter()
         assert router.tertiary.is_available is True
-        provider = router.get_provider_for_model("kat-coder-pro-v2")
+        provider = router.get_provider_for_model("kat-coder-pro-v2.5")
         assert provider.name == "tertiary"
 
     def test_tertiary_unconfigured_returns_primary_for_tertiary_models(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "")
         monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "")
         router = dashscope_module.ProviderRouter()
-        provider = router.get_provider_for_model("kat-coder-pro-v2")
+        provider = router.get_provider_for_model("kat-coder-pro-v2.5")
         assert provider.name == "primary"
 
     def test_get_all_models_includes_tertiary_when_configured(self, dashscope_module, monkeypatch):
@@ -1283,7 +1283,7 @@ class TestProviderRouter:
         router = dashscope_module.ProviderRouter()
         models = router.get_all_models()
         model_ids = [m["id"] for m in models["data"]]
-        assert "kat-coder-pro-v2" in model_ids
+        assert "kat-coder-pro-v2.5" in model_ids
 
     def test_get_all_models_excludes_tertiary_when_not_configured(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "")
@@ -1291,7 +1291,7 @@ class TestProviderRouter:
         router = dashscope_module.ProviderRouter()
         models = router.get_all_models()
         model_ids = [m["id"] for m in models["data"]]
-        assert "kat-coder-pro-v2" not in model_ids
+        assert "kat-coder-pro-v2.5" not in model_ids
 
     def test_model_provider_map_tertiary_override(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-streamlake")
@@ -1301,10 +1301,10 @@ class TestProviderRouter:
         )
         monkeypatch.setattr(
             "dashscope_proxy_lib.config.MODEL_PROVIDER_MAP",
-            {"kat-coder-pro-v2": "tertiary"},
+            {"kat-coder-pro-v2.5": "tertiary"},
         )
         router = dashscope_module.ProviderRouter()
-        assert router.get_provider_for_model("kat-coder-pro-v2").name == "tertiary"
+        assert router.get_provider_for_model("kat-coder-pro-v2.5").name == "tertiary"
 
 
 # ---------------------------------------------------------------------------

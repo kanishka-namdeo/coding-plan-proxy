@@ -177,7 +177,7 @@ SECONDARY_MODELS = {
 TERTIARY_MODELS = {
     "object": "list",
     "data": [
-        {"id": "kat-coder-pro-v2", "object": "model"},
+        {"id": "kat-coder-pro-v2.5", "object": "model"},
     ]
 }
 
