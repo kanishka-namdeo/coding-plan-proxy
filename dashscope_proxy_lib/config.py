@@ -5,17 +5,37 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def _safe_int(env_name: str, default: int) -> int:
+    """Read an env var as int, falling back to default on any parse error."""
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return default
+
+def _safe_float(env_name: str, default: float) -> float:
+    """Read an env var as float, falling back to default on any parse error."""
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return default
+
 # ---------------------------------------------------------------------------
 # Logging configuration
 # ---------------------------------------------------------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-LOG_BUFFER_SIZE = int(os.environ.get("LOG_BUFFER_SIZE", "2000"))
+LOG_BUFFER_SIZE = _safe_int("LOG_BUFFER_SIZE", 2000)
 
 # ---------------------------------------------------------------------------
 # Network configuration
 # ---------------------------------------------------------------------------
 PROXY_HOST = os.environ.get("DASHSCOPE_PROXY_HOST", "127.0.0.1")
-PROXY_PORT = int(os.environ.get("DASHSCOPE_PROXY_PORT", "8899"))
+PROXY_PORT = _safe_int("DASHSCOPE_PROXY_PORT", 8899)
 TARGET_BASE = os.environ.get("TARGET_BASE", "https://coding-intl.dashscope.aliyuncs.com")
 
 # ---------------------------------------------------------------------------
@@ -40,13 +60,13 @@ TERTIARY_BASE_URL = os.environ.get("STREAMLAKE_TARGET_BASE", "").strip()
 # ---------------------------------------------------------------------------
 # Timeout and connection limits
 # ---------------------------------------------------------------------------
-UPSTREAM_TIMEOUT_TOTAL = int(os.environ.get("UPSTREAM_TIMEOUT_TOTAL", "300"))
-UPSTREAM_TIMEOUT_CONNECT = int(os.environ.get("UPSTREAM_TIMEOUT_CONNECT", "10"))
-MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "200"))
-MAX_CONNECTIONS_PER_HOST = int(os.environ.get("MAX_CONNECTIONS_PER_HOST", "50"))
-MAX_BODY_SIZE = int(os.environ.get("MAX_BODY_SIZE", str(50 * 1024 * 1024)))
-MAX_STREAM_BUFFER = int(os.environ.get("MAX_STREAM_BUFFER", str(50 * 1024 * 1024)))  # 50 MB cap for streaming response buffer
-MAX_5XX_RETRIES = int(os.environ.get("MAX_5XX_RETRIES", "3"))
+UPSTREAM_TIMEOUT_TOTAL = _safe_int("UPSTREAM_TIMEOUT_TOTAL", 300)
+UPSTREAM_TIMEOUT_CONNECT = _safe_int("UPSTREAM_TIMEOUT_CONNECT", 10)
+MAX_CONNECTIONS = _safe_int("MAX_CONNECTIONS", 200)
+MAX_CONNECTIONS_PER_HOST = _safe_int("MAX_CONNECTIONS_PER_HOST", 50)
+MAX_BODY_SIZE = _safe_int("MAX_BODY_SIZE", 50 * 1024 * 1024)
+MAX_STREAM_BUFFER = _safe_int("MAX_STREAM_BUFFER", 50 * 1024 * 1024)  # 50 MB cap for streaming response buffer
+MAX_5XX_RETRIES = _safe_int("MAX_5XX_RETRIES", 3)
 DEQUE_MAX_SIZE = 100_000
 
 # ---------------------------------------------------------------------------
@@ -76,15 +96,15 @@ CODING_PLAN_CONFIG = {
 # Secondary provider rate limits (optional - falls back to primary limits if not set)
 # ---------------------------------------------------------------------------
 SECONDARY_CODING_PLAN_CONFIG = {
-    "rpm_limit": int(os.environ.get("SECONDARY_RPM_LIMIT", str(CODING_PLAN_CONFIG["rpm_limit"]))),
-    "tpm_limit": int(os.environ.get("SECONDARY_TPM_LIMIT", str(CODING_PLAN_CONFIG["tpm_limit"]))),
-    "safety_factor": float(os.environ.get("SECONDARY_SAFETY_FACTOR", str(CODING_PLAN_CONFIG["safety_factor"]))),
-    "requests_per_5h": int(os.environ.get("SECONDARY_REQUESTS_PER_5H", str(CODING_PLAN_CONFIG["requests_per_5h"]))),
-    "requests_per_week": int(os.environ.get("SECONDARY_REQUESTS_PER_WEEK", str(CODING_PLAN_CONFIG["requests_per_week"]))),
-    "requests_per_month": int(os.environ.get("SECONDARY_REQUESTS_PER_MONTH", str(CODING_PLAN_CONFIG["requests_per_month"]))),
-    "max_queue_size": int(os.environ.get("SECONDARY_MAX_QUEUE_SIZE", str(CODING_PLAN_CONFIG["max_queue_size"]))),
-    "max_retries": int(os.environ.get("SECONDARY_MAX_RETRIES", str(CODING_PLAN_CONFIG["max_retries"]))),
-    "base_backoff": float(os.environ.get("SECONDARY_BASE_BACKOFF", str(CODING_PLAN_CONFIG["base_backoff"]))),
+    "rpm_limit": _safe_int("SECONDARY_RPM_LIMIT", CODING_PLAN_CONFIG["rpm_limit"]),
+    "tpm_limit": _safe_int("SECONDARY_TPM_LIMIT", CODING_PLAN_CONFIG["tpm_limit"]),
+    "safety_factor": _safe_float("SECONDARY_SAFETY_FACTOR", CODING_PLAN_CONFIG["safety_factor"]),
+    "requests_per_5h": _safe_int("SECONDARY_REQUESTS_PER_5H", CODING_PLAN_CONFIG["requests_per_5h"]),
+    "requests_per_week": _safe_int("SECONDARY_REQUESTS_PER_WEEK", CODING_PLAN_CONFIG["requests_per_week"]),
+    "requests_per_month": _safe_int("SECONDARY_REQUESTS_PER_MONTH", CODING_PLAN_CONFIG["requests_per_month"]),
+    "max_queue_size": _safe_int("SECONDARY_MAX_QUEUE_SIZE", CODING_PLAN_CONFIG["max_queue_size"]),
+    "max_retries": _safe_int("SECONDARY_MAX_RETRIES", CODING_PLAN_CONFIG["max_retries"]),
+    "base_backoff": _safe_float("SECONDARY_BASE_BACKOFF", CODING_PLAN_CONFIG["base_backoff"]),
 }
 
 # ---------------------------------------------------------------------------
@@ -103,15 +123,15 @@ TERTIARY_DEFAULTS = {
 }
 
 TERTIARY_CODING_PLAN_CONFIG = {
-    "rpm_limit": int(os.environ.get("TERTIARY_RPM_LIMIT", str(TERTIARY_DEFAULTS["rpm_limit"]))),
-    "tpm_limit": int(os.environ.get("TERTIARY_TPM_LIMIT", str(TERTIARY_DEFAULTS["tpm_limit"]))),
-    "safety_factor": float(os.environ.get("TERTIARY_SAFETY_FACTOR", str(TERTIARY_DEFAULTS["safety_factor"]))),
-    "requests_per_5h": int(os.environ.get("TERTIARY_REQUESTS_PER_5H", str(TERTIARY_DEFAULTS["requests_per_5h"]))),
-    "requests_per_week": int(os.environ.get("TERTIARY_REQUESTS_PER_WEEK", str(TERTIARY_DEFAULTS["requests_per_week"]))),
-    "requests_per_month": int(os.environ.get("TERTIARY_REQUESTS_PER_MONTH", str(TERTIARY_DEFAULTS["requests_per_month"]))),
-    "max_queue_size": int(os.environ.get("TERTIARY_MAX_QUEUE_SIZE", str(TERTIARY_DEFAULTS["max_queue_size"]))),
-    "max_retries": int(os.environ.get("TERTIARY_MAX_RETRIES", str(TERTIARY_DEFAULTS["max_retries"]))),
-    "base_backoff": float(os.environ.get("TERTIARY_BASE_BACKOFF", str(TERTIARY_DEFAULTS["base_backoff"]))),
+    "rpm_limit": _safe_int("TERTIARY_RPM_LIMIT", TERTIARY_DEFAULTS["rpm_limit"]),
+    "tpm_limit": _safe_int("TERTIARY_TPM_LIMIT", TERTIARY_DEFAULTS["tpm_limit"]),
+    "safety_factor": _safe_float("TERTIARY_SAFETY_FACTOR", TERTIARY_DEFAULTS["safety_factor"]),
+    "requests_per_5h": _safe_int("TERTIARY_REQUESTS_PER_5H", TERTIARY_DEFAULTS["requests_per_5h"]),
+    "requests_per_week": _safe_int("TERTIARY_REQUESTS_PER_WEEK", TERTIARY_DEFAULTS["requests_per_week"]),
+    "requests_per_month": _safe_int("TERTIARY_REQUESTS_PER_MONTH", TERTIARY_DEFAULTS["requests_per_month"]),
+    "max_queue_size": _safe_int("TERTIARY_MAX_QUEUE_SIZE", TERTIARY_DEFAULTS["max_queue_size"]),
+    "max_retries": _safe_int("TERTIARY_MAX_RETRIES", TERTIARY_DEFAULTS["max_retries"]),
+    "base_backoff": _safe_float("TERTIARY_BASE_BACKOFF", TERTIARY_DEFAULTS["base_backoff"]),
 }
 
 

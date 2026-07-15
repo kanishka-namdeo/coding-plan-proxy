@@ -252,7 +252,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     else:
         limiter = rate_limiter
 
-    rate_limiter.pending_requests += 1
+    await rate_limiter.increment_pending()
     try:
         wait_time = await wait_for_slot(limiter, request, estimated_tokens, queue_limiter=rate_limiter)
         if wait_time is None:
@@ -778,7 +778,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
             await limiter.refund_tokens(estimated_tokens)
         raise
     finally:
-        rate_limiter.pending_requests = max(0, rate_limiter.pending_requests - 1)
+        await rate_limiter.decrement_pending()
         session_log: SessionLogWriter | None = request.app.get("session_log")
         if session_log is not None:
             session_entry["status_code"] = status_code

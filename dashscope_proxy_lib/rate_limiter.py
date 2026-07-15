@@ -521,6 +521,7 @@ class MultiProviderRateLimiter:
 
         # Global pending request counter (shared across providers for queue management)
         self._pending_requests = 0
+        self._pending_lock = asyncio.Lock()  # Protects _pending_requests from concurrent modification
 
     def get_limiter_for_provider(self, provider_name: str) -> RateLimiter:
         """Get the appropriate rate limiter for a provider."""
@@ -539,6 +540,16 @@ class MultiProviderRateLimiter:
     @pending_requests.setter
     def pending_requests(self, value: int):
         self._pending_requests = max(0, value)
+
+    async def increment_pending(self) -> None:
+        """Atomically increment pending_requests counter."""
+        async with self._pending_lock:
+            self._pending_requests += 1
+
+    async def decrement_pending(self) -> None:
+        """Atomically decrement pending_requests counter."""
+        async with self._pending_lock:
+            self._pending_requests = max(0, self._pending_requests - 1)
 
     @property
     def max_queue_size(self) -> int:

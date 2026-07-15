@@ -908,21 +908,26 @@ class TestTUILogHandler:
 class TestClientDisconnected:
     def test_disconnected_when_transport_closing(self, dashscope_module):
         req = MagicMock()
-        req.transport.is_closing.return_value = True
+        req.protocol.transport.is_closing.return_value = True
         assert dashscope_module._client_disconnected(req) is True
 
     def test_connected_when_transport_open(self, dashscope_module):
         req = MagicMock()
-        req.transport.is_closing.return_value = False
+        req.protocol.transport.is_closing.return_value = False
         assert dashscope_module._client_disconnected(req) is False
 
-    def test_no_transport_attribute(self, dashscope_module):
-        req = MagicMock(spec=[])  # no transport attribute
+    def test_no_protocol_attribute(self, dashscope_module):
+        req = MagicMock(spec=[])  # no protocol attribute
+        assert dashscope_module._client_disconnected(req) is False
+
+    def test_protocol_without_transport(self, dashscope_module):
+        req = MagicMock()
+        req.protocol = MagicMock(spec=[])  # no transport
         assert dashscope_module._client_disconnected(req) is False
 
     def test_transport_without_is_closing(self, dashscope_module):
         req = MagicMock()
-        req.transport = MagicMock(spec=[])  # no is_closing
+        req.protocol.transport = MagicMock(spec=[])  # no is_closing
         assert dashscope_module._client_disconnected(req) is False
 
 

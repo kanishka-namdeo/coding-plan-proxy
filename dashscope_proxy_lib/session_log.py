@@ -42,9 +42,14 @@ class SessionLogWriter:
             today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
         if today == self._current_date and self._file is not None:
             return
-        os.makedirs(self.log_dir, exist_ok=True)
-        path = os.path.join(self.log_dir, f"{today}.jsonl")
-        new_file = open(path, "a", encoding="utf-8")
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            path = os.path.join(self.log_dir, f"{today}.jsonl")
+            new_file = open(path, "a", encoding="utf-8")
+        except OSError as e:
+            import logging
+            logging.getLogger(__name__).warning("session log file open failed: %s", e)
+            return
         if self._file is not None:
             self._file.close()
         self._file = new_file
@@ -52,9 +57,13 @@ class SessionLogWriter:
 
     def _write_sync(self, entry: dict) -> None:
         """Synchronous write (called from thread pool). Must be called with self._lock held."""
-        self._ensure_file()
-        self._file.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        self._file.flush()
+        try:
+            self._ensure_file()
+            self._file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self._file.flush()
+        except OSError as e:
+            import logging
+            logging.getLogger(__name__).warning("session log write failed: %s", e)
 
     async def log_async(self, entry: dict) -> None:
         """Async wrapper that offloads blocking I/O to a thread pool."""

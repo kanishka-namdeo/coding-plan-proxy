@@ -990,6 +990,7 @@ class ProxyTUI(App):
         if warning:
             tertiary_table.add_row("Warning", warning)
 
+    @_safe_update
     def _update_model_table(self, status: dict) -> None:
         """Update per-model usage DataTable with filtering and sorting.
         
@@ -1328,9 +1329,6 @@ class ProxyTUI(App):
             except NoMatches:
                 pass
 
-    async def on_shutdown(self) -> None:
-        """Signal proxy shutdown and cancel background worker when TUI exits."""
-        self._signal_proxy_shutdown()
 
     def _signal_proxy_shutdown(self) -> None:
         """Signal the proxy server to shut down (cross-thread safe)."""
