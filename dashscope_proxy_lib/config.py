@@ -247,6 +247,7 @@ QUATERNARY_MODELS = {
         {"id": "bytedance-seed-code", "object": "model"},
         {"id": "glm-5.2", "object": "model"},
         {"id": "glm-5.1", "object": "model"},
+        {"id": "ark-code-latest", "object": "model"},
     ]
 }
 
