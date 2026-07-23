@@ -5,7 +5,7 @@ import sys
 from dataclasses import dataclass
 
 from dashscope_proxy_lib.config import (
-    SECONDARY_MODELS, TERTIARY_MODELS, MODEL_PROVIDER_MAP,
+    SECONDARY_MODELS, TERTIARY_MODELS, QUATERNARY_MODELS, MODEL_PROVIDER_MAP,
 )
 from dashscope_proxy_lib.logging_config import _log
 from dashscope_proxy_lib.request_transform import normalize_model_name
@@ -28,6 +28,11 @@ def _build_tertiary_model_ids(models: dict) -> set[str]:
     return {entry["id"] for entry in models.get("data", [])}
 
 
+def _build_quaternary_model_ids(models: dict) -> set[str]:
+    """Build lookup set for quaternary (ARK) models."""
+    return {entry["id"] for entry in models.get("data", [])}
+
+
 def _cfg(name: str):
     """Resolve a constant through the facade module (supports runtime patching by tests)."""
     _ds = sys.modules.get("dashscope_proxy")
@@ -45,6 +50,12 @@ def _secondary_cfg(name: str) -> str:
 
 def _tertiary_cfg(name: str) -> str:
     """Resolve tertiary provider config (always reads live config module values)."""
+    from dashscope_proxy_lib import config as _c
+    return getattr(_c, name, "")
+
+
+def _quaternary_cfg(name: str) -> str:
+    """Resolve quaternary provider config (always reads live config module values)."""
     from dashscope_proxy_lib import config as _c
     return getattr(_c, name, "")
 
@@ -88,9 +99,18 @@ class ProviderRouter:
             base_url=tertiary_base or _cfg("TARGET_BASE"),
             is_available=bool(tertiary_key and tertiary_base),
         )
+        quaternary_key = _quaternary_cfg("QUATERNARY_API_KEY")
+        quaternary_base = _quaternary_cfg("QUATERNARY_BASE_URL")
+        self.quaternary = ProviderConfig(
+            name="quaternary",
+            api_key=quaternary_key,
+            base_url=quaternary_base or _cfg("TARGET_BASE"),
+            is_available=bool(quaternary_key and quaternary_base),
+        )
         # Cache model IDs for O(1) lookup
         self._secondary_model_ids: set[str] = _build_secondary_model_ids(SECONDARY_MODELS)
         self._tertiary_model_ids: set[str] = _build_tertiary_model_ids(TERTIARY_MODELS)
+        self._quaternary_model_ids: set[str] = _build_quaternary_model_ids(QUATERNARY_MODELS)
         self._log_provider_status()
 
     def _log_provider_status(self) -> None:
@@ -98,7 +118,8 @@ class ProviderRouter:
         _log(logging.INFO, "provider router initialized",
              primary_available=self.primary.is_available,
              secondary_available=self.secondary.is_available,
-             tertiary_available=self.tertiary.is_available)
+             tertiary_available=self.tertiary.is_available,
+             quaternary_available=self.quaternary.is_available)
 
     def is_secondary_configured(self) -> bool:
         """Check if secondary provider is fully configured."""
@@ -108,26 +129,37 @@ class ProviderRouter:
         """Check if tertiary provider is fully configured."""
         return self.tertiary.is_available
 
+    def is_quaternary_configured(self) -> bool:
+        """Check if quaternary provider is fully configured."""
+        return self.quaternary.is_available
+
     def get_provider_for_model(self, model_name: str) -> ProviderConfig:
         """
         Determine which provider should handle a request for the given model.
 
         Priority:
         1. Explicit mapping in MODEL_PROVIDER_MAP
-        2. Model exists in TERTIARY_MODELS -> tertiary
-        3. Model exists in SECONDARY_MODELS -> secondary
-        4. Default to primary
+        2. Model exists in QUATERNARY_MODELS -> quaternary
+        3. Model exists in TERTIARY_MODELS -> tertiary
+        4. Model exists in SECONDARY_MODELS -> secondary
+        5. Default to primary
         """
         model_name = normalize_model_name(model_name)
 
         # Check explicit mapping first (highest priority)
         mapped = MODEL_PROVIDER_MAP.get(model_name)
+        if mapped == "quaternary" and self.quaternary.is_available:
+            return self.quaternary
         if mapped == "tertiary" and self.tertiary.is_available:
             return self.tertiary
         if mapped == "secondary" and self.secondary.is_available:
             return self.secondary
         if mapped == "primary":
             return self.primary
+
+        # O(1) set lookup for quaternary models
+        if self.quaternary.is_available and model_name in self._quaternary_model_ids:
+            return self.quaternary
 
         # O(1) set lookup for tertiary models
         if self.tertiary.is_available and model_name in self._tertiary_model_ids:
@@ -143,7 +175,7 @@ class ProviderRouter:
     def get_all_models(self) -> dict:
         """
         Return combined model list from all configured providers.
-        Only includes secondary/tertiary models when those providers are configured.
+        Only includes secondary/tertiary/quaternary models when those providers are configured.
         """
         from dashscope_proxy_lib.config import MOCK_MODELS
 
@@ -159,6 +191,10 @@ class ProviderRouter:
         # Include tertiary models only if configured
         if self.tertiary.is_available:
             models["data"].extend(TERTIARY_MODELS.get("data", []))
+
+        # Include quaternary models only if configured
+        if self.quaternary.is_available:
+            models["data"].extend(QUATERNARY_MODELS.get("data", []))
 
         return models
 
@@ -176,5 +212,9 @@ class ProviderRouter:
             "tertiary": {
                 "available": self.tertiary.is_available,
                 "base_url": self.tertiary.base_url if self.tertiary.is_available else None,
+            },
+            "quaternary": {
+                "available": self.quaternary.is_available,
+                "base_url": self.quaternary.base_url if self.quaternary.is_available else None,
             },
         }

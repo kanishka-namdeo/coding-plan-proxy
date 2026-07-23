@@ -1311,6 +1311,64 @@ class TestProviderRouter:
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model("kat-coder-pro-v2.5").name == "tertiary"
 
+    def test_quaternary_model_routed_to_quaternary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "sk-ark")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.QUATERNARY_BASE_URL",
+            "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("dola-seed-2.0-pro").name == "quaternary"
+
+    def test_quaternary_unconfigured_returns_primary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("dola-seed-2.0-pro").name == "primary"
+
+    def test_get_all_models_includes_quaternary_when_configured(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "sk-ark")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.QUATERNARY_BASE_URL",
+            "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        )
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        model_ids = [m["id"] for m in models["data"]]
+        assert "dola-seed-2.0-pro" in model_ids
+
+    def test_get_all_models_excludes_quaternary_when_not_configured(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        model_ids = [m["id"] for m in models["data"]]
+        assert "dola-seed-2.0-pro" not in model_ids
+
+    def test_get_provider_status_includes_quaternary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "sk-ark")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.QUATERNARY_BASE_URL",
+            "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        )
+        router = dashscope_module.ProviderRouter()
+        status = router.get_provider_status()
+        assert "quaternary" in status
+        assert status["quaternary"]["available"] is True
+
+    def test_model_provider_map_quaternary_override(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "sk-ark")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.QUATERNARY_BASE_URL",
+            "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        )
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.MODEL_PROVIDER_MAP",
+            {"glm-5.2": "quaternary"},
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("glm-5.2").name == "quaternary"
+
 
 # ---------------------------------------------------------------------------
 # MultiProviderRateLimiter
@@ -1392,10 +1450,12 @@ class TestMultiProviderRateLimiter:
         assert "primary" in status
         assert "secondary" in status
         assert "tertiary" in status
+        assert "quaternary" in status
         assert "shared_limits" in status
         assert status["shared_limits"] is True
         assert status["secondary"] is None
         assert status["tertiary"] is None
+        assert status["quaternary"] is None
 
     def test_status_shows_secondary_when_configured(self, dashscope_module):
         mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), self._make_config())
@@ -1413,6 +1473,39 @@ class TestMultiProviderRateLimiter:
     async def test_provider_specific_can_proceed_tertiary(self, dashscope_module):
         mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None, self._make_config())
         allowed, reason, _ = await mpl.can_proceed_for_provider(0, "tertiary")
+        assert allowed is True
+
+    def test_creates_quaternary_when_config_provided(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(
+            self._make_config(), None, None, self._make_config()
+        )
+        assert mpl.primary is not None
+        assert mpl.secondary is None
+        assert mpl.tertiary is None
+        assert mpl.quaternary is not None
+
+    def test_get_limiter_for_provider_returns_quaternary(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(
+            self._make_config(), None, None, self._make_config()
+        )
+        limiter = mpl.get_limiter_for_provider("quaternary")
+        assert limiter is mpl.quaternary
+
+    def test_status_includes_quaternary(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(
+            self._make_config(), None, None, self._make_config()
+        )
+        status = mpl.status()
+        assert "quaternary" in status
+        assert status["quaternary"] is not None
+        assert "rpm_limit" in status["quaternary"]
+
+    @pytest.mark.asyncio
+    async def test_provider_specific_can_proceed_quaternary(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(
+            self._make_config(), None, None, self._make_config()
+        )
+        allowed, reason, _ = await mpl.can_proceed_for_provider(0, "quaternary")
         assert allowed is True
 
     def test_queue_drops_property(self, dashscope_module):

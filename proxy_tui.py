@@ -211,6 +211,12 @@ class ProxyTUI(App):
                             yield Static("StreamLake", classes="panel-title")
                             yield Static("StreamLake: Not configured", id="tertiary-status-line")
                             yield DataTable(id="tertiary-rl-metrics")
+
+                        # Quaternary provider section (ARK, hidden by default)
+                        with Vertical(id="quaternary-overview"):
+                            yield Static("ARK", classes="panel-title")
+                            yield Static("ARK: Not configured", id="quaternary-status-line")
+                            yield DataTable(id="quaternary-rl-metrics")
                         
                         yield Static("", classes="spacer")
                         yield Static("Request Statistics", classes="panel-title")
@@ -348,6 +354,15 @@ class ProxyTUI(App):
         except NoMatches:
             pass
 
+        # Configure quaternary (ARK) metrics table (in Overview tab)
+        try:
+            quaternary_table = self.query_one("#quaternary-rl-metrics", DataTable)
+            quaternary_table.add_columns("Metric", "Value")
+            quaternary_table.show_header = False
+            quaternary_table.zebra_stripes = True
+        except NoMatches:
+            pass
+
         # Start background polling in a thread
         self.run_worker(self._poll_loop, exclusive=True, thread=True, description="metrics poller")
 
@@ -412,6 +427,7 @@ class ProxyTUI(App):
                 self.call_from_thread(self._update_config_table_filtered)
                 self.call_from_thread(self._update_secondary_metrics, raw_status)
                 self.call_from_thread(self._update_tertiary_metrics, raw_status)
+                self.call_from_thread(self._update_quaternary_metrics, raw_status)
 
                 consecutive_errors = 0
 
@@ -545,7 +561,13 @@ class ProxyTUI(App):
                 stats_table.add_row("Forwarded (StreamLake)", _fmt_number(ter_fwd))
                 stats_table.add_row("429s (StreamLake)", str(ter.get("total_429s", 0)))
                 total_fwd_all += ter_fwd
-            if multi_provider.get("secondary") or multi_provider.get("tertiary"):
+            if multi_provider.get("quaternary"):
+                qua = multi_provider["quaternary"]
+                qua_fwd = qua.get("total_forwarded", 0)
+                stats_table.add_row("Forwarded (ARK)", _fmt_number(qua_fwd))
+                stats_table.add_row("429s (ARK)", str(qua.get("total_429s", 0)))
+                total_fwd_all += qua_fwd
+            if multi_provider.get("secondary") or multi_provider.get("tertiary") or multi_provider.get("quaternary"):
                 stats_table.add_row("Total Forwarded", _fmt_number(total_fwd_all))
                 stats_table.add_row("429s (Primary)", str(status.get("total_429s", 0)))
             else:
@@ -811,6 +833,11 @@ class ProxyTUI(App):
             secondary_overview.set_class(False, "visible")
             return
 
+        # Only show if provider has served at least one request
+        if secondary_status.get("total_forwarded", 0) == 0:
+            secondary_overview.set_class(False, "visible")
+            return
+
         # Secondary provider is active - show the section
         secondary_overview.set_class(True, "visible")
 
@@ -914,6 +941,11 @@ class ProxyTUI(App):
             tertiary_overview.set_class(False, "visible")
             return
 
+        # Only show if provider has served at least one request
+        if tertiary_status.get("total_forwarded", 0) == 0:
+            tertiary_overview.set_class(False, "visible")
+            return
+
         tertiary_overview.set_class(True, "visible")
 
         from dashscope_proxy_lib.config import TERTIARY_BASE_URL
@@ -991,6 +1023,107 @@ class ProxyTUI(App):
             tertiary_table.add_row("Warning", warning)
 
     @_safe_update
+    def _update_quaternary_metrics(self, status: dict) -> None:
+        """Update ARK (quaternary) provider metrics in the Overview tab."""
+        try:
+            quaternary_overview = self.query_one("#quaternary-overview", Vertical)
+            quaternary_status_line = self.query_one("#quaternary-status-line", Static)
+            quaternary_table = self.query_one("#quaternary-rl-metrics", DataTable)
+        except NoMatches:
+            return
+
+        if "quaternary" not in status:
+            quaternary_overview.set_class(False, "visible")
+            return
+
+        quaternary_status = status.get("quaternary")
+
+        if not quaternary_status:
+            quaternary_overview.set_class(False, "visible")
+            return
+
+        # Only show if provider has served at least one request
+        if quaternary_status.get("total_forwarded", 0) == 0:
+            quaternary_overview.set_class(False, "visible")
+            return
+
+        quaternary_overview.set_class(True, "visible")
+
+        from dashscope_proxy_lib.config import QUATERNARY_BASE_URL
+        base_url_display = QUATERNARY_BASE_URL or "N/A"
+        quaternary_status_line.update(f"Status: Active | Target: {base_url_display}")
+        quaternary_status_line.set_class(True, "status-running")
+        quaternary_status_line.set_class(False, "status-stopped")
+
+        quaternary_table.clear()
+
+        quaternary_table.add_row("RPS Limit", str(quaternary_status.get("rps_limit", 0)))
+
+        rpm_current = quaternary_status.get("rpm_current", 0)
+        rpm_limit = quaternary_status.get("rpm_limit", 1)
+        quaternary_table.add_row(
+            "RPM",
+            _progress_bar(rpm_current, rpm_limit),
+        )
+
+        quaternary_table.add_row(
+            "TPM Available",
+            _progress_bar(
+                quaternary_status.get("tpm_available", 0),
+                quaternary_status.get("tpm_limit", 1)
+            ),
+        )
+
+        quaternary_table.add_row(
+            "5-Hour Quota",
+            _progress_bar(
+                quaternary_status.get("requests_5h", 0),
+                quaternary_status.get("requests_5h_limit", 1)
+            ),
+        )
+
+        quaternary_table.add_row(
+            "Weekly Quota",
+            _progress_bar(
+                quaternary_status.get("requests_week", 0),
+                quaternary_status.get("requests_week_limit", 1)
+            ),
+        )
+
+        quaternary_table.add_row(
+            "Monthly Quota",
+            _progress_bar(
+                quaternary_status.get("requests_month", 0),
+                quaternary_status.get("requests_month_limit", 1)
+            ),
+        )
+
+        if quaternary_status.get("circuit_open"):
+            quaternary_table.add_row("Circuit", "OPEN (failures: {})".format(
+                quaternary_status.get("circuit_failure_count", 0)))
+        elif quaternary_status.get("circuit_failure_count", 0) > 0:
+            quaternary_table.add_row("Circuit", "closed ({} failures)".format(
+                quaternary_status.get("circuit_failure_count", 0)))
+
+        quaternary_table.add_row(
+            "Tokens",
+            f"{_fmt_number(quaternary_status.get('total_tokens_consumed', 0))} consumed | "
+            f"{_fmt_number(quaternary_status.get('tpm_reserved', 0))} reserved | "
+            f"{_fmt_number(quaternary_status.get('tpm_limit', 0))} capacity",
+        )
+
+        quaternary_table.add_row(
+            "Forwarded",
+            f"{_fmt_number(quaternary_status.get('total_forwarded', 0))} | "
+            f"429s: {quaternary_status.get('total_429s', 0)} | "
+            f"Rejected: {quaternary_status.get('total_rejected', 0)}",
+        )
+
+        warning = self._quota_warning(quaternary_status)
+        if warning:
+            quaternary_table.add_row("Warning", warning)
+
+    @_safe_update
     def _update_model_table(self, status: dict) -> None:
         """Update per-model usage DataTable with filtering and sorting.
         
@@ -1005,6 +1138,7 @@ class ProxyTUI(App):
             primary_usage = status.get("primary", {}).get("model_usage", {})
             secondary_usage = status.get("secondary", {}).get("model_usage", {}) if status.get("secondary") else {}
             tertiary_usage = status.get("tertiary", {}).get("model_usage", {}) if status.get("tertiary") else {}
+            quaternary_usage = status.get("quaternary", {}).get("model_usage", {}) if status.get("quaternary") else {}
 
             model_usage = {}
             for model_name, stats in primary_usage.items():
@@ -1013,6 +1147,8 @@ class ProxyTUI(App):
                 model_usage[model_name] = {**stats, "provider": "secondary"}
             for model_name, stats in tertiary_usage.items():
                 model_usage[model_name] = {**stats, "provider": "streamlake"}
+            for model_name, stats in quaternary_usage.items():
+                model_usage[model_name] = {**stats, "provider": "ark"}
         else:
             # Single provider mode
             model_usage = {k: {**v, "provider": "primary"} for k, v in status.get("model_usage", {}).items()}

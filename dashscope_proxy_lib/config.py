@@ -58,6 +58,13 @@ TERTIARY_API_KEY = os.environ.get("STREAMLAKE_API_KEY", "").strip()
 TERTIARY_BASE_URL = os.environ.get("STREAMLAKE_TARGET_BASE", "").strip()
 
 # ---------------------------------------------------------------------------
+# Quaternary provider configuration (optional - ARK / BytePlus)
+# Only used if both KEY and BASE_URL are set
+# ---------------------------------------------------------------------------
+QUATERNARY_API_KEY = os.environ.get("MODEL_ARK_API_KEY", "").strip()
+QUATERNARY_BASE_URL = os.environ.get("MODEL_ARK_TARGET_BASE", "").strip()
+
+# ---------------------------------------------------------------------------
 # Timeout and connection limits
 # ---------------------------------------------------------------------------
 UPSTREAM_TIMEOUT_TOTAL = _safe_int("UPSTREAM_TIMEOUT_TOTAL", 300)
@@ -81,7 +88,7 @@ HOP_BY_HOP_HEADERS = frozenset({
 # Rate limiting configuration (DashScope Coding Plan)
 # ---------------------------------------------------------------------------
 CODING_PLAN_CONFIG = {
-    "rpm_limit": 10,
+    "rpm_limit": 12,
     "tpm_limit": 4_000_000,
     "safety_factor": 0.8,
     "requests_per_5h": 6000,
@@ -132,6 +139,33 @@ TERTIARY_CODING_PLAN_CONFIG = {
     "max_queue_size": _safe_int("TERTIARY_MAX_QUEUE_SIZE", TERTIARY_DEFAULTS["max_queue_size"]),
     "max_retries": _safe_int("TERTIARY_MAX_RETRIES", TERTIARY_DEFAULTS["max_retries"]),
     "base_backoff": _safe_float("TERTIARY_BASE_BACKOFF", TERTIARY_DEFAULTS["base_backoff"]),
+}
+
+# ---------------------------------------------------------------------------
+# Quaternary provider rate limits (ARK - independent defaults)
+# ---------------------------------------------------------------------------
+QUATERNARY_DEFAULTS = {
+    "rpm_limit": 40,
+    "tpm_limit": 6_000_000,
+    "safety_factor": 0.8,
+    "requests_per_5h": 3000,
+    "requests_per_week": 20000,
+    "requests_per_month": 50000,
+    "max_queue_size": 200,
+    "max_retries": 20,
+    "base_backoff": 1.0,
+}
+
+QUATERNARY_CODING_PLAN_CONFIG = {
+    "rpm_limit": _safe_int("QUATERNARY_RPM_LIMIT", QUATERNARY_DEFAULTS["rpm_limit"]),
+    "tpm_limit": _safe_int("QUATERNARY_TPM_LIMIT", QUATERNARY_DEFAULTS["tpm_limit"]),
+    "safety_factor": _safe_float("QUATERNARY_SAFETY_FACTOR", QUATERNARY_DEFAULTS["safety_factor"]),
+    "requests_per_5h": _safe_int("QUATERNARY_REQUESTS_PER_5H", QUATERNARY_DEFAULTS["requests_per_5h"]),
+    "requests_per_week": _safe_int("QUATERNARY_REQUESTS_PER_WEEK", QUATERNARY_DEFAULTS["requests_per_week"]),
+    "requests_per_month": _safe_int("QUATERNARY_REQUESTS_PER_MONTH", QUATERNARY_DEFAULTS["requests_per_month"]),
+    "max_queue_size": _safe_int("QUATERNARY_MAX_QUEUE_SIZE", QUATERNARY_DEFAULTS["max_queue_size"]),
+    "max_retries": _safe_int("QUATERNARY_MAX_RETRIES", QUATERNARY_DEFAULTS["max_retries"]),
+    "base_backoff": _safe_float("QUATERNARY_BASE_BACKOFF", QUATERNARY_DEFAULTS["base_backoff"]),
 }
 
 
@@ -202,9 +236,24 @@ TERTIARY_MODELS = {
 }
 
 # ---------------------------------------------------------------------------
+# Quaternary provider models (ARK / BytePlus)
+# ---------------------------------------------------------------------------
+QUATERNARY_MODELS = {
+    "object": "list",
+    "data": [
+        {"id": "dola-seed-2.0-pro", "object": "model"},
+        {"id": "dola-seed-2.0-lite", "object": "model"},
+        {"id": "dola-seed-2.0-code", "object": "model"},
+        {"id": "bytedance-seed-code", "object": "model"},
+        {"id": "glm-5.2", "object": "model"},
+        {"id": "glm-5.1", "object": "model"},
+    ]
+}
+
+# ---------------------------------------------------------------------------
 # Explicit model-to-provider mapping (optional overrides)
-# Keys are model names, values are "primary", "secondary", or "tertiary".
+# Keys are model names, values are "primary", "secondary", "tertiary", or "quaternary".
 # When a model is listed here, this mapping takes priority over
-# the SECONDARY_MODELS list for routing decisions.
+# the model list lookups for routing decisions.
 # ---------------------------------------------------------------------------
 MODEL_PROVIDER_MAP: dict[str, str] = {}

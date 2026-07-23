@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import sys
 import time
 import typing
@@ -305,14 +306,22 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                  request_id=request_id, wait_ms=queue_wait_ms)
 
         # Build target URL using provider's base URL
-        # Ensure exactly one /v1 prefix in the final URL regardless of
-        # whether the base URL already includes it (e.g. mimo's /v1 suffix).
+        # Handle versioned base URLs (e.g. /v1, /v3) by preserving the base's version
+        # and normalizing the request path to match.
         base_url = provider.base_url.rstrip("/")
-        if base_url.endswith("/v1"):
-            # Strip /v1 from base since the request path already includes it
-            base_url = base_url[:-3]
-        target_path = path if path.startswith("/v1") else f"/v1{path}"
-        target_url = f"{base_url}{target_path}"
+        # Detect version suffix like /v1, /v2, /v3, etc.
+        version_match = re.search(r'/v(\d+)$', base_url)
+        if version_match:
+            base_version = f"v{version_match.group(1)}"
+            base_url = base_url[:version_match.start()]  # Strip version from base
+        else:
+            base_version = "v1"  # Default to v1
+
+        # Normalize request path: strip any /vN prefix, then add the correct version
+        target_path = re.sub(r'^/v\d+', '', path)
+        if not target_path.startswith('/'):
+            target_path = '/' + target_path
+        target_url = f"{base_url}/{base_version}{target_path}"
         if request.query_string:
             target_url += f"?{request.query_string}"
 

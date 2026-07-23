@@ -14,7 +14,8 @@ from dashscope_proxy_lib.config import (
     PROXY_HOST, PROXY_PORT, TARGET_BASE, UPSTREAM_TIMEOUT_CONNECT,
     UPSTREAM_TIMEOUT_TOTAL, SECONDARY_API_KEY, SECONDARY_BASE_URL,
     SECONDARY_CODING_PLAN_CONFIG, TERTIARY_API_KEY, TERTIARY_BASE_URL,
-    TERTIARY_CODING_PLAN_CONFIG,
+    TERTIARY_CODING_PLAN_CONFIG, QUATERNARY_API_KEY, QUATERNARY_BASE_URL,
+    QUATERNARY_CODING_PLAN_CONFIG,
 )
 from dashscope_proxy_lib.rate_limiter import RateLimiter, MultiProviderRateLimiter
 from dashscope_proxy_lib.session_log import SessionLogWriter, SESSION_LOG_DIR, SESSION_LOG_ENABLED
@@ -103,14 +104,16 @@ async def create_proxy_resources() -> tuple[MultiProviderRateLimiter, web.Applic
     # Create multi-provider rate limiter
     secondary_config = SECONDARY_CODING_PLAN_CONFIG if (SECONDARY_API_KEY and SECONDARY_BASE_URL) else None
     tertiary_config = TERTIARY_CODING_PLAN_CONFIG if (TERTIARY_API_KEY and TERTIARY_BASE_URL) else None
-    rate_limiter = MultiProviderRateLimiter(config, secondary_config, tertiary_config)
+    quaternary_config = QUATERNARY_CODING_PLAN_CONFIG if (QUATERNARY_API_KEY and QUATERNARY_BASE_URL) else None
+    rate_limiter = MultiProviderRateLimiter(config, secondary_config, tertiary_config, quaternary_config)
 
-    if secondary_config or tertiary_config:
+    if secondary_config or tertiary_config or quaternary_config:
         _log(logging.INFO, "multi-provider mode enabled",
              secondary_url=SECONDARY_BASE_URL if secondary_config else None,
-             tertiary_url=TERTIARY_BASE_URL if tertiary_config else None)
+             tertiary_url=TERTIARY_BASE_URL if tertiary_config else None,
+             quaternary_url=QUATERNARY_BASE_URL if quaternary_config else None)
     else:
-        _log(logging.INFO, "single-provider mode (secondary/tertiary not configured)")
+        _log(logging.INFO, "single-provider mode (secondary/tertiary/quaternary not configured)")
 
     app = create_app()
     timeout = aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_TOTAL, connect=UPSTREAM_TIMEOUT_CONNECT)

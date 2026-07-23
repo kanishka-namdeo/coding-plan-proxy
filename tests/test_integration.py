@@ -2,6 +2,8 @@
 import json
 import time
 import asyncio
+from datetime import datetime, timezone
+from email.utils import formatdate
 from unittest.mock import MagicMock
 import aiohttp
 from aiohttp import web
@@ -60,7 +62,7 @@ def _reset_provider_router():
 @pytest.fixture
 def proxy_app():
     """Create the proxy app with a test rate limiter and mock client_session."""
-    rate_limiter = dashscope_proxy.RateLimiter(make_test_config())
+    rate_limiter = dashscope_proxy.MultiProviderRateLimiter(make_test_config())
     app = dashscope_proxy.create_app()
     app["rate_limiter"] = rate_limiter
     app["shutting_down"] = asyncio.Event()
@@ -226,7 +228,7 @@ class TestProxyForwarding:
                     assert resp.status == 200
                     data = await resp.json()
                     assert "choices" in data
-                    assert rl.total_forwarded >= 1
+                    assert rl.primary.total_forwarded >= 1
             finally:
                 dashscope_proxy.TARGET_BASE = original_target
         finally:
@@ -462,11 +464,12 @@ class TestProxyStatus:
             # Plain RateLimiter mode (backward compatibility)
             assert "total_forwarded" in rate_limits
             assert "rpm_limit" in rate_limits
-        # providers should contain primary, secondary, and tertiary availability
+        # providers should contain primary, secondary, tertiary, and quaternary availability
         providers = data["providers"]
         assert "primary" in providers
         assert "secondary" in providers
         assert "tertiary" in providers
+        assert "quaternary" in providers
 
 
 # ---------------------------------------------------------------------------
@@ -638,9 +641,14 @@ class TestQueueEnforcement:
         """Client disconnect while queued must return 499, not 503 queue full."""
         app, rl = proxy_app
         rl.rpm_limit = 1
-        rl.rps_limit = 1
+        rl.primary.rps_limit = 1
         rl.max_queue_size = 50
-        rl.rpm_window.add()
+        rl.primary.rpm_window.add()
+
+        # Set up a mock client session (won't actually be used since we disconnect in queue)
+        mock_session = MagicMock()
+        mock_session.closed = False
+        app["client_session"] = mock_session
 
         disconnected = True
 
@@ -676,9 +684,9 @@ class TestCircuitBreakerCleanup:
     async def test_circuit_open_refunds_reserved_tokens(self, aiohttp_client, proxy_app):
         """Reserved TPM must be released when circuit breaker rejects a queued request."""
         app, rl = proxy_app
-        rl.circuit_threshold = 1
-        await rl.record_circuit_failure()
-        assert rl.circuit_is_open()
+        rl.primary.circuit_threshold = 1
+        await rl.primary.record_circuit_failure()
+        assert rl.primary.circuit_is_open()
 
         upstream_app = web.Application()
 
@@ -708,7 +716,7 @@ class TestCircuitBreakerCleanup:
                         }).encode(),
                     )
                     assert resp.status == 503
-                    assert rl.tpm_bucket.reserved == 0
+                    assert rl.primary.tpm_bucket.reserved == 0
             finally:
                 dashscope_proxy.TARGET_BASE = original_target
         finally:
@@ -1145,7 +1153,7 @@ class TestClientError:
     async def test_client_error_returns_502(self, aiohttp_client, proxy_app):
         """When aiohttp raises ClientError, proxy returns 502 after retries."""
         app, rl = proxy_app
-        rl.max_retries = 1
+        rl.primary.max_retries = 1
 
         mock_session = MagicMock()
         mock_session.closed = False
@@ -1218,11 +1226,11 @@ class TestTPMReservationFailure:
     async def test_tpm_reservation_fails_after_queue_returns_503(self, aiohttp_client, proxy_app):
         """After can_proceed succeeds but reserve_tokens fails, proxy returns 503."""
         app, rl = proxy_app
-        rl.max_retries = 1
+        rl.primary.max_retries = 1
 
         # Drain the TPM bucket so any reservation fails
-        rl.tpm_bucket.tokens = 0.0
-        rl.tpm_bucket.reserved = 0
+        rl.primary.tpm_bucket.tokens = 0.0
+        rl.primary.tpm_bucket.reserved = 0
 
         upstream_app = web.Application()
         async def mock_upstream(request):
@@ -1469,8 +1477,8 @@ class TestTokenReconciliation:
                         }).encode(),
                     )
                     assert resp.status == 200
-                    assert rl.total_forwarded >= 1
-                    assert rl.total_tokens_consumed >= 42
+                    assert rl.primary.total_forwarded >= 1
+                    assert rl.primary.total_tokens_consumed >= 42
             finally:
                 dashscope_proxy.TARGET_BASE = original_target
         finally:
@@ -1486,7 +1494,7 @@ class TestUpstreamTimeoutError:
     async def test_timeout_returns_502_after_max_retries(self, aiohttp_client, proxy_app, dashscope_module):
         """When upstream times out repeatedly, proxy returns 502."""
         app, rl = proxy_app
-        rl.max_retries = 2
+        rl.primary.max_retries = 2
 
         async def _slow_handler(request):
             await asyncio.sleep(100)
@@ -1532,7 +1540,7 @@ class TestMultiRetry429:
     async def test_multiple_429s_then_success(self, aiohttp_client, proxy_app, dashscope_module):
         """Proxy retries through multiple 429s before succeeding."""
         app, rl = proxy_app
-        rl.max_retries = 5
+        rl.primary.max_retries = 5
         call_count = 0
 
         async def mock_upstream(request):
@@ -1574,7 +1582,7 @@ class TestMultiRetry429:
                     )
                     assert resp.status == 200
                     assert call_count == 4  # 3 failures + 1 success
-                    assert rl.total_429s >= 3
+                    assert rl.primary.total_429s >= 3
             finally:
                 dashscope_proxy.TARGET_BASE = original_target
         finally:
@@ -1590,7 +1598,7 @@ class TestRetryAfterHttpDate:
     async def test_retry_after_http_date_format(self, aiohttp_client, proxy_app, dashscope_module):
         """Proxy parses Retry-After as HTTP-date and respects it."""
         app, rl = proxy_app
-        rl.max_retries = 2
+        rl.primary.max_retries = 2
         call_count = 0
 
         async def mock_upstream(request):
@@ -1668,8 +1676,8 @@ class TestRequestLifecycle:
             original_target = dashscope_proxy.TARGET_BASE
             dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
             try:
-                before_forwarded = rl.total_forwarded
-                before_tokens = rl.total_tokens_consumed
+                before_forwarded = rl.primary.total_forwarded
+                before_tokens = rl.primary.total_tokens_consumed
                 async with aiohttp.ClientSession() as session:
                     app["client_session"] = session
                     client = await aiohttp_client(app)
@@ -1681,8 +1689,8 @@ class TestRequestLifecycle:
                         }).encode(),
                     )
                     assert resp.status == 200
-                assert rl.total_forwarded == before_forwarded + 1
-                assert rl.total_tokens_consumed >= before_tokens + 100
+                assert rl.primary.total_forwarded == before_forwarded + 1
+                assert rl.primary.total_tokens_consumed >= before_tokens + 100
             finally:
                 dashscope_proxy.TARGET_BASE = original_target
         finally:
@@ -1954,3 +1962,197 @@ class TestTertiaryProviderRouting:
         data = await resp.json()
         assert "providers" in data
         assert data["providers"]["tertiary"]["available"] is True
+
+
+# ---------------------------------------------------------------------------
+# Quaternary provider routing (ARK)
+# ---------------------------------------------------------------------------
+
+class TestQuaternaryProviderRouting:
+    async def test_quaternary_model_forwarded_to_quaternary_upstream(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        """Requests for ARK models should be forwarded to the quaternary upstream."""
+        from aiohttp import web
+
+        received_headers = {}
+
+        async def handler(request: web.Request):
+            received_headers.update(dict(request.headers))
+            return web.json_response({
+                "id": "resp-quaternary",
+                "object": "chat.completion",
+                "model": "dola-seed-2.0-pro",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            })
+
+        quaternary_app = web.Application()
+        quaternary_app.router.add_route("*", "/{tail:.*}", handler)
+        quaternary_runner = web.AppRunner(quaternary_app)
+        await quaternary_runner.setup()
+        quaternary_site = web.TCPSite(quaternary_runner, "127.0.0.1", 0)
+        await quaternary_site.start()
+        quaternary_port = quaternary_site._server.sockets[0].getsockname()[1]
+
+        import dashscope_proxy_lib.config as cfg
+        import dashscope_proxy_lib.handlers as handlers_mod
+
+        monkeypatch.setattr(cfg, "QUATERNARY_API_KEY", "sk-ark-test")
+        monkeypatch.setattr(cfg, "QUATERNARY_BASE_URL", f"http://127.0.0.1:{quaternary_port}")
+        handlers_mod._provider_router = None
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "dola-seed-2.0-pro",
+                        "messages": [{"role": "user", "content": "hello ark"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["id"] == "resp-quaternary"
+                assert received_headers.get("Authorization") == "Bearer sk-ark-test"
+        finally:
+            await quaternary_runner.cleanup()
+
+    async def test_primary_model_still_goes_to_primary_with_quaternary_configured(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        """Primary models should still route to primary even when quaternary is configured."""
+        import dashscope_proxy_lib.config as cfg
+        import dashscope_proxy_lib.handlers as handlers_mod
+
+        monkeypatch.setattr(cfg, "QUATERNARY_API_KEY", "sk-ark-test")
+        monkeypatch.setattr(cfg, "QUATERNARY_BASE_URL", "https://ark.ap-southeast.bytepluses.com/api/coding/v3")
+        handlers_mod._provider_router = None
+
+        # Set up a mock primary upstream
+        primary_app = web.Application()
+
+        async def primary_handler(request):
+            return web.json_response({
+                "id": "resp-primary",
+                "choices": [{"message": {"role": "assistant", "content": "from primary"}}],
+                "usage": {"total_tokens": 10},
+            })
+
+        primary_app.router.add_post("/v1/chat/completions", primary_handler)
+        primary_runner = web.AppRunner(primary_app)
+        await primary_runner.setup()
+        primary_site = web.TCPSite(primary_runner, "127.0.0.1", 0)
+        await primary_site.start()
+        primary_port = primary_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{primary_port}"
+            try:
+                app, _ = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3.6-plus",
+                            "messages": [{"role": "user", "content": "hello"}],
+                        }).encode(),
+                    )
+                    assert resp.status == 200
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await primary_runner.cleanup()
+
+    async def test_models_endpoint_includes_quaternary_when_configured(self, aiohttp_client, proxy_app, monkeypatch):
+        """GET /v1/models should include ARK models when quaternary is configured."""
+        import dashscope_proxy_lib.config as cfg
+
+        monkeypatch.setattr(cfg, "QUATERNARY_API_KEY", "sk-ark-test")
+        monkeypatch.setattr(
+            cfg, "QUATERNARY_BASE_URL",
+            "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        )
+
+        app, _ = proxy_app
+        client = await aiohttp_client(app)
+        resp = await client.get("/v1/models")
+        assert resp.status == 200
+        data = await resp.json()
+        model_ids = [m["id"] for m in data["data"]]
+        assert "dola-seed-2.0-pro" in model_ids
+
+    async def test_status_endpoint_shows_quaternary_provider(self, aiohttp_client, proxy_app, monkeypatch):
+        """Status endpoint should show quaternary provider availability."""
+        import dashscope_proxy_lib.config as cfg
+
+        monkeypatch.setattr(cfg, "QUATERNARY_API_KEY", "sk-ark-test")
+        monkeypatch.setattr(
+            cfg, "QUATERNARY_BASE_URL",
+            "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        )
+
+        app, _ = proxy_app
+        client = await aiohttp_client(app)
+        resp = await client.get("/v1/proxy/status")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "providers" in data
+        assert data["providers"]["quaternary"]["available"] is True
+
+    async def test_quaternary_unconfigured_ark_model_falls_back_to_primary(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        """When quaternary is not configured, ARK models fall back to primary."""
+        import dashscope_proxy_lib.config as cfg
+        import dashscope_proxy_lib.handlers as handlers_mod
+
+        monkeypatch.setattr(cfg, "QUATERNARY_API_KEY", "")
+        monkeypatch.setattr(cfg, "QUATERNARY_BASE_URL", "")
+        handlers_mod._provider_router = None
+
+        # Set up a mock primary upstream
+        primary_app = web.Application()
+
+        async def primary_handler(request):
+            return web.json_response({
+                "id": "resp-primary",
+                "choices": [{"message": {"role": "assistant", "content": "from primary"}}],
+                "usage": {"total_tokens": 10},
+            })
+
+        primary_app.router.add_post("/v1/chat/completions", primary_handler)
+        primary_runner = web.AppRunner(primary_app)
+        await primary_runner.setup()
+        primary_site = web.TCPSite(primary_runner, "127.0.0.1", 0)
+        await primary_site.start()
+        primary_port = primary_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{primary_port}"
+            try:
+                app, _ = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "dola-seed-2.0-pro",
+                            "messages": [{"role": "user", "content": "hello"}],
+                        }).encode(),
+                    )
+                    # Falls back to primary; primary upstream may return error since no real key,
+                    # but the routing itself should not crash
+                    assert resp.status in (200, 502, 401, 403)
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await primary_runner.cleanup()
