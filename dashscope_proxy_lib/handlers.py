@@ -341,6 +341,9 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
         stream_prepared = False
         stream_resp: web.StreamResponse | None = None
+        quota_retries = 0
+        quota_max = getattr(limiter, "quota_max_retries", 0)
+        quota_cooldown = getattr(limiter, "quota_retry_cooldown", 1800)
 
         client_session = request.app.get("client_session")
         if client_session is None or getattr(client_session, "closed", False) is True:
@@ -406,6 +409,19 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             upstream_headers = dict(upstream.headers)
                             upstream.close()
                             if not should_retry_429(error_body):
+                                if quota_retries < quota_max:
+                                    quota_retries += 1
+                                    _log(logging.WARNING, "upstream quota exceeded, retrying after cooldown",
+                                         request_id=request_id, model=model_name,
+                                         quota_retry=quota_retries, quota_max=quota_max,
+                                         cooldown_sec=quota_cooldown)
+                                    del error_body
+                                    if not await _sleep_interruptible(request, quota_cooldown):
+                                        error_reason = "client_disconnected"
+                                        status_code = 499
+                                        await limiter.refund_tokens(estimated_tokens)
+                                        return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
+                                    continue
                                 error_reason = "upstream_quota_exceeded"
                                 status_code = 429
                                 _log(logging.WARNING, "upstream quota exceeded, not retrying",
@@ -634,6 +650,18 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         limiter.total_429s += 1
                         await limiter.record_model_stats(model_name or "unknown", 0, 0.0, is_429=True)
                         if not should_retry_429(resp_body):
+                            if quota_retries < quota_max:
+                                quota_retries += 1
+                                _log(logging.WARNING, "upstream quota exceeded, retrying after cooldown",
+                                     request_id=request_id, model=model_name,
+                                     quota_retry=quota_retries, quota_max=quota_max,
+                                     cooldown_sec=quota_cooldown)
+                                del resp_body, resp_headers
+                                if not await _sleep_interruptible(request, quota_cooldown):
+                                    error_reason = "client_disconnected"
+                                    await limiter.refund_tokens(estimated_tokens)
+                                    return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
+                                continue
                             error_reason = "upstream_quota_exceeded"
                             _log(logging.WARNING, "upstream quota exceeded, not retrying",
                                  request_id=request_id, model=model_name)

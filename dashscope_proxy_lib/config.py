@@ -88,7 +88,7 @@ HOP_BY_HOP_HEADERS = frozenset({
 # Rate limiting configuration (DashScope Coding Plan)
 # ---------------------------------------------------------------------------
 CODING_PLAN_CONFIG = {
-    "rpm_limit": 12,
+    "rpm_limit": 9,
     "tpm_limit": 4_000_000,
     "safety_factor": 0.8,
     "requests_per_5h": 6000,
@@ -97,6 +97,10 @@ CODING_PLAN_CONFIG = {
     "max_queue_size": 500,
     "max_retries": 40,
     "base_backoff": 1.0,
+    # Quota-exceeded retry: wait this many seconds then retry once.
+    # Alibaba Coding Plan cooldown is ~30 min; default covers it with margin.
+    "quota_retry_cooldown": _safe_int("PROXY_QUOTA_RETRY_COOLDOWN", 1800),
+    "quota_max_retries": _safe_int("PROXY_QUOTA_MAX_RETRIES", 1),
 }
 
 # ---------------------------------------------------------------------------
@@ -112,6 +116,8 @@ SECONDARY_CODING_PLAN_CONFIG = {
     "max_queue_size": _safe_int("SECONDARY_MAX_QUEUE_SIZE", CODING_PLAN_CONFIG["max_queue_size"]),
     "max_retries": _safe_int("SECONDARY_MAX_RETRIES", CODING_PLAN_CONFIG["max_retries"]),
     "base_backoff": _safe_float("SECONDARY_BASE_BACKOFF", CODING_PLAN_CONFIG["base_backoff"]),
+    "quota_retry_cooldown": _safe_int("SECONDARY_QUOTA_RETRY_COOLDOWN", CODING_PLAN_CONFIG["quota_retry_cooldown"]),
+    "quota_max_retries": _safe_int("SECONDARY_QUOTA_MAX_RETRIES", CODING_PLAN_CONFIG["quota_max_retries"]),
 }
 
 # ---------------------------------------------------------------------------
@@ -127,6 +133,8 @@ TERTIARY_DEFAULTS = {
     "max_queue_size": 200,
     "max_retries": 20,
     "base_backoff": 1.0,
+    "quota_retry_cooldown": 1800,
+    "quota_max_retries": 1,
 }
 
 TERTIARY_CODING_PLAN_CONFIG = {
@@ -139,6 +147,8 @@ TERTIARY_CODING_PLAN_CONFIG = {
     "max_queue_size": _safe_int("TERTIARY_MAX_QUEUE_SIZE", TERTIARY_DEFAULTS["max_queue_size"]),
     "max_retries": _safe_int("TERTIARY_MAX_RETRIES", TERTIARY_DEFAULTS["max_retries"]),
     "base_backoff": _safe_float("TERTIARY_BASE_BACKOFF", TERTIARY_DEFAULTS["base_backoff"]),
+    "quota_retry_cooldown": _safe_int("TERTIARY_QUOTA_RETRY_COOLDOWN", TERTIARY_DEFAULTS["quota_retry_cooldown"]),
+    "quota_max_retries": _safe_int("TERTIARY_QUOTA_MAX_RETRIES", TERTIARY_DEFAULTS["quota_max_retries"]),
 }
 
 # ---------------------------------------------------------------------------
@@ -154,6 +164,8 @@ QUATERNARY_DEFAULTS = {
     "max_queue_size": 200,
     "max_retries": 20,
     "base_backoff": 1.0,
+    "quota_retry_cooldown": 1800,
+    "quota_max_retries": 1,
 }
 
 QUATERNARY_CODING_PLAN_CONFIG = {
@@ -166,6 +178,8 @@ QUATERNARY_CODING_PLAN_CONFIG = {
     "max_queue_size": _safe_int("QUATERNARY_MAX_QUEUE_SIZE", QUATERNARY_DEFAULTS["max_queue_size"]),
     "max_retries": _safe_int("QUATERNARY_MAX_RETRIES", QUATERNARY_DEFAULTS["max_retries"]),
     "base_backoff": _safe_float("QUATERNARY_BASE_BACKOFF", QUATERNARY_DEFAULTS["base_backoff"]),
+    "quota_retry_cooldown": _safe_int("QUATERNARY_QUOTA_RETRY_COOLDOWN", QUATERNARY_DEFAULTS["quota_retry_cooldown"]),
+    "quota_max_retries": _safe_int("QUATERNARY_QUOTA_MAX_RETRIES", QUATERNARY_DEFAULTS["quota_max_retries"]),
 }
 
 

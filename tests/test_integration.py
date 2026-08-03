@@ -1099,7 +1099,7 @@ class TestMaxRetriesExhausted:
             await upstream_runner.cleanup()
 
     async def test_quota_exceeded_429_not_retried(self, aiohttp_client, proxy_app):
-        """Hard quota 429 from upstream is passed through immediately without retry."""
+        """Hard quota 429 from upstream is retried once after cooldown, then passed through."""
         upstream_app = web.Application()
         quota_body = json.dumps({
             "error": {
@@ -1107,8 +1107,11 @@ class TestMaxRetriesExhausted:
                 "message": "usage allocated quota exceeded. please try again later.",
             }
         }).encode()
+        call_count = 0
 
         async def quota_429(request):
+            nonlocal call_count
+            call_count += 1
             return web.Response(status=429, body=quota_body, content_type="application/json")
 
         upstream_app.router.add_post("/v1/chat/completions", quota_429)
@@ -1124,6 +1127,9 @@ class TestMaxRetriesExhausted:
             dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
             try:
                 app, rl = proxy_app
+                limiter = rl.primary if hasattr(rl, "primary") else rl
+                limiter.quota_retry_cooldown = 0.1
+                limiter.quota_max_retries = 1
                 async with aiohttp.ClientSession() as session:
                     app["client_session"] = session
                     client = await aiohttp_client(app)
@@ -1137,8 +1143,8 @@ class TestMaxRetriesExhausted:
                     assert resp.status == 429
                     data = await resp.json()
                     assert "quota exceeded" in data["error"]["message"].lower()
-                    limiter = rl.primary if hasattr(rl, "primary") else rl
-                    assert limiter.total_429s == 1
+                    assert limiter.total_429s == 2
+                    assert call_count == 2
             finally:
                 dashscope_proxy.TARGET_BASE = original_target
         finally:

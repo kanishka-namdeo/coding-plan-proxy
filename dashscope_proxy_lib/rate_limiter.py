@@ -191,6 +191,8 @@ class RateLimiter:
         self.max_retries = config["max_retries"]
         self.base_backoff = config["base_backoff"]
         self.pending_requests = 0
+        self.quota_retry_cooldown = config.get("quota_retry_cooldown", 1800)
+        self.quota_max_retries = config.get("quota_max_retries", 1)
 
         self.total_forwarded = 0
         self.queue_drops = 0
