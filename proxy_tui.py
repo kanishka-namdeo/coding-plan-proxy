@@ -418,10 +418,10 @@ class ProxyTUI(App):
                 self.latency_tracker.latencies = list(status.get("recent_latencies", []))
 
                 # Update all UI components
-                self.call_from_thread(self._update_metrics, status)
+                self.call_from_thread(self._update_metrics, raw_status)
                 self.call_from_thread(self._poll_logs)
                 self.call_from_thread(self._update_sparklines)
-                self.call_from_thread(self._update_derived_metrics, status)
+                self.call_from_thread(self._update_derived_metrics, raw_status)
                 self.call_from_thread(self._update_latency_histogram)
                 self.call_from_thread(self._update_model_table, raw_status)
                 self.call_from_thread(self._update_config_table_filtered)
@@ -462,30 +462,44 @@ class ProxyTUI(App):
 
     @_safe_update
     def _update_metrics(self, status: dict) -> None:
-        """Refresh the metrics DataTable widgets (Overview tab)."""
-        if not self._validate_status(status):
+        """Refresh the metrics DataTable widgets (Overview tab).
+
+        In multi-provider mode, `status` is raw_status from
+        MultiProviderRateLimiter.status() which has {"primary": {...},
+        "secondary": {...}, ...} plus aggregated totals at the top level.
+        In single-provider mode, `status` is a flat RateLimiter status dict.
+        """
+        # Detect multi-provider mode
+        if "primary" in status:
+            primary = status["primary"]
+            multi = status  # aggregated totals live at top level
+        else:
+            primary = status
+            multi = status
+
+        if not self._validate_status(primary):
             return
 
         # Update connection status indicator
         status_widget = self.query_one("#status-indicator", Static)
         session = self.proxy_app.get("client_session")
         is_running = session is not None and not session.closed
-        uptime = status.get("uptime_seconds", 0)
+        uptime = primary.get("uptime_seconds", 0)
         status_text = f"Proxy: Running (uptime: {self._format_uptime(uptime)})" if is_running else "Proxy: Stopped"
         status_widget.update(status_text)
         status_widget.set_class(is_running, "status-running")
         status_widget.set_class(not is_running, "status-stopped")
 
-        # Update alert badge
+        # Update alert badge (checks all providers in multi-provider mode)
         self._update_alert_badge(status)
 
+        # Primary provider rate limiter metrics
         rl_table = self.query_one("#rl-metrics", DataTable)
         rl_table.clear()
-        rl_table.add_row("RPS Limit", str(status.get("rps_limit", 0)))
+        rl_table.add_row("RPS Limit", str(primary.get("rps_limit", 0)))
 
-        # RPM (sliding window - no fixed reset time)
-        rpm_current = status.get("rpm_current", 0)
-        rpm_limit = status.get("rpm_limit", 1)
+        rpm_current = primary.get("rpm_current", 0)
+        rpm_limit = primary.get("rpm_limit", 1)
         rl_table.add_row(
             "RPM",
             _progress_bar(rpm_current, rpm_limit),
@@ -493,96 +507,97 @@ class ProxyTUI(App):
 
         rl_table.add_row(
             "TPM Available",
-            _progress_bar(status.get("tpm_available", 0), status.get("tpm_limit", 1)),
+            _progress_bar(primary.get("tpm_available", 0), primary.get("tpm_limit", 1)),
         )
 
-        # Quota rows (all use sliding windows - no fixed reset times)
         rl_table.add_row(
             "5-Hour Quota",
-            _progress_bar(status.get('requests_5h', 0), status.get('requests_5h_limit', 1)),
+            _progress_bar(primary.get('requests_5h', 0), primary.get('requests_5h_limit', 1)),
         )
         rl_table.add_row(
             "Weekly Quota",
-            _progress_bar(status.get('requests_week', 0), status.get('requests_week_limit', 1)),
+            _progress_bar(primary.get('requests_week', 0), primary.get('requests_week_limit', 1)),
         )
         rl_table.add_row(
             "Monthly Quota",
-            _progress_bar(status.get('requests_month', 0), status.get('requests_month_limit', 1)),
+            _progress_bar(primary.get('requests_month', 0), primary.get('requests_month_limit', 1)),
         )
 
-        # Circuit breaker status
-        if status.get("circuit_open"):
-            rl_table.add_row("Circuit", "OPEN (failures: {})".format(status.get("circuit_failure_count", 0)))
-        elif status.get("circuit_failure_count", 0) > 0:
-            rl_table.add_row("Circuit", "closed ({} failures)".format(status.get("circuit_failure_count", 0)))
+        # Circuit breaker status (primary)
+        if primary.get("circuit_open"):
+            rl_table.add_row("Circuit", "OPEN (failures: {})".format(primary.get("circuit_failure_count", 0)))
+        elif primary.get("circuit_failure_count", 0) > 0:
+            rl_table.add_row("Circuit", "closed ({} failures)".format(primary.get("circuit_failure_count", 0)))
 
-        # Token summary
+        # Token summary (primary)
         rl_table.add_row(
             "Tokens",
-            f"{_fmt_number(status.get('total_tokens_consumed', 0))} consumed | "
-            f"{_fmt_number(status.get('tpm_reserved', 0))} reserved | "
-            f"{_fmt_number(status.get('tpm_limit', 0))} capacity",
+            f"{_fmt_number(primary.get('total_tokens_consumed', 0))} consumed | "
+            f"{_fmt_number(primary.get('tpm_reserved', 0))} reserved | "
+            f"{_fmt_number(primary.get('tpm_limit', 0))} capacity",
         )
 
-        # Quota warning row
-        warning = self._quota_warning(status)
+        # Quota warning row (primary only)
+        warning = self._quota_warning(primary)
         if warning:
             rl_table.add_row("Warning", warning)
 
-        # Request statistics (streamlined - removed duplicates that appear in Metrics tab)
+        # Request statistics — use AGGREGATED totals across all providers
         stats_table = self.query_one("#request-stats", DataTable)
         stats_table.clear()
-        total_fwd = status.get("total_forwarded", 0)
-        total_rejected = status.get("total_rejected", 0)
-        total_429s = status.get("total_429s", 0)
+        total_fwd = multi.get("total_forwarded", 0)
+        total_rejected = multi.get("total_rejected", 0)
+        total_429s = multi.get("total_429s", 0)
         total_attempts = total_fwd + total_rejected + total_429s
         success_rate = (total_fwd / total_attempts * 100) if total_attempts > 0 else 0.0
 
-        total_request_bytes = status.get("total_request_bytes", 0)
-        total_response_bytes = status.get("total_response_bytes", 0)
+        total_request_bytes = multi.get("total_request_bytes", 0)
+        total_response_bytes = multi.get("total_response_bytes", 0)
         avg_req_size = _fmt_number(total_request_bytes // total_fwd) if total_fwd > 0 else "0"
         avg_resp_size = _fmt_number(total_response_bytes // total_fwd) if total_fwd > 0 else "0"
 
-        # Show per-provider breakdown when secondary/tertiary are active
-        multi_provider = status.get("_multi_provider")
-        if multi_provider:
-            pri_fwd = status.get("total_forwarded", 0)
+        # Show per-provider breakdown when secondary/tertiary/quaternary are active
+        if "primary" in status:
+            pri_fwd = primary.get("total_forwarded", 0)
             total_fwd_all = pri_fwd
             stats_table.add_row("Forwarded (Primary)", _fmt_number(pri_fwd))
-            if multi_provider.get("secondary"):
-                sec = multi_provider["secondary"]
+            if status.get("secondary"):
+                sec = status["secondary"]
                 sec_fwd = sec.get("total_forwarded", 0)
                 stats_table.add_row("Forwarded (Secondary)", _fmt_number(sec_fwd))
                 stats_table.add_row("429s (Secondary)", str(sec.get("total_429s", 0)))
                 total_fwd_all += sec_fwd
-            if multi_provider.get("tertiary"):
-                ter = multi_provider["tertiary"]
+            if status.get("tertiary"):
+                ter = status["tertiary"]
                 ter_fwd = ter.get("total_forwarded", 0)
                 stats_table.add_row("Forwarded (StreamLake)", _fmt_number(ter_fwd))
                 stats_table.add_row("429s (StreamLake)", str(ter.get("total_429s", 0)))
                 total_fwd_all += ter_fwd
-            if multi_provider.get("quaternary"):
-                qua = multi_provider["quaternary"]
+            if status.get("quaternary"):
+                qua = status["quaternary"]
                 qua_fwd = qua.get("total_forwarded", 0)
                 stats_table.add_row("Forwarded (ARK)", _fmt_number(qua_fwd))
                 stats_table.add_row("429s (ARK)", str(qua.get("total_429s", 0)))
                 total_fwd_all += qua_fwd
-            if multi_provider.get("secondary") or multi_provider.get("tertiary") or multi_provider.get("quaternary"):
-                stats_table.add_row("Total Forwarded", _fmt_number(total_fwd_all))
-                stats_table.add_row("429s (Primary)", str(status.get("total_429s", 0)))
+            # Show aggregate totals when multiple providers are active
+            has_fallback = status.get("secondary") or status.get("tertiary") or status.get("quaternary")
+            if has_fallback:
+                stats_table.add_row("Total 429s", str(total_429s))
+                stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
+                stats_table.add_row("429s (Primary)", str(primary.get("total_429s", 0)))
             else:
                 stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
         else:
             stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
 
-        stats_table.add_row("Queue Drops", str(status.get("queue_drops", 0)))
-        queue_p50 = status.get("queue_p50_ms", 0)
-        queue_p95 = status.get("queue_p95_ms", 0)
-        queue_p99 = status.get("queue_p99_ms", 0)
+        stats_table.add_row("Queue Drops", str(primary.get("queue_drops", 0)))
+        queue_p50 = primary.get("queue_p50_ms", 0)
+        queue_p95 = primary.get("queue_p95_ms", 0)
+        queue_p99 = primary.get("queue_p99_ms", 0)
         stats_table.add_row("Queue Wait (p50/p95/p99)", f"{queue_p50}ms / {queue_p95}ms / {queue_p99}ms")
         stats_table.add_row(
             "Tokens Consumed",
-            _fmt_number(status.get("total_tokens_consumed", 0)),
+            _fmt_number(multi.get("total_tokens_consumed", 0)),
         )
         stats_table.add_row("Avg Req Size", avg_req_size)
         stats_table.add_row("Avg Resp Size", avg_resp_size)
@@ -742,14 +757,34 @@ class ProxyTUI(App):
         return written_count
 
     def _update_alert_badge(self, status: dict) -> None:
-        """Update alert badge based on quota usage and circuit status."""
+        """Update alert badge based on quota usage and circuit status.
+
+        In multi-provider mode, checks quotas and circuit breakers for ALL
+        providers. In single-provider mode, checks the flat status dict.
+        """
         try:
             badge = self.query_one("#alert-badge", Static)
-            warnings = self._check_quota_thresholds(status)
-            
-            if status.get("circuit_open"):
-                warnings.append("Circuit")
-            
+            warnings = []
+
+            if "primary" in status:
+                # Multi-provider mode: check all providers
+                for provider_key in ("primary", "secondary", "tertiary", "quaternary"):
+                    provider_status = status.get(provider_key)
+                    if not provider_status:
+                        continue
+                    provider_warnings = self._check_quota_thresholds(provider_status)
+                    for name in provider_warnings:
+                        label = f"{name} ({provider_key})" if provider_key != "primary" else name
+                        if label not in warnings:
+                            warnings.append(label)
+                    if provider_status.get("circuit_open") and "Circuit" not in warnings:
+                        warnings.append(f"Circuit ({provider_key})" if provider_key != "primary" else "Circuit")
+            else:
+                # Single-provider mode
+                warnings = self._check_quota_thresholds(status)
+                if status.get("circuit_open"):
+                    warnings.append("Circuit")
+
             if warnings:
                 badge.update("ALERT: " + " | ".join(warnings) + " critical")
                 badge.add_class("alert-active")
