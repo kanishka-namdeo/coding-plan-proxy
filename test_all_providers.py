@@ -11,7 +11,7 @@ PROXY_URL = "http://127.0.0.1:8899"
 # Test models for each provider
 PRIMARY_MODEL = "qwen3-coder-plus"
 SECONDARY_MODEL = "mimo-v2.5-pro"
-TERTIARY_MODEL = "kat-coder-pro-v2.5"
+TERTIARY_MODEL = "gemini-3.7-flash"
 
 results = []
 
