@@ -1882,14 +1882,14 @@ class TestSecondaryProviderRouting:
 
 
 # ---------------------------------------------------------------------------
-# Tertiary provider routing (StreamLake)
+# Tertiary provider routing (OpenLux)
 # ---------------------------------------------------------------------------
 
 class TestTertiaryProviderRouting:
-    """Integration tests for tertiary (StreamLake) provider routing via model name."""
+    """Integration tests for tertiary (OpenLux) provider routing via model name."""
 
     async def test_tertiary_model_forwarded_to_tertiary_upstream(self, aiohttp_client, proxy_app, monkeypatch):
-        """A request with kat-coder-pro-v2.5 should be forwarded to the StreamLake upstream."""
+        """A request with gemini-3.7-flash should be forwarded to the OpenLux upstream."""
         import dashscope_proxy_lib.config as cfg
 
         tertiary_app = web.Application()
@@ -1900,7 +1900,7 @@ class TestTertiaryProviderRouting:
             received_headers = dict(request.headers)
             return web.json_response({
                 "id": "resp-tertiary",
-                "choices": [{"message": {"role": "assistant", "content": "from streamlake"}}],
+                "choices": [{"message": {"role": "assistant", "content": "from openlux"}}],
                 "usage": {"total_tokens": 15},
             })
 
@@ -1911,7 +1911,7 @@ class TestTertiaryProviderRouting:
         await tertiary_site.start()
         tertiary_port = tertiary_site._server.sockets[0].getsockname()[1]
 
-        monkeypatch.setattr(cfg, "TERTIARY_API_KEY", "sk-streamlake-test")
+        monkeypatch.setattr(cfg, "TERTIARY_API_KEY", "sk-openlux-test")
         monkeypatch.setattr(cfg, "TERTIARY_BASE_URL", f"http://127.0.0.1:{tertiary_port}")
 
         try:
@@ -1922,25 +1922,25 @@ class TestTertiaryProviderRouting:
                 resp = await client.post(
                     "/v1/chat/completions",
                     data=json.dumps({
-                        "model": "kat-coder-pro-v2.5",
-                        "messages": [{"role": "user", "content": "hello streamlake"}],
+                        "model": "gemini-3.7-flash",
+                        "messages": [{"role": "user", "content": "hello openlux"}],
                     }).encode(),
                 )
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["id"] == "resp-tertiary"
-                assert received_headers.get("Authorization") == "Bearer sk-streamlake-test"
+                assert received_headers.get("Authorization") == "Bearer sk-openlux-test"
         finally:
             await tertiary_runner.cleanup()
 
     async def test_models_endpoint_includes_tertiary_when_configured(self, aiohttp_client, proxy_app, monkeypatch):
-        """GET /v1/models should include StreamLake models when tertiary is configured."""
+        """GET /v1/models should include OpenLux models when tertiary is configured."""
         import dashscope_proxy_lib.config as cfg
 
-        monkeypatch.setattr(cfg, "TERTIARY_API_KEY", "sk-streamlake-test")
+        monkeypatch.setattr(cfg, "TERTIARY_API_KEY", "sk-openlux-test")
         monkeypatch.setattr(
             cfg, "TERTIARY_BASE_URL",
-            "https://vanchin.streamlake.ai/api/gateway/coding/v1",
+            "https://api.openlux.ai/v1",
         )
 
         app, _ = proxy_app
@@ -1949,16 +1949,16 @@ class TestTertiaryProviderRouting:
         assert resp.status == 200
         data = await resp.json()
         model_ids = [m["id"] for m in data["data"]]
-        assert "kat-coder-pro-v2.5" in model_ids
+        assert "gemini-3.7-flash" in model_ids
 
     async def test_status_endpoint_shows_tertiary_provider(self, aiohttp_client, proxy_app, monkeypatch):
         """Status endpoint should show tertiary provider availability."""
         import dashscope_proxy_lib.config as cfg
 
-        monkeypatch.setattr(cfg, "TERTIARY_API_KEY", "sk-streamlake-test")
+        monkeypatch.setattr(cfg, "TERTIARY_API_KEY", "sk-openlux-test")
         monkeypatch.setattr(
             cfg, "TERTIARY_BASE_URL",
-            "https://vanchin.streamlake.ai/api/gateway/coding/v1",
+            "https://api.openlux.ai/v1",
         )
 
         app, _ = proxy_app
