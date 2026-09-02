@@ -51,11 +51,11 @@ SECONDARY_API_KEY = os.environ.get("MIMO_CODING_PLAN_API_KEY", "").strip()
 SECONDARY_BASE_URL = os.environ.get("MIMO_CODING_PLAN_TARGET_BASE", "").strip()
 
 # ---------------------------------------------------------------------------
-# Tertiary provider configuration (optional - StreamLake)
+# Tertiary provider configuration (optional - OpenLux)
 # Only used if both KEY and BASE_URL are set
 # ---------------------------------------------------------------------------
-TERTIARY_API_KEY = os.environ.get("STREAMLAKE_API_KEY", "").strip()
-TERTIARY_BASE_URL = os.environ.get("STREAMLAKE_TARGET_BASE", "").strip()
+TERTIARY_API_KEY = os.environ.get("OPENLUX_API_KEY", "").strip()
+TERTIARY_BASE_URL = os.environ.get("OPENLUX_TARGET_BASE", "https://api.openlux.ai/v1").strip()
 
 # ---------------------------------------------------------------------------
 # Quaternary provider configuration (optional - ARK / BytePlus)
@@ -121,7 +121,7 @@ SECONDARY_CODING_PLAN_CONFIG = {
 }
 
 # ---------------------------------------------------------------------------
-# Tertiary provider rate limits (StreamLake - independent defaults)
+# Tertiary provider rate limits (OpenLux - independent defaults)
 # ---------------------------------------------------------------------------
 TERTIARY_DEFAULTS = {
     "rpm_limit": 40,
@@ -240,12 +240,15 @@ SECONDARY_MODELS = {
 }
 
 # ---------------------------------------------------------------------------
-# Tertiary provider models (StreamLake)
+# Tertiary provider models (OpenLux)
 # ---------------------------------------------------------------------------
 TERTIARY_MODELS = {
     "object": "list",
     "data": [
-        {"id": "kat-coder-pro-v2.5", "object": "model"},
+        {"id": "gemini-3.7-flash", "object": "model"},
+        {"id": "gpt-5.6-terra", "object": "model"},
+        {"id": "gpt-5.6-sol", "object": "model"},
+        {"id": "qwen3.8-max", "object": "model"},
     ]
 }
 
