@@ -245,10 +245,7 @@ SECONDARY_MODELS = {
 TERTIARY_MODELS = {
     "object": "list",
     "data": [
-        {"id": "gemini-3.7-flash", "object": "model"},
-        {"id": "gpt-5.6-terra", "object": "model"},
         {"id": "gpt-5.6-sol", "object": "model"},
-        {"id": "qwen3.8-max", "object": "model"},
     ]
 }
 
