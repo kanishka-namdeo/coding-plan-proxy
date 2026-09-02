@@ -206,10 +206,10 @@ class ProxyTUI(App):
                             yield Static("Secondary: Not configured", id="secondary-status-line")
                             yield DataTable(id="secondary-rl-metrics")
 
-                        # Tertiary provider section (StreamLake, hidden by default)
+                        # Tertiary provider section (OpenLux, hidden by default)
                         with Vertical(id="tertiary-overview"):
-                            yield Static("StreamLake", classes="panel-title")
-                            yield Static("StreamLake: Not configured", id="tertiary-status-line")
+                            yield Static("OpenLux", classes="panel-title")
+                            yield Static("OpenLux: Not configured", id="tertiary-status-line")
                             yield DataTable(id="tertiary-rl-metrics")
 
                         # Quaternary provider section (ARK, hidden by default)
@@ -345,7 +345,7 @@ class ProxyTUI(App):
         except NoMatches:
             pass
 
-        # Configure tertiary (StreamLake) metrics table (in Overview tab)
+        # Configure tertiary (OpenLux) metrics table (in Overview tab)
         try:
             tertiary_table = self.query_one("#tertiary-rl-metrics", DataTable)
             tertiary_table.add_columns("Metric", "Value")
@@ -570,8 +570,8 @@ class ProxyTUI(App):
             if status.get("tertiary"):
                 ter = status["tertiary"]
                 ter_fwd = ter.get("total_forwarded", 0)
-                stats_table.add_row("Forwarded (StreamLake)", _fmt_number(ter_fwd))
-                stats_table.add_row("429s (StreamLake)", str(ter.get("total_429s", 0)))
+                stats_table.add_row("Forwarded (OpenLux)", _fmt_number(ter_fwd))
+                stats_table.add_row("429s (OpenLux)", str(ter.get("total_429s", 0)))
                 total_fwd_all += ter_fwd
             if status.get("quaternary"):
                 qua = status["quaternary"]
@@ -958,7 +958,7 @@ class ProxyTUI(App):
 
     @_safe_update
     def _update_tertiary_metrics(self, status: dict) -> None:
-        """Update StreamLake (tertiary) provider metrics in the Overview tab."""
+        """Update OpenLux (tertiary) provider metrics in the Overview tab."""
         try:
             tertiary_overview = self.query_one("#tertiary-overview", Vertical)
             tertiary_status_line = self.query_one("#tertiary-status-line", Static)
