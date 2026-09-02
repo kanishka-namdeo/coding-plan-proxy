@@ -24,7 +24,7 @@ def _build_secondary_model_ids(models: dict) -> set[str]:
 
 
 def _build_tertiary_model_ids(models: dict) -> set[str]:
-    """Build lookup set for tertiary (StreamLake) models."""
+    """Build lookup set for tertiary (OpenLux) models."""
     return {entry["id"] for entry in models.get("data", [])}
 
 
