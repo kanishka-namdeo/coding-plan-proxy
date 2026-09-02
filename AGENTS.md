@@ -80,7 +80,7 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Child DOX Index
 
-- `dashscope_proxy_lib/` — proxy core: rate limiter (sliding window, token bucket, multi-provider), request queue, HTTP handlers, provider routing (DashScope/MIMO/StreamLake), request transformation, token utilities, session logging, logging infrastructure
+- `dashscope_proxy_lib/` — proxy core: rate limiter (sliding window, token bucket, multi-provider), request queue, HTTP handlers, provider routing (DashScope/MIMO/OpenLux), request transformation, token utilities, session logging, logging infrastructure
 - `tests/` — pytest test suite: unit tests (rate limiter, token utils, request transform, HTTP helpers), integration tests (handler with mock upstream), e2e tests (real API calls, requires API key)
 - `screenshots/` — TUI dashboard screenshots (SVG format) and SVG→PNG conversion script
 - Root-owned files: `dashscope_proxy.py` (facade re-exporting lib), `proxy_tui.py` + `proxy_tui.tcss` (Textual TUI dashboard), `test_live_server.py` (manual live server test), `capture_screenshots.py` (screenshot automation), `.env.example`, `requirements.txt`, `pyproject.toml`
