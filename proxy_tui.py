@@ -337,41 +337,16 @@ class ProxyTUI(App):
         except NoMatches:
             pass
 
-        # Configure secondary metrics table (in Overview tab)
-        try:
-            secondary_table = self.query_one("#secondary-rl-metrics", DataTable)
-            secondary_table.add_columns("Metric", "Value")
-            secondary_table.show_header = False
-            secondary_table.zebra_stripes = True
-        except NoMatches:
-            pass
-
-        # Configure tertiary (OpenLux) metrics table (in Overview tab)
-        try:
-            tertiary_table = self.query_one("#tertiary-rl-metrics", DataTable)
-            tertiary_table.add_columns("Metric", "Value")
-            tertiary_table.show_header = False
-            tertiary_table.zebra_stripes = True
-        except NoMatches:
-            pass
-
-        # Configure quaternary (ARK) metrics table (in Overview tab)
-        try:
-            quaternary_table = self.query_one("#quaternary-rl-metrics", DataTable)
-            quaternary_table.add_columns("Metric", "Value")
-            quaternary_table.show_header = False
-            quaternary_table.zebra_stripes = True
-        except NoMatches:
-            pass
-
-        # Configure quinary (Meta AI) metrics table (in Overview tab)
-        try:
-            quinary_table = self.query_one("#quinary-rl-metrics", DataTable)
-            quinary_table.add_columns("Metric", "Value")
-            quinary_table.show_header = False
-            quinary_table.zebra_stripes = True
-        except NoMatches:
-            pass
+        # Configure dynamic provider metrics tables
+        for provider_info in PROVIDER_REGISTRY[1:]:  # Skip primary
+            provider_key = provider_info["key"]
+            try:
+                table = self.query_one(f"#{provider_key}-rl-metrics", DataTable)
+                table.add_columns("Metric", "Value")
+                table.show_header = False
+                table.zebra_stripes = True
+            except NoMatches:
+                pass
 
         # Start background polling in a thread
         self.run_worker(self._poll_loop, exclusive=True, thread=True, description="metrics poller")
