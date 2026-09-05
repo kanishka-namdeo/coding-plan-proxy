@@ -884,8 +884,9 @@ class ProxyTUI(App):
             warnings = []
 
             if "primary" in status:
-                # Multi-provider mode: check all providers
-                for provider_key in ("primary", "secondary", "tertiary", "quaternary", "quinary"):
+                # Multi-provider mode: check all providers via registry
+                for provider_info in PROVIDER_REGISTRY:
+                    provider_key = provider_info["key"]
                     provider_status = status.get(provider_key)
                     if not provider_status:
                         continue
