@@ -541,42 +541,35 @@ class ProxyTUI(App):
         avg_req_size = _fmt_number(total_request_bytes // total_fwd) if total_fwd > 0 else "0"
         avg_resp_size = _fmt_number(total_response_bytes // total_fwd) if total_fwd > 0 else "0"
 
-        # Show per-provider breakdown when secondary/tertiary/quaternary are active
+        # Show per-provider breakdown using registry
         if "primary" in status:
-            pri_fwd = primary.get("total_forwarded", 0)
-            total_fwd_all = pri_fwd
-            stats_table.add_row("Forwarded (Primary)", _fmt_number(pri_fwd))
-            if status.get("secondary"):
-                sec = status["secondary"]
-                sec_fwd = sec.get("total_forwarded", 0)
-                stats_table.add_row("Forwarded (Secondary)", _fmt_number(sec_fwd))
-                stats_table.add_row("429s (Secondary)", str(sec.get("total_429s", 0)))
-                total_fwd_all += sec_fwd
-            if status.get("tertiary"):
-                ter = status["tertiary"]
-                ter_fwd = ter.get("total_forwarded", 0)
-                stats_table.add_row("Forwarded (OpenLux)", _fmt_number(ter_fwd))
-                stats_table.add_row("429s (OpenLux)", str(ter.get("total_429s", 0)))
-                total_fwd_all += ter_fwd
-            if status.get("quaternary"):
-                qua = status["quaternary"]
-                qua_fwd = qua.get("total_forwarded", 0)
-                stats_table.add_row("Forwarded (ARK)", _fmt_number(qua_fwd))
-                stats_table.add_row("429s (ARK)", str(qua.get("total_429s", 0)))
-                total_fwd_all += qua_fwd
-            if status.get("quinary"):
-                qui = status["quinary"]
-                qui_fwd = qui.get("total_forwarded", 0)
-                stats_table.add_row("Forwarded (Meta AI)", _fmt_number(qui_fwd))
-                stats_table.add_row("429s (Meta AI)", str(qui.get("total_429s", 0)))
-                total_fwd_all += qui_fwd
+            total_fwd_all = 0
+            has_fallback = False
+            
+            for provider_info in PROVIDER_REGISTRY:
+                provider_key = provider_info["key"]
+                provider_label = provider_info["label"]
+                provider_status = status.get(provider_key)
+                
+                if not provider_status:
+                    continue
+                
+                provider_fwd = provider_status.get("total_forwarded", 0)
+                if provider_fwd == 0:
+                    continue
+                
+                # Determine label prefix: "Primary" for primary, otherwise use label
+                label_prefix = "Primary" if provider_key == "primary" else provider_label
+                stats_table.add_row(f"Forwarded ({label_prefix})", _fmt_number(provider_fwd))
+                stats_table.add_row(f"429s ({label_prefix})", str(provider_status.get("total_429s", 0)))
+                
+                total_fwd_all += provider_fwd
+                if provider_key != "primary":
+                    has_fallback = True
+            
             # Show aggregate totals when multiple providers are active
-            has_fallback = status.get("secondary") or status.get("tertiary") or status.get("quaternary") or status.get("quinary")
             if has_fallback:
                 stats_table.add_row("Total 429s", str(total_429s))
-                stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
-                stats_table.add_row("429s (Primary)", str(primary.get("total_429s", 0)))
-            else:
                 stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
         else:
             stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
