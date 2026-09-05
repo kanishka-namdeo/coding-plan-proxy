@@ -21,6 +21,16 @@ from dashscope_proxy_lib.config import _load_config
 from dashscope_proxy_lib.rate_limiter import RateLimiter
 from dashscope_proxy_lib.logging_config import TUILogHandler
 
+# Provider registry for dynamic UI rendering
+PROVIDER_REGISTRY = [
+    {"key": "primary", "label": "DashScope", "slug": "dashscope", "config_key": "TARGET_BASE"},
+    {"key": "secondary", "label": "MIMO", "slug": "mimo", "config_key": "SECONDARY_BASE_URL"},
+    {"key": "tertiary", "label": "OpenLux", "slug": "openlux", "config_key": "TERTIARY_BASE_URL"},
+    {"key": "quaternary", "label": "ARK", "slug": "ark", "config_key": "QUATERNARY_BASE_URL"},
+    {"key": "quinary", "label": "Meta AI", "slug": "metaspark", "config_key": "QUINARY_BASE_URL"},
+    {"key": "senary", "label": "DeepSeek", "slug": "deepseek", "config_key": "SENARY_BASE_URL"},
+]
+
 
 def _fmt_number(n: int) -> str:
     """Format large numbers with suffixes."""
@@ -217,6 +227,12 @@ class ProxyTUI(App):
                             yield Static("ARK", classes="panel-title")
                             yield Static("ARK: Not configured", id="quaternary-status-line")
                             yield DataTable(id="quaternary-rl-metrics")
+
+                        # Quinary provider section (Meta AI, hidden by default)
+                        with Vertical(id="quinary-overview"):
+                            yield Static("Meta AI", classes="panel-title")
+                            yield Static("Meta AI: Not configured", id="quinary-status-line")
+                            yield DataTable(id="quinary-rl-metrics")
                         
                         yield Static("", classes="spacer")
                         yield Static("Request Statistics", classes="panel-title")
@@ -363,6 +379,15 @@ class ProxyTUI(App):
         except NoMatches:
             pass
 
+        # Configure quinary (Meta AI) metrics table (in Overview tab)
+        try:
+            quinary_table = self.query_one("#quinary-rl-metrics", DataTable)
+            quinary_table.add_columns("Metric", "Value")
+            quinary_table.show_header = False
+            quinary_table.zebra_stripes = True
+        except NoMatches:
+            pass
+
         # Start background polling in a thread
         self.run_worker(self._poll_loop, exclusive=True, thread=True, description="metrics poller")
 
@@ -428,6 +453,7 @@ class ProxyTUI(App):
                 self.call_from_thread(self._update_secondary_metrics, raw_status)
                 self.call_from_thread(self._update_tertiary_metrics, raw_status)
                 self.call_from_thread(self._update_quaternary_metrics, raw_status)
+                self.call_from_thread(self._update_quinary_metrics, raw_status)
 
                 consecutive_errors = 0
 
@@ -579,8 +605,14 @@ class ProxyTUI(App):
                 stats_table.add_row("Forwarded (ARK)", _fmt_number(qua_fwd))
                 stats_table.add_row("429s (ARK)", str(qua.get("total_429s", 0)))
                 total_fwd_all += qua_fwd
+            if status.get("quinary"):
+                qui = status["quinary"]
+                qui_fwd = qui.get("total_forwarded", 0)
+                stats_table.add_row("Forwarded (Meta AI)", _fmt_number(qui_fwd))
+                stats_table.add_row("429s (Meta AI)", str(qui.get("total_429s", 0)))
+                total_fwd_all += qui_fwd
             # Show aggregate totals when multiple providers are active
-            has_fallback = status.get("secondary") or status.get("tertiary") or status.get("quaternary")
+            has_fallback = status.get("secondary") or status.get("tertiary") or status.get("quaternary") or status.get("quinary")
             if has_fallback:
                 stats_table.add_row("Total 429s", str(total_429s))
                 stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
@@ -768,7 +800,7 @@ class ProxyTUI(App):
 
             if "primary" in status:
                 # Multi-provider mode: check all providers
-                for provider_key in ("primary", "secondary", "tertiary", "quaternary"):
+                for provider_key in ("primary", "secondary", "tertiary", "quaternary", "quinary"):
                     provider_status = status.get(provider_key)
                     if not provider_status:
                         continue
@@ -1159,6 +1191,107 @@ class ProxyTUI(App):
             quaternary_table.add_row("Warning", warning)
 
     @_safe_update
+    def _update_quinary_metrics(self, status: dict) -> None:
+        """Update Meta AI (quinary) provider metrics in the Overview tab."""
+        try:
+            quinary_overview = self.query_one("#quinary-overview", Vertical)
+            quinary_status_line = self.query_one("#quinary-status-line", Static)
+            quinary_table = self.query_one("#quinary-rl-metrics", DataTable)
+        except NoMatches:
+            return
+
+        if "quinary" not in status:
+            quinary_overview.set_class(False, "visible")
+            return
+
+        quinary_status = status.get("quinary")
+
+        if not quinary_status:
+            quinary_overview.set_class(False, "visible")
+            return
+
+        # Only show if provider has served at least one request
+        if quinary_status.get("total_forwarded", 0) == 0:
+            quinary_overview.set_class(False, "visible")
+            return
+
+        quinary_overview.set_class(True, "visible")
+
+        from dashscope_proxy_lib.config import QUINARY_BASE_URL
+        base_url_display = QUINARY_BASE_URL or "N/A"
+        quinary_status_line.update(f"Status: Active | Target: {base_url_display}")
+        quinary_status_line.set_class(True, "status-running")
+        quinary_status_line.set_class(False, "status-stopped")
+
+        quinary_table.clear()
+
+        quinary_table.add_row("RPS Limit", str(quinary_status.get("rps_limit", 0)))
+
+        rpm_current = quinary_status.get("rpm_current", 0)
+        rpm_limit = quinary_status.get("rpm_limit", 1)
+        quinary_table.add_row(
+            "RPM",
+            _progress_bar(rpm_current, rpm_limit),
+        )
+
+        quinary_table.add_row(
+            "TPM Available",
+            _progress_bar(
+                quinary_status.get("tpm_available", 0),
+                quinary_status.get("tpm_limit", 1)
+            ),
+        )
+
+        quinary_table.add_row(
+            "5-Hour Quota",
+            _progress_bar(
+                quinary_status.get("requests_5h", 0),
+                quinary_status.get("requests_5h_limit", 1)
+            ),
+        )
+
+        quinary_table.add_row(
+            "Weekly Quota",
+            _progress_bar(
+                quinary_status.get("requests_week", 0),
+                quinary_status.get("requests_week_limit", 1)
+            ),
+        )
+
+        quinary_table.add_row(
+            "Monthly Quota",
+            _progress_bar(
+                quinary_status.get("requests_month", 0),
+                quinary_status.get("requests_month_limit", 1)
+            ),
+        )
+
+        if quinary_status.get("circuit_open"):
+            quinary_table.add_row("Circuit", "OPEN (failures: {})".format(
+                quinary_status.get("circuit_failure_count", 0)))
+        elif quinary_status.get("circuit_failure_count", 0) > 0:
+            quinary_table.add_row("Circuit", "closed ({} failures)".format(
+                quinary_status.get("circuit_failure_count", 0)))
+
+        quinary_table.add_row(
+            "Tokens",
+            f"{_fmt_number(quinary_status.get('total_tokens_consumed', 0))} consumed | "
+            f"{_fmt_number(quinary_status.get('tpm_reserved', 0))} reserved | "
+            f"{_fmt_number(quinary_status.get('tpm_limit', 0))} capacity",
+        )
+
+        quinary_table.add_row(
+            "Forwarded",
+            f"{_fmt_number(quinary_status.get('total_forwarded', 0))} | "
+            f"429s: {quinary_status.get('total_429s', 0)} | "
+            f"Rejected: {quinary_status.get('total_rejected', 0)}",
+        )
+
+        warning = self._quota_warning(quinary_status)
+        if warning:
+            quinary_table.add_row("Warning", warning)
+
+    @_safe_update
     def _update_model_table(self, status: dict) -> None:
         """Update per-model usage DataTable with filtering and sorting.
         
@@ -1174,6 +1307,7 @@ class ProxyTUI(App):
             secondary_usage = status.get("secondary", {}).get("model_usage", {}) if status.get("secondary") else {}
             tertiary_usage = status.get("tertiary", {}).get("model_usage", {}) if status.get("tertiary") else {}
             quaternary_usage = status.get("quaternary", {}).get("model_usage", {}) if status.get("quaternary") else {}
+            quinary_usage = status.get("quinary", {}).get("model_usage", {}) if status.get("quinary") else {}
 
             model_usage = {}
             for model_name, stats in primary_usage.items():
@@ -1181,9 +1315,11 @@ class ProxyTUI(App):
             for model_name, stats in secondary_usage.items():
                 model_usage[model_name] = {**stats, "provider": "secondary"}
             for model_name, stats in tertiary_usage.items():
-                model_usage[model_name] = {**stats, "provider": "streamlake"}
+                model_usage[model_name] = {**stats, "provider": "openlux"}
             for model_name, stats in quaternary_usage.items():
                 model_usage[model_name] = {**stats, "provider": "ark"}
+            for model_name, stats in quinary_usage.items():
+                model_usage[model_name] = {**stats, "provider": "meta-ai"}
         else:
             # Single provider mode
             model_usage = {k: {**v, "provider": "primary"} for k, v in status.get("model_usage", {}).items()}
@@ -1268,6 +1404,12 @@ class ProxyTUI(App):
             if f"SECONDARY_{key.upper()}" in os.environ:
                 return "env"
             if f"MIMO_CODING_PLAN_{key.upper()}" in os.environ:
+                return "env"
+            if f"OPENLUX_{key.upper()}" in os.environ:
+                return "env"
+            if f"MODEL_ARK_{key.upper()}" in os.environ:
+                return "env"
+            if f"QUINARY_{key.upper()}" in os.environ:
                 return "env"
             return "default"
         
