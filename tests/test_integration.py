@@ -2162,3 +2162,88 @@ class TestQuaternaryProviderRouting:
                 dashscope_proxy.TARGET_BASE = original_target
         finally:
             await primary_runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Provider prefix-pin routing + 400 on bad pin (Task 3)
+# ---------------------------------------------------------------------------
+
+class TestPinnedRoutingHandler:
+    async def test_pinned_model_strips_prefix_before_upstream(self, aiohttp_client, proxy_app, monkeypatch):
+        """'openlux/<model>' pin routes to tertiary and upstream sees the bare model id."""
+        import dashscope_proxy_lib.config as cfg
+
+        upstream_app = web.Application()
+        received_body = None
+
+        async def capture_upstream(request):
+            nonlocal received_body
+            received_body = await request.json()
+            return web.json_response({
+                "id": "resp-tertiary-pinned",
+                "choices": [{"message": {"role": "assistant", "content": "pinned"}}],
+                "usage": {"total_tokens": 11},
+            })
+
+        upstream_app.router.add_post("/v1/chat/completions", capture_upstream)
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        monkeypatch.setattr(cfg, "TERTIARY_API_KEY", "sk-openlux-test")
+        monkeypatch.setattr(cfg, "TERTIARY_BASE_URL", f"http://127.0.0.1:{upstream_port}/v1")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "openlux/gemini-3.7-flash",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                assert received_body is not None
+                assert received_body["model"] == "gemini-3.7-flash"
+        finally:
+            await upstream_runner.cleanup()
+
+    async def test_unknown_provider_prefix_returns_400(self, aiohttp_client, proxy_app):
+        """'nosuch/<model>' pin is rejected with 400 before any upstream call."""
+        app, _ = proxy_app
+        client = await aiohttp_client(app)
+        resp = await client.post(
+            "/v1/chat/completions",
+            data=json.dumps({
+                "model": "nosuch/gemini-3.7-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+            }).encode(),
+        )
+        assert resp.status == 400
+        data = await resp.json()
+        assert data["error"] == "unknown provider prefix"
+
+    async def test_pin_to_unconfigured_provider_returns_400(self, aiohttp_client, proxy_app, monkeypatch):
+        """Pin to a provider without key/base is rejected with 400."""
+        import dashscope_proxy_lib.config as cfg
+
+        monkeypatch.setattr(cfg, "TERTIARY_API_KEY", "")
+        monkeypatch.setattr(cfg, "TERTIARY_BASE_URL", "")
+
+        app, _ = proxy_app
+        client = await aiohttp_client(app)
+        resp = await client.post(
+            "/v1/chat/completions",
+            data=json.dumps({
+                "model": "openlux/gemini-3.7-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+            }).encode(),
+        )
+        assert resp.status == 400
+        data = await resp.json()
+        assert data["error"] == "provider 'tertiary' not configured"

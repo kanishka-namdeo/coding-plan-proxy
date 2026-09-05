@@ -214,6 +214,8 @@ class ProviderRouter:
         Determine which provider should handle a request for the given model.
 
         Priority:
+        0. Provider pin '<provider>/<model>' (e.g. 'openlux/...') -> pinned provider if configured,
+           else fall through to normal resolution on the bare name
         1. Explicit mapping in MODEL_PROVIDER_MAP
         2. Model exists in SENARY_MODELS -> senary
         3. Model exists in QUINARY_MODELS -> quinary
@@ -223,6 +225,16 @@ class ProviderRouter:
         7. Default to primary
         """
         model_name = normalize_model_name(model_name)
+
+        from dashscope_proxy_lib.request_transform import split_provider_prefix
+        pinned, bare = split_provider_prefix(model_name)
+        if pinned is not None:
+            provider = getattr(self, pinned)
+            if provider.is_available:
+                return provider
+            model_name = bare  # fall through to normal resolution on bare name
+        else:
+            model_name = bare
 
         # Check explicit mapping first (highest priority)
         mapped = MODEL_PROVIDER_MAP.get(model_name)

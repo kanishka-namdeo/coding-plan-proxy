@@ -236,6 +236,44 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
     # Determine which provider should handle this request
     router = get_provider_router()
+    from dashscope_proxy_lib.request_transform import split_provider_prefix
+    pinned_name, bare_name = split_provider_prefix(model_name or "")
+    if "/" in (model_name or "") and pinned_name is None:
+        error_reason = "unknown_provider_prefix"
+        status_code = 400
+        _log(logging.WARNING, "request rejected: unknown provider prefix",
+             request_id=request_id, method=method, path=path, reason="unknown_provider_prefix",
+             model=model_name)
+        session_entry["model"] = model_name
+        session_entry["status_code"] = status_code
+        session_entry["error_reason"] = error_reason
+        await _maybe_flush_session_log(request.app, session_entry)
+        return _make_error_response(
+            400,
+            json.dumps({"error": "unknown provider prefix", "model": model_name}).encode(),
+            request_id,
+        )
+    if pinned_name is not None:
+        provider_check = getattr(router, pinned_name)
+        if not provider_check.is_available:
+            error_reason = "provider_not_configured"
+            status_code = 400
+            _log(logging.WARNING, "request rejected: provider not configured",
+                 request_id=request_id, method=method, path=path, reason="provider_not_configured",
+                 model=model_name, provider=pinned_name)
+            session_entry["model"] = model_name
+            session_entry["status_code"] = status_code
+            session_entry["error_reason"] = error_reason
+            await _maybe_flush_session_log(request.app, session_entry)
+            return _make_error_response(
+                400,
+                json.dumps({"error": f"provider '{pinned_name}' not configured", "model": model_name}).encode(),
+                request_id,
+            )
+        model_name = bare_name
+        if isinstance(body, dict):
+            body["model"] = bare_name
+        body_bytes = json.dumps(body).encode()
     provider = router.get_provider_for_model(model_name or "")
     provider_name = provider.name
 

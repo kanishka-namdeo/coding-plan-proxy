@@ -1735,3 +1735,17 @@ class TestOverlapRegistry:
         entry = next(m for m in models["data"] if m["id"] == "dup-model")
         assert entry["providers"] == ["primary", "tertiary"]
         assert entry["provider_models"] == ["dashscope/dup-model", "openlux/dup-model"]
+
+
+class TestPinnedRouting:
+    def test_pinned_model_routes_to_pinned_provider(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "k")
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "https://t.example.com/v1")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("openlux/gemini-3.7-flash").name == "tertiary"
+
+    def test_pin_to_unconfigured_provider_falls_back(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("openlux/gemini-3.7-flash").name == "primary"
