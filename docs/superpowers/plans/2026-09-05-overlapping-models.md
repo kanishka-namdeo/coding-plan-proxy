@@ -175,10 +175,16 @@ Expected: FAIL with "has no attribute 'get_providers_for_model'"
 
 In `dashscope_proxy_lib/provider_router.py`:
 
-1. In `__init__`, after the `_xxx_model_ids` sets are built, build the registry:
+1. In `__init__`, after the `_xxx_model_ids` sets are built, build the registry.
+   Seed with primary's `MOCK_MODELS` ids first (primary is always available),
+   then senary → secondary (pre-flight decision: registry includes primary so
+   `get_providers_for_model` covers primary-served models):
 
 ```python
+from dashscope_proxy_lib.config import MOCK_MODELS
 self._overlap_registry: dict[str, list[str]] = {}
+for _entry in MOCK_MODELS.get("data", []):
+    self._overlap_registry.setdefault(_entry["id"], []).append("primary")
 _all_sets = [
     ("senary", self._senary_model_ids),
     ("quinary", self._quinary_model_ids),
@@ -210,7 +216,7 @@ def get_model_overlaps(self) -> dict:
     return {m: list(p) for m, p in self._overlap_registry.items() if len(p) > 1}
 ```
 
-3. Rewrite `get_all_models()` to dedupe: iterate primary + each configured provider's list in existing order, keep first occurrence of each `id`, then attach `providers` (canonical slug names via reverse map: primary→`dashscope`, secondary→`mimo`, tertiary→`openlux`, quaternary→`ark`, quinary→`metaspark`, senary→`deepseek`) and `provider_models` (`f"{slug}/{id}"`) from the registry. Models only on primary get `providers: ["primary"]`... use slug form: `providers` holds canonical provider names (`primary`, `secondary`, …) matching `get_provider_status()` keys, while `provider_models` uses the new slugs. Keep it simple: `providers` = canonical names, `provider_models` = `f"{_slug_for(n)}/{id}"` with `_slug_for = {"primary": "dashscope", "secondary": "mimo", "tertiary": "openlux", "quaternary": "ark", "quinary": "metaspark", "senary": "deepseek"}`.
+3. Rewrite `get_all_models()` to dedupe: iterate primary + each configured provider's list in existing order, keep first occurrence of each `id`, then attach `providers` and `provider_models` from the registry. `providers` holds canonical provider names (`primary`, `secondary`, …) matching `get_provider_status()` keys; `provider_models` uses the new slugs via `_slug_for = {"primary": "dashscope", "secondary": "mimo", "tertiary": "openlux", "quaternary": "ark", "quinary": "metaspark", "senary": "deepseek"}`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -275,7 +281,10 @@ else:
     model_name = bare
 ```
 
-Then continue with existing `MODEL_PROVIDER_MAP` + set lookups on the bare name.
+If a pin targets an unconfigured provider, fall through to normal resolution
+on the bare name (layered semantics, pre-flight decision: router falls back so
+`get_provider_for_model` stays total; the HTTP handler in Task 3 returns 400
+for the same request, so users never see a silent reroute).
 
 2. In `handlers.py::handle_request`, after `model_name`/`is_stream` extraction (around line 234), insert pin validation before router selection:
 
