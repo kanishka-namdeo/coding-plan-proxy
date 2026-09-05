@@ -410,10 +410,9 @@ class ProxyTUI(App):
                 self.call_from_thread(self._update_latency_histogram)
                 self.call_from_thread(self._update_model_table, raw_status)
                 self.call_from_thread(self._update_config_table_filtered)
-                self.call_from_thread(self._update_secondary_metrics, raw_status)
-                self.call_from_thread(self._update_tertiary_metrics, raw_status)
-                self.call_from_thread(self._update_quaternary_metrics, raw_status)
-                self.call_from_thread(self._update_quinary_metrics, raw_status)
+                # Update all non-primary providers via registry
+                for provider_info in PROVIDER_REGISTRY[1:]:
+                    self.call_from_thread(self._update_provider_metrics, provider_info["key"], raw_status)
 
                 consecutive_errors = 0
 
