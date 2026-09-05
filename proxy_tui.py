@@ -271,6 +271,8 @@ class ProxyTUI(App):
                         Sparkline([], id="upstream-latency-sparkline"),
                         id="sparkline-row",
                     )
+                    yield Static("Failover Events", classes="panel-title")
+                    yield Static("", id="failover-events-panel", classes="failover-panel")
                     yield Static("", id="latency-histogram-panel", classes="histogram-panel")
                     yield Static("", id="poll-error-banner", classes="poll-error")
 
@@ -407,6 +409,7 @@ class ProxyTUI(App):
                 self.call_from_thread(self._poll_logs)
                 self.call_from_thread(self._update_sparklines)
                 self.call_from_thread(self._update_derived_metrics, raw_status)
+                self.call_from_thread(self._update_failover_panel)
                 self.call_from_thread(self._update_latency_histogram)
                 self.call_from_thread(self._update_model_table, raw_status)
                 self.call_from_thread(self._update_config_table_filtered)
@@ -971,6 +974,64 @@ class ProxyTUI(App):
         lines.append(f"  avg: {avg}ms | p50: {p50}ms | p95: {p95}ms | p99: {p99}ms")
         
         panel.update("\n".join(lines))
+
+    def _update_failover_panel(self) -> None:
+        """Update failover events panel from recent session logs."""
+        try:
+            panel = self.query_one("#failover-events-panel", Static)
+        except NoMatches:
+            return
+
+        import json
+        from datetime import datetime, timezone
+        
+        failovers = []
+        log_dir = "session_logs"
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        log_file = f"{log_dir}/{today}.jsonl"
+        
+        try:
+            with open(log_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()[-200:]
+                for line in lines:
+                    try:
+                        entry = json.loads(line.strip())
+                        attempted = entry.get("attempted_providers", [])
+                        if len(attempted) > 1:
+                            model = entry.get("model", "unknown")
+                            request_id = entry.get("request_id", "")[:8]
+                            timestamp = entry.get("timestamp", "")
+                            if timestamp:
+                                try:
+                                    dt = datetime.fromisoformat(timestamp)
+                                    time_str = dt.strftime("%H:%M:%S")
+                                except:
+                                    time_str = timestamp
+                            else:
+                                time_str = "unknown"
+                            
+                            failovers.append({
+                                "model": model,
+                                "chain": attempted,
+                                "request_id": request_id,
+                                "time": time_str,
+                            })
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+        if failovers:
+            failovers = failovers[-10:]
+            lines = []
+            for event in failovers:
+                chain_str = " → ".join(event["chain"])
+                lines.append(f"  {event['model']} → [{chain_str}] (req: {event['request_id']}, {event['time']})")
+            panel.update("\n".join(lines))
+        else:
+            panel.update("  No recent failover events")
 
     @_safe_update
     def _update_model_table(self, status: dict) -> None:
