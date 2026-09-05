@@ -11,62 +11,50 @@
     overflow-y: auto;
 }
 
-#secondary-overview {
+/* Dynamic provider sections */
+.Vertical[id$="-overview"] {
     display: none;
     margin: 1 0 0 0;
     border-top: heavy $primary 30%;
     padding-top: 1;
 }
 
-#secondary-overview.visible {
+.Vertical[id$="-overview"].visible {
     display: block;
 }
 
-#tertiary-overview {
+/* Provider status lines */
+.Static[id$="-status-line"] {
+    padding: 0 1;
+    text-style: bold;
+    height: 1;
+}
+
+.Static[id$="-status-line"].status-running {
+    color: $success;
+}
+
+.Static[id$="-status-line"].status-stopped {
+    color: $error;
+}
+
+/* Provider metrics tables */
+DataTable[id$="-rl-metrics"] {
+    height: auto;
+}
+
+/* Failover events panel */
+.failover-panel {
+    height: auto;
+    padding: 0 1;
+    margin: 1 0;
+    border: round $warning;
+    max-height: 8;
+    overflow-y: auto;
+}
+
+.failover-panel:empty {
     display: none;
-    margin: 1 0 0 0;
-    border-top: heavy $primary 30%;
-    padding-top: 1;
-}
-
-#tertiary-overview.visible {
-    display: block;
-}
-
-#secondary-status-line {
-    padding: 0 1;
-    text-style: bold;
-    height: 1;
-}
-
-#secondary-status-line.status-running {
-    color: $success;
-}
-
-#secondary-status-line.status-stopped {
-    color: $error;
-}
-
-#secondary-rl-metrics {
-    height: auto;
-}
-
-#tertiary-status-line {
-    padding: 0 1;
-    text-style: bold;
-    height: 1;
-}
-
-#tertiary-status-line.status-running {
-    color: $success;
-}
-
-#tertiary-status-line.status-stopped {
-    color: $error;
-}
-
-#tertiary-rl-metrics {
-    height: auto;
 }
 
 #log-panel {
