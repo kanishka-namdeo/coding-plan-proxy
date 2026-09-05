@@ -101,6 +101,9 @@ existing `should_retry_429` / `MAX_5XX_RETRIES` split.
   `MAX_5XX_RETRIES` budgets; upstream `400` is terminal. Quota-`429`
   (non-retryable per `should_retry_429`) keeps the existing same-provider
   cooldown path and does not trigger cross-provider failover.
+- Failover decisions happen on upstream status before streaming starts; once a
+  stream is established, mid-stream failures keep the existing streaming-error
+  path (no mid-stream provider switch).
 
 ## 4. Config, observability, testing
 
