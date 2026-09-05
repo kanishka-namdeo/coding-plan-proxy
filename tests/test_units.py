@@ -1703,3 +1703,35 @@ class TestSplitProviderPrefix:
     def test_positional_alias_still_works(self, dashscope_module):
         from dashscope_proxy_lib.request_transform import split_provider_prefix
         assert split_provider_prefix("tertiary/gpt-5.6-sol") == ("tertiary", "gpt-5.6-sol")
+
+
+class TestOverlapRegistry:
+    def test_single_provider_model_returns_one(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "k")
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "https://t.example.com/v1")
+        router = dashscope_module.ProviderRouter()
+        providers = router.get_providers_for_model("gemini-3.7-flash")
+        assert [p.name for p in providers] == ["tertiary"]
+
+    def test_unknown_model_returns_empty(self, dashscope_module):
+        router = dashscope_module.ProviderRouter()
+        assert router.get_providers_for_model("no-such-model-xyz") == []
+
+    def test_get_all_models_dedupes_overlap(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "k")
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "https://t.example.com/v1")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.TERTIARY_MODELS",
+            {"object": "list", "data": [{"id": "dup-model", "object": "model"}]},
+        )
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.MOCK_MODELS",
+            {"object": "list", "data": [{"id": "dup-model", "object": "model"}]},
+        )
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        ids = [m["id"] for m in models["data"]]
+        assert ids.count("dup-model") == 1
+        entry = next(m for m in models["data"] if m["id"] == "dup-model")
+        assert entry["providers"] == ["primary", "tertiary"]
+        assert entry["provider_models"] == ["dashscope/dup-model", "openlux/dup-model"]
