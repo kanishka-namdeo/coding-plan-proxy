@@ -210,29 +210,14 @@ class ProxyTUI(App):
                         yield Static("Rate Limiter", classes="panel-title")
                         yield DataTable(id="rl-metrics")
                         
-                        # Secondary provider section (hidden by default, shown when configured)
-                        with Vertical(id="secondary-overview"):
-                            yield Static("Secondary Provider", classes="panel-title")
-                            yield Static("Secondary: Not configured", id="secondary-status-line")
-                            yield DataTable(id="secondary-rl-metrics")
-
-                        # Tertiary provider section (OpenLux, hidden by default)
-                        with Vertical(id="tertiary-overview"):
-                            yield Static("OpenLux", classes="panel-title")
-                            yield Static("OpenLux: Not configured", id="tertiary-status-line")
-                            yield DataTable(id="tertiary-rl-metrics")
-
-                        # Quaternary provider section (ARK, hidden by default)
-                        with Vertical(id="quaternary-overview"):
-                            yield Static("ARK", classes="panel-title")
-                            yield Static("ARK: Not configured", id="quaternary-status-line")
-                            yield DataTable(id="quaternary-rl-metrics")
-
-                        # Quinary provider section (Meta AI, hidden by default)
-                        with Vertical(id="quinary-overview"):
-                            yield Static("Meta AI", classes="panel-title")
-                            yield Static("Meta AI: Not configured", id="quinary-status-line")
-                            yield DataTable(id="quinary-rl-metrics")
+                        # Dynamic provider sections (secondary through senary)
+                        for provider_info in PROVIDER_REGISTRY[1:]:  # Skip primary
+                            provider_key = provider_info["key"]
+                            label = provider_info["label"]
+                            with Vertical(id=f"{provider_key}-overview"):
+                                yield Static(label, classes="panel-title")
+                                yield Static(f"{label}: Not configured", id=f"{provider_key}-status-line")
+                                yield DataTable(id=f"{provider_key}-rl-metrics")
                         
                         yield Static("", classes="spacer")
                         yield Static("Request Statistics", classes="panel-title")
