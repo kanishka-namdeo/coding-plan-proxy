@@ -716,7 +716,60 @@ git commit -m "feat(tui): enhanced model table with multi-provider breakdown"
 
 ---
 
-### Task 10: Add Failover Tracking Panel to Metrics Tab
+### Task 10: Add Alert Badge Failover Enhancement
+
+**Files:**
+- Modify: `proxy_tui.py:7` (_update_alert_badge method, add failover detection)
+
+**Interfaces:**
+- Consumes: Session logs for failover detection
+- Produces: Alert badge showing "Failover active" when recent failovers detected
+
+- [ ] **Step 1: Add failover detection to _update_alert_badge**
+
+The spec requires the alert badge to show "Failover active" when recent failovers have occurred. Add this after the circuit breaker check in `_update_alert_badge`:
+
+In the `_update_alert_badge` method, after checking all providers, add failover detection:
+
+```python
+            # Check for recent failover events
+            if warnings:  # Only check if we already have warnings
+                import json
+                from datetime import datetime, timezone, timedelta
+                log_dir = "session_logs"
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                log_file = f"{log_dir}/{today}.jsonl"
+                try:
+                    with open(log_file, "r", encoding="utf-8") as f:
+                        lines = f.readlines()[-50:]  # Check last 50 entries
+                        for line in lines[-10:]:  # Only last 10 for recent failovers
+                            try:
+                                entry = json.loads(line.strip())
+                                if len(entry.get("attempted_providers", [])) > 1:
+                                    if "Failover" not in warnings:
+                                        warnings.append("Failover")
+                                    break
+                            except (json.JSONDecodeError, KeyError):
+                                continue
+                except FileNotFoundError:
+                    pass
+```
+
+- [ ] **Step 2: Verify syntax**
+
+Run: `python -m py_compile proxy_tui.py`
+Expected: No output (success)
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add proxy_tui.py
+git commit -m "feat(tui): add failover status to alert badge"
+```
+
+---
+
+### Task 11: Add Failover Tracking Panel to Metrics Tab
 
 **Files:**
 - Modify: `proxy_tui.py:280` (compose method, metrics tab)
@@ -840,7 +893,89 @@ git commit -m "feat(tui): add failover tracking panel to Metrics tab"
 
 ---
 
-### Task 11: Run Full Test Suite
+### Task 12: Refactor CSS for Dynamic Provider Sections
+
+**Files:**
+- Modify: `proxy_tui.tcss` (replace ID selectors with class selectors)
+
+**Interfaces:**
+- Produces: CSS that works for all dynamic provider sections
+
+- [ ] **Step 1: Replace hardcoded provider ID selectors with class selectors**
+
+The current CSS has hardcoded selectors for `#secondary-overview`, `#tertiary-overview`, etc. Replace these with generic class selectors that work for all providers.
+
+Replace the provider-specific CSS (lines 16-77) with generic class-based CSS:
+
+```css
+/* Dynamic provider sections */
+.provider-section, .Vertical[id$="-overview"] {
+    display: none;
+    margin: 1 0 0 0;
+    border-top: heavy $primary 30%;
+    padding-top: 1;
+}
+
+.provider-section.visible, .Vertical[id$="-overview"].visible {
+    display: block;
+}
+
+/* Provider status lines */
+.provider-status-line, .Static[id$="-status-line"] {
+    padding: 0 1;
+    text-style: bold;
+    height: 1;
+}
+
+.provider-status-line.status-running, .Static[id$="-status-line"].status-running {
+    color: $success;
+}
+
+.provider-status-line.status-stopped, .Static[id$="-status-line"].status-stopped {
+    color: $error;
+}
+
+/* Provider metrics tables */
+.provider-metrics-table, DataTable[id$="-rl-metrics"] {
+    height: auto;
+}
+```
+
+- [ ] **Step 2: Add failover panel CSS**
+
+Add CSS for the new failover panel:
+
+```css
+/* Failover events panel */
+.failover-panel {
+    height: auto;
+    padding: 0 1;
+    margin: 1 0;
+    border: round $warning;
+    max-height: 8;
+    overflow-y: auto;
+}
+
+.failover-panel:empty {
+    display: none;
+}
+```
+
+- [ ] **Step 3: Verify TUI renders correctly**
+
+Run: `python proxy_tui.py` (quick visual check)
+Expected: No CSS errors in logs
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add proxy_tui.tcss
+git commit -m "refactor(tui): generic CSS for dynamic provider sections"
+```
+
+---
+
+### Task 13: Run Full Test Suite
 
 **Files:**
 - Test: `tests/`
@@ -873,7 +1008,7 @@ git commit -m "fix: update tests for provider registry refactoring"
 
 ---
 
-### Task 12: Manual Testing and Documentation
+### Task 14: Manual Testing and Documentation
 
 **Files:**
 - None (manual testing)
@@ -920,11 +1055,13 @@ After completing all tasks:
 - [ ] **Spec coverage**: Each requirement from the spec has a corresponding task
   - ✅ Provider registry pattern (Tasks 1-2)
   - ✅ Dynamic UI sections (Tasks 2-3)
-  - ✅ Unified _update_provider_metrics (Task 4)
-  - ✅ Senary provider support (Tasks 1-8, automatic via registry)
+  - ✅ Unified _update_provider_metrics (Task 4-6)
+  - ✅ Senary provider support (Tasks 1-9, automatic via registry)
   - ✅ Enhanced model table (Task 9)
-  - ✅ Failover tracking (Task 10)
-  - ✅ Testing (Task 11-12)
+  - ✅ Alert badge enhancement for failover (Task 10)
+  - ✅ Failover tracking panel (Task 11)
+  - ✅ CSS refactoring for dynamic sections (Task 12)
+  - ✅ Testing (Task 13-14)
 
 - [ ] **No placeholders**: All steps contain actual code
 
