@@ -896,6 +896,27 @@ class ProxyTUI(App):
                 if status.get("circuit_open"):
                     warnings.append("Circuit")
 
+            # Check for recent failover events
+            if warnings:  # Only check if we already have warnings
+                import json
+                log_dir = "session_logs"
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                log_file = f"{log_dir}/{today}.jsonl"
+                try:
+                    with open(log_file, "r", encoding="utf-8") as f:
+                        lines = f.readlines()[-50:]  # Check last 50 entries
+                        for line in lines[-10:]:  # Only last 10 for recent failovers
+                            try:
+                                entry = json.loads(line.strip())
+                                if len(entry.get("attempted_providers", [])) > 1:
+                                    if "Failover" not in warnings:
+                                        warnings.append("Failover")
+                                    break
+                            except (json.JSONDecodeError, KeyError):
+                                continue
+                except FileNotFoundError:
+                    pass
+
             if warnings:
                 badge.update("ALERT: " + " | ".join(warnings) + " critical")
                 badge.add_class("alert-active")
