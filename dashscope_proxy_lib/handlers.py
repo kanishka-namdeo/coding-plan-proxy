@@ -112,6 +112,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         status = {
             "rate_limits": rate_limiter.status(),
             "providers": router.get_provider_status(),
+            "model_overlaps": router.get_model_overlaps(),
         }
         return web.json_response(status)
 

@@ -16,7 +16,7 @@ This directory owns all proxy core logic. The root `dashscope_proxy.py` facade r
   - `rate_limiter.py` — `SlidingWindowCounter`, `TokenWindowCounter`, `RateLimiter`, `MultiProviderRateLimiter`
   - `queue.py` — `wait_for_slot()` deadline-bounded queue wait with client disconnect detection
   - `handlers.py` — `handle_request()` main request handler with retry logic, streaming, session logging
-  - `provider_router.py` — `ProviderRouter` routes requests to primary/secondary/tertiary providers based on model name
+  - `provider_router.py` — `ProviderRouter` routes requests to one of six providers (primary/secondary/tertiary/quaternary/quinary/senary) based on model name
   - `request_transform.py` — `map_developer_to_system()`, `normalize_model_name()`, endpoint detection
   - `token_utils.py` — token extraction from responses/streams, request token estimation
   - `http_helpers.py` — HTTP utilities: header stripping, error responses, backoff computation, disconnect detection
@@ -30,7 +30,9 @@ This directory owns all proxy core logic. The root `dashscope_proxy.py` facade r
   - `RateLimiter` — combines sliding window + token bucket + quota windows (5h/week/month) + circuit breaker
   - `MultiProviderRateLimiter` — wraps multiple `RateLimiter` instances (one per provider) with global queue tracking
 
-- **Provider routing**: model name determines provider. Explicit mapping in `MODEL_PROVIDER_MAP` takes priority; otherwise model lists in `SECONDARY_MODELS` / `TERTIARY_MODELS` determine routing. MIMO v2.5 hyphen aliases (`mimo-v2-5-*`) normalized to dots (`mimo-v2.5-*`).
+- **Provider routing**: model name determines provider. A `<provider>/<model>` pin (`openlux/…`, `mimo/…`, `ark/…`, `metaspark/…`, `deepseek/…`, `dashscope/…`, or canonical names) forces that provider when configured; unknown pins or pins to unconfigured providers are rejected with HTTP 400 before queue/TPM, and the prefix is stripped before upstream. Bare names: explicit mapping in `MODEL_PROVIDER_MAP` takes priority; otherwise model lists determine routing, checked in order: senary → quinary → quaternary → tertiary → secondary → primary (default). Six providers: primary (DashScope), secondary (MIMO), tertiary (OpenLux), quaternary (ARK/BytePlus), quinary (Meta AI/Muse Spark), senary (DeepSeek). MIMO v2.5 hyphen aliases (`mimo-v2-5-*`) normalized to dots (`mimo-v2.5-*`). Overlapping models (present in multiple provider lists) support cross-provider failover on 429/5xx/timeout: after per-provider retries are exhausted, the handler advances to the next available provider with a closed circuit. TPM is refunded to the old limiter before failover and reserved from the new limiter after. Session entries include `attempted_providers: list[str]` tracking the failover chain. Upstream 4xx (non-429) is terminal and does not trigger failover. `/v1/models` returns deduped model IDs with `providers` and `provider_models` fields indicating which providers serve each model; overlapping models list all available providers. `GET /v1/proxy/status` includes `model_overlaps: {model_id: [provider names]}` for models served by 2+ providers.
+
+- **URL construction**: base URLs must include an explicit version suffix (e.g., `/v1`, `/v3`) if the upstream requires it. The proxy detects version suffixes in base URLs and uses them; if no version is present, no `/vN` prefix is added to the path. This supports APIs like DeepSeek (`https://api.deepseek.com`) which use unversioned paths.
 
 - **Session logging**: writes to `session_logs/YYYY-MM-DD.jsonl` with daily rotation. Uses thread pool executor for async I/O. Each entry is a JSON line with request/response metadata.
 
@@ -40,7 +42,7 @@ This directory owns all proxy core logic. The root `dashscope_proxy.py` facade r
 
 - All proxy logic belongs here; do not add proxy logic to root-level files
 - When adding a new constant, add it to `config.py` and resolve via `_cfg()` in handlers/helpers
-- When adding a new provider, update `config.py` (models, rate limits), `provider_router.py` (routing logic), and `server.py` (resource initialization)
+- When adding a new provider, update: `config.py` (API key, base URL, rate limit config, models), `provider_router.py` (build function, cfg helper, ProviderConfig, routing logic), `server.py` (import config, pass to MultiProviderRateLimiter), `proxy_tui.py` (UI section), `dashscope_proxy.py` (re-export constants), and `tests/` (coverage)
 - Session log format: JSON lines with `request_id`, `timestamp`, `model`, `is_stream`, `request_body`, `response_status`, `response_body`, `tokens`, `latency`, `provider`
 - Logging: use `_log(level, msg, **extra)` for structured logs with context; TUI consumes via `TUILogHandler`
 
