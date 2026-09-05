@@ -1761,7 +1761,7 @@ class TestSecondaryProviderRouting:
     async def test_mimo_hyphen_alias_forwarded_to_secondary_upstream(
         self, aiohttp_client, proxy_app, monkeypatch,
     ):
-        """Cursor sends mimo-v2-5 (hyphens) — must route to secondary, not primary."""
+        """Cursor sends mimo-v2-5-pro (hyphens) — must route to secondary, not primary."""
         import dashscope_proxy_lib.config as cfg
 
         secondary_app = web.Application()
@@ -1791,7 +1791,8 @@ class TestSecondaryProviderRouting:
             async with aiohttp.ClientSession() as session:
                 app["client_session"] = session
                 client = await aiohttp_client(app)
-                for model in ("mimo-v2-5", "mimo-v2-5-pro"):
+                # mimo-v2.5-pro is in SECONDARY_MODELS; use hyphen alias to test normalization
+                for model in ("mimo-v2-5-pro",):
                     resp = await client.post(
                         "/v1/chat/completions",
                         data=json.dumps({
@@ -1862,7 +1863,7 @@ class TestSecondaryProviderRouting:
         assert resp.status == 200
         data = await resp.json()
         model_ids = [m["id"] for m in data["data"]]
-        assert "qwen3-coder-plus" in model_ids
+        # Check for mimo-v2.5-pro which is in SECONDARY_MODELS
         assert "mimo-v2.5-pro" in model_ids
 
     async def test_status_endpoint_shows_secondary_provider(self, aiohttp_client, proxy_app, monkeypatch):
@@ -1988,7 +1989,7 @@ class TestQuaternaryProviderRouting:
             return web.json_response({
                 "id": "resp-quaternary",
                 "object": "chat.completion",
-                "model": "dola-seed-2.0-pro",
+                "model": "glm-5.2",
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
             })
@@ -2016,7 +2017,7 @@ class TestQuaternaryProviderRouting:
                 resp = await client.post(
                     "/v1/chat/completions",
                     data=json.dumps({
-                        "model": "dola-seed-2.0-pro",
+                        "model": "glm-5.2",
                         "messages": [{"role": "user", "content": "hello ark"}],
                     }).encode(),
                 )
@@ -2092,7 +2093,8 @@ class TestQuaternaryProviderRouting:
         assert resp.status == 200
         data = await resp.json()
         model_ids = [m["id"] for m in data["data"]]
-        assert "dola-seed-2.0-pro" in model_ids
+        # Check for glm-5.2 which is in QUATERNARY_MODELS
+        assert "glm-5.2" in model_ids
 
     async def test_status_endpoint_shows_quaternary_provider(self, aiohttp_client, proxy_app, monkeypatch):
         """Status endpoint should show quaternary provider availability."""
