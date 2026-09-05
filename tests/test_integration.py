@@ -2247,3 +2247,150 @@ class TestPinnedRoutingHandler:
         assert resp.status == 400
         data = await resp.json()
         assert data["error"] == "provider 'tertiary' not configured"
+
+
+async def test_overlap_failover_on_502(aiohttp_client):
+    """Overlapping model on tertiary+quaternary: 502 on first → served by second."""
+    async def tertiary_handler(request):
+        return web.Response(status=502, text='{"error":"bad gateway"}')
+    async def quaternary_handler(request):
+        return web.json_response({"choices": [], "usage": {"total_tokens": 5}})
+
+    # Set up mock tertiary upstream
+    t_app = web.Application()
+    t_app.router.add_post("/v1/chat/completions", tertiary_handler)
+    t_runner = web.AppRunner(t_app)
+    await t_runner.setup()
+    t_site = web.TCPSite(t_runner, "127.0.0.1", 0)
+    await t_site.start()
+    t_port = t_site._server.sockets[0].getsockname()[1]
+
+    # Set up mock quaternary upstream
+    q_app = web.Application()
+    q_app.router.add_post("/v1/chat/completions", quaternary_handler)
+    q_runner = web.AppRunner(q_app)
+    await q_runner.setup()
+    q_site = web.TCPSite(q_runner, "127.0.0.1", 0)
+    await q_site.start()
+    q_port = q_site._server.sockets[0].getsockname()[1]
+
+    import dashscope_proxy_lib.config as _c
+    # Set fallback order so tertiary is tried before quaternary
+    # Patch the facade module, not the config module directly
+    import dashscope_proxy as _facade
+    _facade.MODEL_FALLBACK_ORDER = ["tertiary", "quaternary"]
+    _c.TERTIARY_API_KEY = "t-key"
+    _c.TERTIARY_BASE_URL = f"http://127.0.0.1:{t_port}/v1"
+    _c.TERTIARY_MODELS["data"].append({"id": "overlap-failover-model", "object": "model"})
+    _c.QUATERNARY_API_KEY = "q-key"
+    _c.QUATERNARY_BASE_URL = f"http://127.0.0.1:{q_port}/v1"
+    _c.QUATERNARY_MODELS["data"].append({"id": "overlap-failover-model", "object": "model"})
+    try:
+        app = dashscope_proxy.create_app()
+        app["rate_limiter"] = dashscope_proxy.MultiProviderRateLimiter(make_test_config())
+        app["shutting_down"] = asyncio.Event()
+        async with aiohttp.ClientSession() as session:
+            app["client_session"] = session
+            client = await aiohttp_client(app)
+            resp = await client.post("/v1/chat/completions", json={
+                "model": "overlap-failover-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+            assert resp.status == 200
+    finally:
+        await t_runner.cleanup()
+        await q_runner.cleanup()
+        _facade.MODEL_FALLBACK_ORDER = []
+        _c.TERTIARY_MODELS["data"][:] = [m for m in _c.TERTIARY_MODELS["data"] if m["id"] != "overlap-failover-model"]
+        _c.QUATERNARY_MODELS["data"][:] = [m for m in _c.QUATERNARY_MODELS["data"] if m["id"] != "overlap-failover-model"]
+
+
+async def test_pinned_request_does_not_fail_over(aiohttp_client):
+    """Pinned provider returning 502 → 502 to client, no cross-provider retry."""
+    async def bad_handler(request):
+        return web.Response(status=502, text='{"error":"bad gateway"}')
+    
+    # Set up mock upstream that returns 502
+    bad_app = web.Application()
+    bad_app.router.add_post("/v1/chat/completions", bad_handler)
+    bad_runner = web.AppRunner(bad_app)
+    await bad_runner.setup()
+    bad_site = web.TCPSite(bad_runner, "127.0.0.1", 0)
+    await bad_site.start()
+    bad_port = bad_site._server.sockets[0].getsockname()[1]
+
+    import dashscope_proxy_lib.config as _c
+    _c.TERTIARY_API_KEY = "t-key"
+    _c.TERTIARY_BASE_URL = f"http://127.0.0.1:{bad_port}/v1"
+    _c.TERTIARY_MODELS["data"].append({"id": "pinned-failover-model", "object": "model"})
+    try:
+        app = dashscope_proxy.create_app()
+        app["rate_limiter"] = dashscope_proxy.MultiProviderRateLimiter(make_test_config())
+        app["shutting_down"] = asyncio.Event()
+        async with aiohttp.ClientSession() as session:
+            app["client_session"] = session
+            client = await aiohttp_client(app)
+            resp = await client.post("/v1/chat/completions", json={
+                "model": "openlux/pinned-failover-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+            assert resp.status == 502
+    finally:
+        await bad_runner.cleanup()
+        _c.TERTIARY_MODELS["data"][:] = [m for m in _c.TERTIARY_MODELS["data"] if m["id"] != "pinned-failover-model"]
+
+
+async def test_upstream_400_does_not_fail_over(aiohttp_client):
+    """Upstream 400 is terminal — no cross-provider retry."""
+    async def bad_handler(request):
+        return web.Response(status=400, text='{"error":"bad request"}')
+    async def good_handler(request):
+        return web.json_response({"choices": []})
+    
+    # Set up mock tertiary upstream that returns 400
+    t_app = web.Application()
+    t_app.router.add_post("/v1/chat/completions", bad_handler)
+    t_runner = web.AppRunner(t_app)
+    await t_runner.setup()
+    t_site = web.TCPSite(t_runner, "127.0.0.1", 0)
+    await t_site.start()
+    t_port = t_site._server.sockets[0].getsockname()[1]
+
+    # Set up mock quaternary upstream that returns 200
+    q_app = web.Application()
+    q_app.router.add_post("/v1/chat/completions", good_handler)
+    q_runner = web.AppRunner(q_app)
+    await q_runner.setup()
+    q_site = web.TCPSite(q_runner, "127.0.0.1", 0)
+    await q_site.start()
+    q_port = q_site._server.sockets[0].getsockname()[1]
+
+    import dashscope_proxy_lib.config as _c
+    # Set fallback order so tertiary is tried before quaternary
+    # Patch the facade module, not the config module directly
+    import dashscope_proxy as _facade
+    _facade.MODEL_FALLBACK_ORDER = ["tertiary", "quaternary"]
+    _c.TERTIARY_API_KEY = "t-key"
+    _c.TERTIARY_BASE_URL = f"http://127.0.0.1:{t_port}/v1"
+    _c.TERTIARY_MODELS["data"].append({"id": "overlap-400-model", "object": "model"})
+    _c.QUATERNARY_API_KEY = "q-key"
+    _c.QUATERNARY_BASE_URL = f"http://127.0.0.1:{q_port}/v1"
+    _c.QUATERNARY_MODELS["data"].append({"id": "overlap-400-model", "object": "model"})
+    try:
+        app = dashscope_proxy.create_app()
+        app["rate_limiter"] = dashscope_proxy.MultiProviderRateLimiter(make_test_config())
+        app["shutting_down"] = asyncio.Event()
+        async with aiohttp.ClientSession() as session:
+            app["client_session"] = session
+            client = await aiohttp_client(app)
+            resp = await client.post("/v1/chat/completions", json={
+                "model": "overlap-400-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+            assert resp.status == 400
+    finally:
+        await t_runner.cleanup()
+        await q_runner.cleanup()
+        _facade.MODEL_FALLBACK_ORDER = []
+        _c.TERTIARY_MODELS["data"][:] = [m for m in _c.TERTIARY_MODELS["data"] if m["id"] != "overlap-400-model"]
+        _c.QUATERNARY_MODELS["data"][:] = [m for m in _c.QUATERNARY_MODELS["data"] if m["id"] != "overlap-400-model"]

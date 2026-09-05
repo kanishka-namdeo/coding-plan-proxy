@@ -274,13 +274,30 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         if isinstance(body, dict):
             body["model"] = bare_name
         body_bytes = json.dumps(body).encode()
-    provider = router.get_provider_for_model(model_name or "")
+
+    # Build candidate provider list for failover
+    if pinned_name is not None:
+        # Pinned request: single provider, no failover
+        candidates = [getattr(router, pinned_name)]
+    else:
+        # Check for overlapping models
+        overlap = router.get_providers_for_model(model_name or "")
+        if overlap:
+            candidates = overlap
+        else:
+            # Single provider, no failover
+            candidates = [router.get_provider_for_model(model_name or "")]
+
+    provider = candidates[0]
     provider_name = provider.name
+    attempted_providers: list[str] = [provider_name]
+    candidate_idx = 0
 
     session_entry["model"] = model_name
     session_entry["is_stream"] = is_stream
     session_entry["estimated_tokens"] = estimated_tokens
     session_entry["provider"] = provider_name
+    session_entry["attempted_providers"] = attempted_providers
 
     # Get the appropriate rate limiter for this provider.
     # Duck-type instead of isinstance — the facade may reload rate_limiter
@@ -395,6 +412,91 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 503, b'{"error":"proxy unavailable, restart the server"}', request_id, retry_after=5
             )
 
+        # Helper for provider failover
+        def _advance_candidate() -> bool:
+            """Advance to next candidate provider. Returns False if exhausted."""
+            nonlocal candidate_idx, provider, provider_name, limiter, retry, retry_5xx
+            
+            # Skip providers with open circuits
+            while candidate_idx + 1 < len(candidates):
+                next_provider = candidates[candidate_idx + 1]
+                next_limiter = get_provider_limiter(next_provider.name) if get_provider_limiter else rate_limiter
+                if not next_limiter.circuit_is_open():
+                    # Advance to next provider
+                    candidate_idx += 1
+                    provider = next_provider
+                    provider_name = provider.name
+                    limiter = next_limiter
+                    attempted_providers.append(provider_name)
+                    retry = 0
+                    retry_5xx = 0
+                    
+                    _log(logging.WARNING, "provider failover",
+                         request_id=request_id, model=model_name,
+                         from_provider=attempted_providers[-2], to_provider=provider_name,
+                         reason="upstream failure")
+                    return True
+                candidate_idx += 1  # Skip this candidate, try the next
+            return False
+
+        async def _try_failover_with_tpm() -> tuple[bool, bool]:
+            """
+            Try failover to next provider with proper TPM handling.
+            Returns (success, tokens_reserved) - if success is False, request should be terminated.
+            """
+            nonlocal tokens_reserved
+            
+            # Refund tokens to old limiter before failover
+            if tokens_reserved and estimated_tokens > 0:
+                await limiter.refund_tokens(estimated_tokens)
+                tokens_reserved = False
+            
+            # Try to advance to next provider
+            if not _advance_candidate():
+                # No more candidates - tokens already refunded
+                return False, False
+            
+            # Reserve tokens from new limiter
+            if estimated_tokens > 0:
+                if await limiter.reserve_tokens(estimated_tokens):
+                    tokens_reserved = True
+                    return True, True
+                else:
+                    # TPM quota exceeded on new provider - log and try next
+                    _log(logging.WARNING, "TPM reservation failed on failover provider",
+                         request_id=request_id, model=model_name,
+                         provider=provider_name, estimated_tokens=estimated_tokens)
+                    # Recursively try next candidate
+                    return await _try_failover_with_tpm()
+            
+            return True, False  # No tokens needed, failover successful
+
+        def _rebuild_request_for_provider():
+            """Rebuild target_url and headers for the current provider."""
+            nonlocal target_url, headers
+            
+            base_url_new = provider.base_url.rstrip("/")
+            version_match_new = re.search(r'/v(\d+)$', base_url_new)
+            if version_match_new:
+                base_version_new = f"v{version_match_new.group(1)}"
+                base_url_new = base_url_new[:version_match_new.start()]
+            else:
+                base_version_new = "v1"
+            target_path_new = re.sub(r'^/v\d+', '', path)
+            if not target_path_new.startswith('/'):
+                target_path_new = '/' + target_path_new
+            target_url = f"{base_url_new}/{base_version_new}{target_path_new}"
+            if request.query_string:
+                target_url += f"?{request.query_string}"
+            
+            headers = {
+                k: v for k, v in request.headers.items()
+                if k.lower() not in ("host", "transfer-encoding", "content-length", "authorization")
+            }
+            headers["Content-Type"] = "application/json"
+            headers["Authorization"] = f"Bearer {provider.api_key}"
+            headers["X-Request-ID"] = request_id
+
         while retry <= limiter.max_retries and retry_5xx <= _cfg("MAX_5XX_RETRIES"):
             try:
                 if app_shutting_down and app_shutting_down.is_set():
@@ -476,7 +578,12 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                                 _log(logging.ERROR, "max retries exceeded after 429",
                                      request_id=request_id, model=model_name,
                                      retry_count=retry, max_retries=limiter.max_retries)
-                                await limiter.refund_tokens(estimated_tokens)
+                                # Try failover to next provider with proper TPM handling
+                                success, _ = await _try_failover_with_tpm()
+                                if success:
+                                    _rebuild_request_for_provider()
+                                    continue
+                                # Tokens already refunded inside _try_failover_with_tpm()
                                 resp = web.Response(status=429, body=error_body, content_type="application/json")
                                 resp.headers["X-Request-ID"] = request_id
                                 _add_forwarded_headers(resp, upstream_headers)
@@ -524,7 +631,12 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                                      request_id=request_id, model=model_name,
                                      status=upstream.status, retry_5xx=retry_5xx,
                                      max_retries=_cfg("MAX_5XX_RETRIES"))
-                                await limiter.refund_tokens(estimated_tokens)
+                                # Try failover to next provider with proper TPM handling
+                                success, _ = await _try_failover_with_tpm()
+                                if success:
+                                    _rebuild_request_for_provider()
+                                    continue
+                                # Tokens already refunded inside _try_failover_with_tpm()
                                 resp = web.Response(status=upstream.status, body=upstream_body)
                                 resp.headers["X-Request-ID"] = request_id
                                 _add_forwarded_headers(resp, upstream_headers)
@@ -718,7 +830,12 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             _log(logging.ERROR, "max retries exceeded after 429",
                                  request_id=request_id, model=model_name,
                                  retry_count=retry, max_retries=limiter.max_retries)
-                            await limiter.refund_tokens(estimated_tokens)
+                            # Try failover to next provider with proper TPM handling
+                            success, _ = await _try_failover_with_tpm()
+                            if success:
+                                _rebuild_request_for_provider()
+                                continue
+                            # Tokens already refunded inside _try_failover_with_tpm()
                             out = web.Response(status=429, body=resp_body, content_type="application/json")
                             out.headers["X-Request-ID"] = request_id
                             if retry_after_raw:
@@ -753,7 +870,12 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                                  request_id=request_id, model=model_name,
                                  status=status_code, retry_5xx=retry_5xx,
                                  max_retries=_cfg("MAX_5XX_RETRIES"))
-                            await limiter.refund_tokens(estimated_tokens)
+                            # Try failover to next provider with proper TPM handling
+                            success, _ = await _try_failover_with_tpm()
+                            if success:
+                                _rebuild_request_for_provider()
+                                continue
+                            # Tokens already refunded inside _try_failover_with_tpm()
                             out = web.Response(status=status_code, body=resp_body)
                             out.headers["X-Request-ID"] = request_id
                             _add_forwarded_headers(out, resp_headers)
@@ -835,7 +957,12 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 if retry > limiter.max_retries:
                     error_reason = "max_retries_exceeded"
                     status_code = 502
-                    await limiter.refund_tokens(estimated_tokens)
+                    # Try failover to next provider with proper TPM handling
+                    success, _ = await _try_failover_with_tpm()
+                    if success:
+                        _rebuild_request_for_provider()
+                        continue
+                    # Tokens already refunded inside _try_failover_with_tpm()
                     return _make_error_response(502, b'{"error":"proxy forward error"}', request_id)
                 if not await _sleep_interruptible(request, _compute_backoff(limiter, retry)):
                     error_reason = "client_disconnected"
