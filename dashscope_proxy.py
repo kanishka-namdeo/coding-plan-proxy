@@ -65,6 +65,17 @@ from dashscope_proxy_lib.config import (
     QUATERNARY_BASE_URL,
     QUATERNARY_CODING_PLAN_CONFIG,
     QUATERNARY_MODELS,
+    QUINARY_API_KEY,
+    QUINARY_BASE_URL,
+    QUINARY_CODING_PLAN_CONFIG,
+    QUINARY_MODELS,
+    SENARY_API_KEY,
+    SENARY_BASE_URL,
+    SENARY_CODING_PLAN_CONFIG,
+    SENARY_MODELS,
+    PROVIDER_SLUGS,
+    MODEL_FALLBACK_ORDER,
+    MODEL_PROVIDER_MAP,
     _load_config,
 )
 
@@ -112,6 +123,7 @@ from dashscope_proxy_lib.token_utils import (
 from dashscope_proxy_lib.request_transform import (
     map_developer_to_system,
     normalize_model_name,
+    split_provider_prefix,
     _is_chat_endpoint,
 )
 
@@ -154,6 +166,9 @@ __all__ = [
     "CODING_PLAN_CONFIG", "MOCK_MODELS",
     "TERTIARY_API_KEY", "TERTIARY_BASE_URL", "TERTIARY_CODING_PLAN_CONFIG", "TERTIARY_MODELS",
     "QUATERNARY_API_KEY", "QUATERNARY_BASE_URL", "QUATERNARY_CODING_PLAN_CONFIG", "QUATERNARY_MODELS",
+    "QUINARY_API_KEY", "QUINARY_BASE_URL", "QUINARY_CODING_PLAN_CONFIG", "QUINARY_MODELS",
+    "SENARY_API_KEY", "SENARY_BASE_URL", "SENARY_CODING_PLAN_CONFIG", "SENARY_MODELS",
+    "PROVIDER_SLUGS", "MODEL_FALLBACK_ORDER", "MODEL_PROVIDER_MAP",
     "_load_config",
     # logging
     "LOG_LEVEL", "LOG_BUFFER_SIZE",
@@ -169,7 +184,8 @@ __all__ = [
     "extract_tokens_from_response", "extract_tokens_from_stream",
     "estimate_tokens_for_request",
     # request transform
-    "map_developer_to_system", "_is_chat_endpoint",
+    "map_developer_to_system", "normalize_model_name", "split_provider_prefix",
+    "_is_chat_endpoint",
     # http helpers
     "parse_retry_after", "should_retry_429", "_make_error_response", "_add_ratelimit_headers",
     "_strip_hop_by_hop", "_client_disconnected", "_compute_backoff",

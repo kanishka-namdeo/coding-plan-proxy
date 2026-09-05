@@ -1191,18 +1191,24 @@ class TestProviderRouter:
         provider = router.get_provider_for_model("mimo-v2-5-pro")
         assert provider.name == "secondary"
 
-    def test_mimo_v25_base_hyphen_alias_routed_to_secondary(self, dashscope_module, monkeypatch):
-        """Cursor sends 'mimo-v2-5' (no suffix) for the base model."""
-        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
-        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+    def test_mimo_v25_base_hyphen_alias_routed_to_tertiary(self, dashscope_module, monkeypatch):
+        """Cursor sends 'mimo-v2-5' (no suffix) for the base model (tertiary-only)."""
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-test")
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "https://tertiary.example.com/v1")
         router = dashscope_module.ProviderRouter()
         provider = router.get_provider_for_model("mimo-v2-5")
-        assert provider.name == "secondary"
+        assert provider.name == "tertiary"
+
+    def test_mimo_v25_unconfigured_returns_primary(self, dashscope_module, monkeypatch):
+        """mimo-v2.5 returns primary when tertiary is not configured."""
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model("mimo-v2.5")
+        assert provider.name == "primary"
 
     @pytest.mark.parametrize("model_id", [
-        "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2.5-asr", "mimo-v2.5-tts",
-        "mimo-v2.5-tts-voiceclone", "mimo-v2.5-tts-voicedesign",
-        "mimo-v2-pro", "mimo-v2-omni", "mimo-v2-tts",
+        "mimo-v2.5-pro",
     ])
     def test_all_secondary_models_routed_to_secondary(self, dashscope_module, monkeypatch, model_id):
         monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
@@ -1211,8 +1217,7 @@ class TestProviderRouter:
         assert router.get_provider_for_model(model_id).name == "secondary"
 
     @pytest.mark.parametrize("model_id", [
-        "qwen3.6-plus", "qwen3.7-plus", "qwen3.5-plus", "qwen3-max",
-        "qwen3-coder-plus", "qwen3-coder-next", "kimi-k2-5", "glm-5-0", "MiniMax-M2.5",
+        "qwen3.6-plus", "qwen3.7-plus", "kimi-k2-5", "glm-5-0", "MiniMax-M2.5",
     ])
     def test_all_primary_models_routed_to_primary(self, dashscope_module, monkeypatch, model_id):
         monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
@@ -1240,7 +1245,7 @@ class TestProviderRouter:
         router = dashscope_module.ProviderRouter()
         models = router.get_all_models()
         model_ids = [m["id"] for m in models["data"]]
-        assert "qwen3-coder-plus" in model_ids
+        assert "qwen3.6-plus" in model_ids
         assert "mimo-v2.5-pro" in model_ids
 
     def test_get_all_models_excludes_secondary_when_not_configured(self, dashscope_module, monkeypatch):
@@ -1249,7 +1254,7 @@ class TestProviderRouter:
         router = dashscope_module.ProviderRouter()
         models = router.get_all_models()
         model_ids = [m["id"] for m in models["data"]]
-        assert "qwen3-coder-plus" in model_ids
+        assert "qwen3.6-plus" in model_ids
         assert "mimo-v2.5-pro" not in model_ids
 
     def test_get_provider_status(self, dashscope_module):
@@ -1271,6 +1276,50 @@ class TestProviderRouter:
         assert router.tertiary.is_available is True
         provider = router.get_provider_for_model("gemini-3.7-flash")
         assert provider.name == "tertiary"
+
+    @pytest.mark.parametrize("model_id", [
+        "gpt-5.6-sol", "gemini-3.7-flash", "gpt-5.6-terra", "qwen3.8-max",
+        "qwen3.8-max-0902",
+        "gpt-5.6-luna", "gemini-3.8-flash", "grok-4.6", "MiniMax-M3", "mimo-v2.5",
+    ])
+    def test_all_tertiary_models_routed_to_tertiary(self, dashscope_module, monkeypatch, model_id):
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-openlux")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.TERTIARY_BASE_URL",
+            "https://api.openlux.ai/v1",
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model(model_id).name == "tertiary"
+
+    def test_mimo_v25_routes_to_tertiary_not_secondary(self, dashscope_module, monkeypatch):
+        """mimo-v2.5 is tertiary-only; secondary config must not capture it."""
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-secondary")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-openlux")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.TERTIARY_BASE_URL",
+            "https://api.openlux.ai/v1",
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("mimo-v2.5").name == "tertiary"
+        assert router.get_provider_for_model("mimo-v2-5").name == "tertiary"
+        assert router.get_provider_for_model("mimo-v2.5-pro").name == "secondary"
+
+    def test_mimo_v25_base_hyphen_alias_in_tertiary_ids(self, dashscope_module):
+        from dashscope_proxy_lib.provider_router import _build_tertiary_model_ids
+        from dashscope_proxy_lib.config import TERTIARY_MODELS
+        ids = _build_tertiary_model_ids(TERTIARY_MODELS)
+        assert "mimo-v2.5" in ids
+        assert "mimo-v2-5" in ids
+
+    def test_tertiary_model_list_has_nine_models(self, dashscope_module):
+        from dashscope_proxy_lib.config import TERTIARY_MODELS
+        model_ids = [m["id"] for m in TERTIARY_MODELS["data"]]
+        assert model_ids == [
+            "gpt-5.6-sol", "gemini-3.7-flash", "gpt-5.6-terra", "qwen3.8-max",
+            "qwen3.8-max-0902",
+            "gpt-5.6-luna", "gemini-3.8-flash", "grok-4.6", "MiniMax-M3", "mimo-v2.5",
+        ]
 
     def test_tertiary_unconfigured_returns_primary_for_tertiary_models(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "")
@@ -1318,13 +1367,13 @@ class TestProviderRouter:
             "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
         )
         router = dashscope_module.ProviderRouter()
-        assert router.get_provider_for_model("dola-seed-2.0-pro").name == "quaternary"
+        assert router.get_provider_for_model("glm-5.2").name == "quaternary"
 
     def test_quaternary_unconfigured_returns_primary(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "")
         monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_BASE_URL", "")
         router = dashscope_module.ProviderRouter()
-        assert router.get_provider_for_model("dola-seed-2.0-pro").name == "primary"
+        assert router.get_provider_for_model("glm-5.2").name == "primary"
 
     def test_get_all_models_includes_quaternary_when_configured(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "sk-ark")
@@ -1335,7 +1384,7 @@ class TestProviderRouter:
         router = dashscope_module.ProviderRouter()
         models = router.get_all_models()
         model_ids = [m["id"] for m in models["data"]]
-        assert "dola-seed-2.0-pro" in model_ids
+        assert "glm-5.2" in model_ids
 
     def test_get_all_models_excludes_quaternary_when_not_configured(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "")
@@ -1343,7 +1392,7 @@ class TestProviderRouter:
         router = dashscope_module.ProviderRouter()
         models = router.get_all_models()
         model_ids = [m["id"] for m in models["data"]]
-        assert "dola-seed-2.0-pro" not in model_ids
+        assert "glm-5.2" not in model_ids
 
     def test_get_provider_status_includes_quaternary(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "sk-ark")
@@ -1368,6 +1417,64 @@ class TestProviderRouter:
         )
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model("glm-5.2").name == "quaternary"
+
+    def test_senary_model_routed_to_senary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_API_KEY", "sk-deepseek")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SENARY_BASE_URL",
+            "https://api.deepseek.com",
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("deepseek-v4-flash").name == "senary"
+
+    def test_senary_unconfigured_returns_primary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("deepseek-v4-flash").name == "primary"
+
+    def test_get_all_models_includes_senary_when_configured(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_API_KEY", "sk-deepseek")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SENARY_BASE_URL",
+            "https://api.deepseek.com",
+        )
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        model_ids = [m["id"] for m in models["data"]]
+        assert "deepseek-v4-flash" in model_ids
+
+    def test_get_all_models_excludes_senary_when_not_configured(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        model_ids = [m["id"] for m in models["data"]]
+        assert "deepseek-v4-flash" not in model_ids
+
+    def test_get_provider_status_includes_senary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_API_KEY", "sk-deepseek")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SENARY_BASE_URL",
+            "https://api.deepseek.com",
+        )
+        router = dashscope_module.ProviderRouter()
+        status = router.get_provider_status()
+        assert "senary" in status
+        assert status["senary"]["available"] is True
+
+    def test_model_provider_map_senary_override(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_API_KEY", "sk-deepseek")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SENARY_BASE_URL",
+            "https://api.deepseek.com",
+        )
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.MODEL_PROVIDER_MAP",
+            {"deepseek-v4-pro": "senary"},
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("deepseek-v4-pro").name == "senary"
 
 
 # ---------------------------------------------------------------------------
@@ -1508,6 +1615,28 @@ class TestMultiProviderRateLimiter:
         allowed, reason, _ = await mpl.can_proceed_for_provider(0, "quaternary")
         assert allowed is True
 
+    def test_creates_senary_when_senary_config_provided(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(
+            self._make_config(), None, None, None, None, self._make_config()
+        )
+        assert mpl.primary is not None
+        assert mpl.senary is not None
+
+    def test_get_limiter_for_provider_returns_senary(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(
+            self._make_config(), None, None, None, None, self._make_config()
+        )
+        limiter = mpl.get_limiter_for_provider("senary")
+        assert limiter is mpl.senary
+
+    @pytest.mark.asyncio
+    async def test_provider_specific_can_proceed_senary(self, dashscope_module):
+        config = self._make_config()
+        mpl = dashscope_module.MultiProviderRateLimiter(config, None, None, None, None, config)
+        allowed, reason, _ = await mpl.can_proceed_for_provider(0, "senary")
+        assert allowed is True
+        assert reason == "ok"
+
     def test_queue_drops_property(self, dashscope_module):
         mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
         mpl.queue_drops = 5
@@ -1548,3 +1677,29 @@ class TestMultiProviderRateLimiter:
         assert limiter.circuit_is_open() is False
         secondary = mpl.get_limiter_for_provider("secondary")
         assert secondary is mpl.secondary
+
+
+# ---------------------------------------------------------------------------
+# SplitProviderPrefix
+# ---------------------------------------------------------------------------
+
+class TestSplitProviderPrefix:
+    def test_bare_model_returns_no_prefix(self, dashscope_module):
+        from dashscope_proxy_lib.request_transform import split_provider_prefix
+        assert split_provider_prefix("gpt-5.6-sol") == (None, "gpt-5.6-sol")
+
+    def test_openlux_prefix_splits(self, dashscope_module):
+        from dashscope_proxy_lib.request_transform import split_provider_prefix
+        assert split_provider_prefix("openlux/gpt-5.6-sol") == ("tertiary", "gpt-5.6-sol")
+
+    def test_prefix_alias_normalized(self, dashscope_module):
+        from dashscope_proxy_lib.request_transform import split_provider_prefix
+        assert split_provider_prefix("mimo/mimo-v2-5-pro") == ("secondary", "mimo-v2.5-pro")
+
+    def test_unknown_slug_returns_none(self, dashscope_module):
+        from dashscope_proxy_lib.request_transform import split_provider_prefix
+        assert split_provider_prefix("nosuch/gpt-5.6-sol") == (None, "nosuch/gpt-5.6-sol")
+
+    def test_positional_alias_still_works(self, dashscope_module):
+        from dashscope_proxy_lib.request_transform import split_provider_prefix
+        assert split_provider_prefix("tertiary/gpt-5.6-sol") == ("tertiary", "gpt-5.6-sol")

@@ -34,6 +34,27 @@ def normalize_model_name(model_name: str) -> str:
     return model_name
 
 
+PROVIDER_SLUG_MAP = {
+    "dashscope": "primary", "primary": "primary",
+    "mimo": "secondary", "secondary": "secondary",
+    "openlux": "tertiary", "tertiary": "tertiary",
+    "ark": "quaternary", "quaternary": "quaternary",
+    "metaspark": "quinary", "quinary": "quinary",
+    "deepseek": "senary", "senary": "senary",
+}
+
+
+def split_provider_prefix(model: str) -> tuple:
+    """Split optional '<provider>/<model>' prefix. Returns (provider_or_None, bare_model)."""
+    if "/" not in model:
+        return None, model
+    head, _, tail = model.partition("/")
+    provider = PROVIDER_SLUG_MAP.get(head.lower())
+    if provider is None or not tail:
+        return None, model
+    return provider, normalize_model_name(tail)
+
+
 def _is_chat_endpoint(path: str) -> bool:
     """Check if path is a chat completion endpoint."""
     return "chat/completions" in path.lower()
