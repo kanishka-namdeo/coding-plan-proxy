@@ -38,11 +38,26 @@ This directory owns all proxy core logic. The root `dashscope_proxy.py` facade r
 
 - **Test patching convention**: tests patch `dashscope_proxy.CONSTANT` (facade), so modules must resolve constants via `_cfg("CONSTANT")` which reads from the facade at runtime. Direct imports like `from dashscope_proxy_lib.config import CONSTANT` break test patching.
 
+- **Provider naming convention**: When adding a new provider, assign a **provider slug** — a short, lowercase, hyphen-free identifier used in the `<provider>/<model>` pin syntax (e.g., `openlux`, `deepseek`). Slugs must be added to `PROVIDER_SLUGS` in `config.py` (slug → canonical provider name like `tertiary`) and `PROVIDER_SLUG_MAP` in `request_transform.py` (slug + canonical name → canonical name for both). Clients use `<slug>/<model>` to pin a provider; the slug is stripped before forwarding upstream. Avoid ambiguous names; prefer provider-specific identifiers over generic terms.
+
 ## Work Guidance
 
 - All proxy logic belongs here; do not add proxy logic to root-level files
 - When adding a new constant, add it to `config.py` and resolve via `_cfg()` in handlers/helpers
-- When adding a new provider, update: `config.py` (API key, base URL, rate limit config, models), `provider_router.py` (build function, cfg helper, ProviderConfig, routing logic), `server.py` (import config, pass to MultiProviderRateLimiter), `proxy_tui.py` (UI section), `dashscope_proxy.py` (re-export constants), and `tests/` (coverage)
+- When adding a new provider:
+  1. Define a **provider slug** (short, lowercase, no hyphens) in `config.py` → `PROVIDER_SLUGS` dict
+  2. Add slug + canonical name to `request_transform.py` → `PROVIDER_SLUG_MAP` dict
+  3. Update `config.py`: API key env var, base URL env var, rate limit config, model list constant
+  4. Update `provider_router.py`: build function for model IDs, cfg helper, `ProviderConfig` in `__init__`, routing priority in `get_provider_for_model`
+  5. Update `server.py`: import new rate limit config, pass to `MultiProviderRateLimiter` constructor
+  6. Update `proxy_tui.py`: add UI section for the new provider's metrics
+  7. Update `dashscope_proxy.py`: re-export new config constants
+  8. Update `tests/`: add unit tests for routing, integration tests for forwarding
+  9. Update `.env.example`: document new env vars with the provider slug
+- When adding a new model to an existing provider:
+  1. Add model ID to the appropriate model list constant in `config.py` (e.g., `TERTIARY_MODELS`)
+  2. Model will automatically appear in `/v1/models` with `providers` and `provider_models` fields
+  3. No slug changes needed — use the existing provider slug in `provider_models` field
 - Session log format: JSON lines with `request_id`, `timestamp`, `model`, `is_stream`, `request_body`, `response_status`, `response_body`, `tokens`, `latency`, `provider`
 - Logging: use `_log(level, msg, **extra)` for structured logs with context; TUI consumes via `TUILogHandler`
 
