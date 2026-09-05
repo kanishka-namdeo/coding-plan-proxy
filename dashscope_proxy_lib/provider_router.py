@@ -279,9 +279,9 @@ class ProviderRouter:
         from dashscope_proxy_lib.request_transform import split_provider_prefix
         _, bare = split_provider_prefix(model_name)
         names = list(self._overlap_registry.get(bare, []))
-        order = _cfg("MODEL_FALLBACK_ORDER") or []
-        if order:
-            names.sort(key=lambda n: order.index(n) if n in order else len(order))
+        # Default order: senary→quinary→quaternary→tertiary→secondary→primary
+        order = _cfg("MODEL_FALLBACK_ORDER") or ["senary", "quinary", "quaternary", "tertiary", "secondary", "primary"]
+        names.sort(key=lambda n: order.index(n) if n in order else len(order))
         return [getattr(self, n) for n in names]
 
     def get_model_overlaps(self) -> dict:

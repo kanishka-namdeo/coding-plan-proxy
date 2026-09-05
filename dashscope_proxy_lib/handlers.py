@@ -249,9 +249,15 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         session_entry["status_code"] = status_code
         session_entry["error_reason"] = error_reason
         await _maybe_flush_session_log(request.app, session_entry)
+        # Provide list of valid provider slugs as hint
+        provider_slugs = list(_cfg("PROVIDER_SLUGS").keys())
         return _make_error_response(
             400,
-            json.dumps({"error": "unknown provider prefix", "model": model_name}).encode(),
+            json.dumps({
+                "error": "unknown provider prefix",
+                "model": model_name,
+                "available_providers": provider_slugs,
+            }).encode(),
             request_id,
         )
     if pinned_name is not None:
@@ -266,9 +272,15 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
             session_entry["status_code"] = status_code
             session_entry["error_reason"] = error_reason
             await _maybe_flush_session_log(request.app, session_entry)
+            # Provide list of valid provider slugs as hint
+            provider_slugs = list(_cfg("PROVIDER_SLUGS").keys())
             return _make_error_response(
                 400,
-                json.dumps({"error": f"provider '{pinned_name}' not configured", "model": model_name}).encode(),
+                json.dumps({
+                    "error": f"provider '{pinned_name}' not configured",
+                    "model": model_name,
+                    "available_providers": provider_slugs,
+                }).encode(),
                 request_id,
             )
         model_name = bare_name
