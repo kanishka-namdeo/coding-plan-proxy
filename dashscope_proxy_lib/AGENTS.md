@@ -12,7 +12,7 @@ This directory owns all proxy core logic. The root `dashscope_proxy.py` facade r
 
 - **Facade pattern**: `dashscope_proxy.py` re-exports all public symbols from this lib. Tests patch the facade (e.g., `dashscope_proxy.TARGET_BASE`), so constants must resolve at runtime via `_cfg()` helpers, not at import time.
 - **Module structure**:
-  - `config.py` — configuration constants, environment variables, rate limit defaults, mock models
+  - `config.py` — configuration constants, environment variables, rate limit defaults, mock models; `_load_config()` builds the primary rate-limiter dict; `_load_display_config()` returns TUI Config rows and does not affect limiter construction
   - `rate_limiter.py` — `SlidingWindowCounter`, `TokenWindowCounter`, `RateLimiter`, `MultiProviderRateLimiter`
   - `queue.py` — `wait_for_slot()` deadline-bounded queue wait with client disconnect detection
   - `handlers.py` — `handle_request()` main request handler with retry logic, streaming, session logging

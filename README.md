@@ -21,13 +21,13 @@ Run the proxy to launch the interactive TUI dashboard. Monitor rate limits, quot
 
 ### Overview Tab
 
-Real-time rate limiter status, RPM/TPM/quotas with progress bars, connection status, request statistics with success rate, and live log feed.
+Real-time rate limiter status, RPM/TPM/quotas with progress bars, connection status, and request statistics (success rate, rejected, pending/max queue). Non-primary providers appear as soon as they are configured, including at zero traffic. Live log feed of warnings and errors.
 
 ![Overview](screenshots/overview.svg)
 
 ### Metrics Tab
 
-Sparkline charts for RPM, tokens-per-minute, and queue depth. Derived metrics (success rate, latency percentiles), latency histogram, and quota reset timers.
+Sparkline charts for RPM, tokens-per-minute, queue depth, and upstream latency. Derived metrics (success rate, latency percentiles), failover events, and a latency histogram.
 
 ![Metrics](screenshots/metrics.svg)
 
@@ -45,7 +45,7 @@ Per-model usage breakdown: request count with percentage, tokens, 429 errors, av
 
 ### Config Tab
 
-Configuration viewer with filter, grouped view toggle, and source indicator (environment vs default).
+Grouped network, timeout, connection, buffering, logging, and per-provider limit blocks. Filter by key; source column shows env vs default.
 
 ![Config](screenshots/config.svg)
 
