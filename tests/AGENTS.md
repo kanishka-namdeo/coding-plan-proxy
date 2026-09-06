@@ -11,7 +11,7 @@ This directory owns all test code. Test fixtures and configuration live in `conf
 ## Local Contracts
 
 - **Test layers**:
-  - `test_units.py` — unit tests for `SlidingWindowCounter`, `TokenWindowCounter`, `RateLimiter`, token extraction, request transformation, HTTP helpers, session logging, TUI log handler, provider router, multi-provider rate limiter
+  - `test_units.py` — unit tests for `SlidingWindowCounter`, `TokenWindowCounter`, `RateLimiter`, token extraction, request transformation, HTTP helpers, session logging, TUI log handler, provider router, multi-provider rate limiter, TUI status helpers (`TestTuiStatusHelpers`)
   - `test_integration.py` — integration tests for `handle_request()` with mock upstream servers: API key validation, health/ready endpoints, request validation, proxy forwarding, 429/5xx retries, mock models, proxy status, response headers, queue enforcement, circuit breaker, graceful shutdown, streaming errors, client disconnect, multi-retry scenarios, provider routing
   - `test_e2e_real.py` — end-to-end tests against real DashScope API (requires `DASHSCOPE_API_KEY` in `.env`)
   - `conftest.py` — shared fixtures: `dashscope_module`, `rate_limiter`, `mock_app`, `mock_request`, `make_test_config`, `token_bucket`

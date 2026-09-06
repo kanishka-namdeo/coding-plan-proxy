@@ -1281,6 +1281,7 @@ class TestProviderRouter:
         "gpt-5.6-sol", "gemini-3.7-flash", "gpt-5.6-terra", "qwen3.8-max",
         "qwen3.8-max-0902",
         "gpt-5.6-luna", "gemini-3.8-flash", "grok-4.6", "MiniMax-M3", "mimo-v2.5",
+        "glm-5.3-flash",
     ])
     def test_all_tertiary_models_routed_to_tertiary(self, dashscope_module, monkeypatch, model_id):
         monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-openlux")
@@ -1312,13 +1313,14 @@ class TestProviderRouter:
         assert "mimo-v2.5" in ids
         assert "mimo-v2-5" in ids
 
-    def test_tertiary_model_list_has_nine_models(self, dashscope_module):
+    def test_tertiary_model_list_has_ten_models(self, dashscope_module):
         from dashscope_proxy_lib.config import TERTIARY_MODELS
         model_ids = [m["id"] for m in TERTIARY_MODELS["data"]]
         assert model_ids == [
             "gpt-5.6-sol", "gemini-3.7-flash", "gpt-5.6-terra", "qwen3.8-max",
             "qwen3.8-max-0902",
             "gpt-5.6-luna", "gemini-3.8-flash", "grok-4.6", "MiniMax-M3", "mimo-v2.5",
+            "glm-5.3-flash",
         ]
 
     def test_tertiary_unconfigured_returns_primary_for_tertiary_models(self, dashscope_module, monkeypatch):
@@ -1749,3 +1751,67 @@ class TestPinnedRouting:
         monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "")
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model("openlux/gemini-3.7-flash").name == "primary"
+
+
+# ---------------------------------------------------------------------------
+# TUI status helpers
+# ---------------------------------------------------------------------------
+
+class TestTuiStatusHelpers:
+    def _multi(self, primary_pending=0, global_pending=7, primary_lats=None, all_lats=None):
+        primary = {
+            "rpm_current": 3, "tpm_limit": 100, "tpm_available": 80,
+            "pending_requests": primary_pending,
+            "recent_latencies": primary_lats or [10.0],
+            "total_forwarded": 1, "total_429s": 0, "total_rejected": 0,
+        }
+        return {
+            "primary": primary,
+            "secondary": {"total_forwarded": 2, "rpm_current": 1,
+                          "tpm_limit": 50, "tpm_available": 40,
+                          "recent_latencies": [200.0]},
+            "pending_requests": global_pending,
+            "recent_latencies": all_lats or [10.0, 200.0],
+            "total_forwarded": 3, "total_429s": 1, "total_rejected": 2,
+            "max_queue_size": 500,
+        }
+
+    def test_series_uses_global_pending_not_primary(self):
+        from tui_status import series_from_status
+        s = series_from_status(self._multi(primary_pending=0, global_pending=7))
+        assert s["queue_depth"] == 7
+
+    def test_series_uses_aggregated_latencies(self):
+        from tui_status import series_from_status
+        s = series_from_status(self._multi(primary_lats=[10.0], all_lats=[10.0, 200.0]))
+        assert s["recent_latencies"] == [10.0, 200.0]
+
+    def test_series_flat_single_provider(self):
+        from tui_status import series_from_status
+        flat = {"rpm_current": 2, "tpm_limit": 10, "tpm_available": 4,
+                "pending_requests": 1, "recent_latencies": [5.0]}
+        s = series_from_status(flat)
+        assert s["queue_depth"] == 1
+        assert s["tpm_used"] == 6
+        assert s["rpm"] == 2
+
+    def test_idle_configured_provider_is_visible(self):
+        from tui_status import provider_section_visible
+        assert provider_section_visible({"total_forwarded": 0, "total_429s": 0}) is True
+
+    def test_missing_provider_is_hidden(self):
+        from tui_status import provider_section_visible
+        assert provider_section_visible(None) is False
+
+    def test_failover_alert_without_other_warnings(self):
+        from tui_status import failover_alert_should_show
+        assert failover_alert_should_show([], True) is True
+        assert failover_alert_should_show([], False) is False
+
+    def test_overview_stats_include_rejected_and_success_rate(self):
+        from tui_status import overview_request_stats
+        stats = overview_request_stats(self._multi())
+        assert stats["total_rejected"] == 2
+        assert stats["pending_requests"] == 7
+        assert stats["max_queue_size"] == 500
+        assert abs(stats["success_rate"] - 50.0) < 0.01  # 3/(3+2+1)
