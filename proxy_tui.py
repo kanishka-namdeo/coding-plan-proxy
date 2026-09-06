@@ -605,12 +605,12 @@ class ProxyTUI(App):
             overview.set_class(False, "visible")
             return
 
-        # Only show if provider has served at least one request
-        if provider_status.get("total_forwarded", 0) == 0:
+        from tui_status import provider_section_visible
+        if not provider_section_visible(provider_status):
             overview.set_class(False, "visible")
             return
 
-        # Provider is active - show the section
+        # Provider is configured - show the section even at zero traffic
         overview.set_class(True, "visible")
 
         # Update status line with base URL from config
@@ -627,9 +627,16 @@ class ProxyTUI(App):
             from dashscope_proxy_lib import config as proxy_config
             base_url = getattr(proxy_config, config_key, None)
             base_url_display = base_url or "N/A"
-            status_line.update(f"Status: Active | Target: {base_url_display}")
-            status_line.set_class(True, "status-running")
-            status_line.set_class(False, "status-stopped")
+            forwarded = provider_status.get("total_forwarded", 0)
+            if provider_status.get("circuit_open"):
+                status_prefix = "Status: Circuit OPEN"
+            elif forwarded > 0:
+                status_prefix = "Status: Active"
+            else:
+                status_prefix = "Status: Configured (idle)"
+            status_line.update(f"{status_prefix} | Target: {base_url_display}")
+            status_line.set_class(forwarded > 0, "status-running")
+            status_line.set_class(forwarded == 0, "status-stopped")
 
         # Populate metrics table
         metrics_table.clear()
