@@ -214,10 +214,10 @@ class ProxyTUI(App):
                         for provider_info in PROVIDER_REGISTRY[1:]:  # Skip primary
                             provider_key = provider_info["key"]
                             label = provider_info["label"]
-                            with Vertical(id=f"{provider_key}-overview"):
+                            with Vertical(id=f"{provider_key}-overview", classes="provider-section"):
                                 yield Static(label, classes="panel-title")
-                                yield Static(f"{label}: Not configured", id=f"{provider_key}-status-line")
-                                yield DataTable(id=f"{provider_key}-rl-metrics")
+                                yield Static(f"{label}: Not configured", id=f"{provider_key}-status-line", classes="provider-status")
+                                yield DataTable(id=f"{provider_key}-rl-metrics", classes="provider-metrics")
                         
                         yield Static("", classes="spacer")
                         yield Static("Request Statistics", classes="panel-title")

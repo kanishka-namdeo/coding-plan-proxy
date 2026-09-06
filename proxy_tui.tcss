@@ -12,34 +12,34 @@
 }
 
 /* Dynamic provider sections */
-.Vertical[id$="-overview"] {
+.provider-section {
     display: none;
     margin: 1 0 0 0;
     border-top: heavy $primary 30%;
     padding-top: 1;
 }
 
-.Vertical[id$="-overview"].visible {
+.provider-section.visible {
     display: block;
 }
 
 /* Provider status lines */
-.Static[id$="-status-line"] {
+.provider-status {
     padding: 0 1;
     text-style: bold;
     height: 1;
 }
 
-.Static[id$="-status-line"].status-running {
+.provider-status.status-running {
     color: $success;
 }
 
-.Static[id$="-status-line"].status-stopped {
+.provider-status.status-stopped {
     color: $error;
 }
 
 /* Provider metrics tables */
-DataTable[id$="-rl-metrics"] {
+.provider-metrics {
     height: auto;
 }
 
