@@ -279,6 +279,56 @@ def _load_config() -> dict:
     return base
 
 
+def _env_source(env_names: list[str]) -> str:
+    return "env" if any(n in os.environ for n in env_names) else "default"
+
+
+def _load_display_config() -> list[tuple[str, str, str, str]]:
+    """Rows for the TUI Config tab. Does not affect rate-limiter construction."""
+    from dashscope_proxy_lib.session_log import SESSION_LOG_DIR, SESSION_LOG_ENABLED
+
+    rows: list[tuple[str, str, str, str]] = []
+
+    def add(group, key, value, env_names):
+        rows.append((group, key, str(value), _env_source(env_names)))
+
+    add("Network", "proxy_host", os.environ.get("DASHSCOPE_PROXY_HOST", PROXY_HOST), ["DASHSCOPE_PROXY_HOST"])
+    add("Network", "proxy_port", os.environ.get("DASHSCOPE_PROXY_PORT", PROXY_PORT), ["DASHSCOPE_PROXY_PORT"])
+    add("Network", "target_base", os.environ.get("TARGET_BASE", TARGET_BASE), ["TARGET_BASE"])
+    add("Timeouts", "upstream_timeout_total", os.environ.get("UPSTREAM_TIMEOUT_TOTAL", UPSTREAM_TIMEOUT_TOTAL), ["UPSTREAM_TIMEOUT_TOTAL"])
+    add("Timeouts", "upstream_timeout_connect", os.environ.get("UPSTREAM_TIMEOUT_CONNECT", UPSTREAM_TIMEOUT_CONNECT), ["UPSTREAM_TIMEOUT_CONNECT"])
+    add("Connection", "max_connections", os.environ.get("MAX_CONNECTIONS", MAX_CONNECTIONS), ["MAX_CONNECTIONS"])
+    add("Connection", "max_connections_per_host", os.environ.get("MAX_CONNECTIONS_PER_HOST", MAX_CONNECTIONS_PER_HOST), ["MAX_CONNECTIONS_PER_HOST"])
+    add("Buffering", "max_body_size", os.environ.get("MAX_BODY_SIZE", MAX_BODY_SIZE), ["MAX_BODY_SIZE"])
+    add("Buffering", "max_stream_buffer", os.environ.get("MAX_STREAM_BUFFER", MAX_STREAM_BUFFER), ["MAX_STREAM_BUFFER"])
+    add("Buffering", "max_5xx_retries", os.environ.get("MAX_5XX_RETRIES", MAX_5XX_RETRIES), ["MAX_5XX_RETRIES"])
+    add("Logging", "log_level", os.environ.get("LOG_LEVEL", LOG_LEVEL), ["LOG_LEVEL"])
+    add("Logging", "log_buffer_size", os.environ.get("LOG_BUFFER_SIZE", LOG_BUFFER_SIZE), ["LOG_BUFFER_SIZE"])
+    add("Logging", "session_log_enabled", os.environ.get("SESSION_LOG_ENABLED", SESSION_LOG_ENABLED), ["SESSION_LOG_ENABLED"])
+    add("Logging", "session_log_dir", os.environ.get("SESSION_LOG_DIR", SESSION_LOG_DIR), ["SESSION_LOG_DIR"])
+
+    provider_cfgs = [
+        ("Primary Limits", CODING_PLAN_CONFIG, "PROXY_"),
+        ("MIMO Limits", SECONDARY_CODING_PLAN_CONFIG, "SECONDARY_"),
+        ("OpenLux Limits", TERTIARY_CODING_PLAN_CONFIG, "TERTIARY_"),
+        ("ARK Limits", QUATERNARY_CODING_PLAN_CONFIG, "QUATERNARY_"),
+        ("Meta AI Limits", QUINARY_CODING_PLAN_CONFIG, "QUINARY_"),
+        ("DeepSeek Limits", SENARY_CODING_PLAN_CONFIG, "SENARY_"),
+    ]
+    for group, cfg, prefix in provider_cfgs:
+        for key, value in cfg.items():
+            add(group, f"{group.split()[0].lower()}.{key}" if group != "Primary Limits" else key,
+                value, [f"{prefix}{key.upper()}"])
+
+    add("Providers", "secondary_base_url", SECONDARY_BASE_URL or "(unset)", ["MIMO_CODING_PLAN_TARGET_BASE"])
+    add("Providers", "tertiary_base_url", TERTIARY_BASE_URL or "(unset)", ["OPENLUX_TARGET_BASE"])
+    add("Providers", "quaternary_base_url", QUATERNARY_BASE_URL or "(unset)", ["MODEL_ARK_TARGET_BASE"])
+    add("Providers", "quinary_base_url", QUINARY_BASE_URL or "(unset)", ["META_AI_TARGET_BASE"])
+    add("Providers", "senary_base_url", SENARY_BASE_URL or "(unset)", ["DEEPSEEK_TARGET_BASE"])
+    add("Providers", "model_fallback_order", ",".join(MODEL_FALLBACK_ORDER) or "(default)", ["MODEL_FALLBACK_ORDER"])
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Mock models for /v1/models endpoint
 # ---------------------------------------------------------------------------

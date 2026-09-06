@@ -77,6 +77,7 @@ from dashscope_proxy_lib.config import (
     MODEL_FALLBACK_ORDER,
     MODEL_PROVIDER_MAP,
     _load_config,
+    _load_display_config,
 )
 
 # --- logging -----------------------------------------------------------------
@@ -169,7 +170,7 @@ __all__ = [
     "QUINARY_API_KEY", "QUINARY_BASE_URL", "QUINARY_CODING_PLAN_CONFIG", "QUINARY_MODELS",
     "SENARY_API_KEY", "SENARY_BASE_URL", "SENARY_CODING_PLAN_CONFIG", "SENARY_MODELS",
     "PROVIDER_SLUGS", "MODEL_FALLBACK_ORDER", "MODEL_PROVIDER_MAP",
-    "_load_config",
+    "_load_config", "_load_display_config",
     # logging
     "LOG_LEVEL", "LOG_BUFFER_SIZE",
     "StructuredLogFormatter", "TUILogHandler", "_log", "logger", "tui_handler",

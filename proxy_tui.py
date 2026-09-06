@@ -17,7 +17,7 @@ from textual.worker import Worker, get_current_worker
 from textual.css.query import NoMatches
 
 # Import proxy components for shared state
-from dashscope_proxy_lib.config import _load_config
+from dashscope_proxy_lib.config import _load_display_config
 from dashscope_proxy_lib.rate_limiter import RateLimiter
 from dashscope_proxy_lib.logging_config import TUILogHandler
 
@@ -158,7 +158,7 @@ class ProxyTUI(App):
         self.proxy_app = proxy_app
         self.history = MetricHistory()
         self.latency_tracker = LatencyTracker()
-        self._config_snapshot: dict = {}
+        self._config_rows: list[tuple[str, str, str, str]] = []
 
         # Logs tab state
         self._logs_paused: bool = False
@@ -306,7 +306,7 @@ class ProxyTUI(App):
 
     async def on_mount(self) -> None:
         """Initialize data tables and start background polling."""
-        self._config_snapshot = _load_config()
+        self._config_rows = _load_display_config()
 
         # Configure rate limiter metrics table
         rl_table = self.query_one("#rl-metrics", DataTable)
@@ -355,11 +355,7 @@ class ProxyTUI(App):
 
     def _populate_config_table(self, table: DataTable) -> None:
         """Populate the config table with current configuration."""
-        table.clear()
-        env_prefix = "PROXY_"
-        for key, value in sorted(self._config_snapshot.items()):
-            source = "env" if env_prefix + key.upper() in __import__("os").environ else "default"
-            table.add_row(key, str(value), source)
+        self._update_config_table_filtered()
 
     def _poll_loop(self) -> None:
         """Threaded loop that polls rate limiter and log handler with adaptive timing."""
@@ -1185,59 +1181,20 @@ class ProxyTUI(App):
             return
 
         table.clear()
-        import os
-        
-        # Group config keys
-        config_groups = {
-            "Rate Limits": ["rpm_limit", "tpm_limit", "rps_limit", "requests_per_week", "requests_per_month", "requests_per_5h", "safety_factor"],
-            "Timeouts": ["upstream_timeout_total", "upstream_timeout_connect"],
-            "Connection": ["max_connections", "max_connections_per_host"],
-            "Buffering": ["max_body_size", "max_stream_buffer", "max_queue_size", "max_retries", "base_backoff", "deque_max_size"],
-            "Logging": ["log_level", "log_buffer_size"],
-        }
-        
-        # Detect env var source for a config key
-        def _env_source(key: str) -> str:
-            if f"PROXY_{key.upper()}" in os.environ:
-                return "env"
-            if f"SECONDARY_{key.upper()}" in os.environ:
-                return "env"
-            if f"MIMO_CODING_PLAN_{key.upper()}" in os.environ:
-                return "env"
-            if f"OPENLUX_{key.upper()}" in os.environ:
-                return "env"
-            if f"MODEL_ARK_{key.upper()}" in os.environ:
-                return "env"
-            if f"QUINARY_{key.upper()}" in os.environ:
-                return "env"
-            return "default"
-        
-        ungrouped_keys = []
-        for key, value in sorted(self._config_snapshot.items()):
-            source = _env_source(key)
-            if self._config_filter and self._config_filter.lower() not in key.lower():
-                continue
-            ungrouped_keys.append((key, str(value), source))
-        
+        filtered = [
+            row for row in self._config_rows
+            if not self._config_filter or self._config_filter.lower() in row[1].lower()
+        ]
+
         if self._config_grouped:
-            # Show grouped view
-            shown_keys = set()
-            for group_name, group_keys in config_groups.items():
-                group_items = [(k, v, s) for k, v, s in ungrouped_keys if k in group_keys]
-                if group_items:
-                    table.add_row(f"--- {group_name} ---", "", "")
-                    for key, value, source in group_items:
-                        table.add_row(key, value, source)
-                        shown_keys.add(key)
-            
-            # Show remaining ungrouped keys
-            remaining = [(k, v, s) for k, v, s in ungrouped_keys if k not in shown_keys]
-            if remaining:
-                table.add_row("--- Other ---", "", "")
-                for key, value, source in remaining:
-                    table.add_row(key, value, source)
+            current_group = None
+            for group, key, value, source in filtered:
+                if group != current_group:
+                    table.add_row(f"--- {group} ---", "", "")
+                    current_group = group
+                table.add_row(key, value, source)
         else:
-            for key, value, source in ungrouped_keys:
+            for group, key, value, source in sorted(filtered, key=lambda r: r[1]):
                 table.add_row(key, value, source)
 
     def _update_log_entry_count(self) -> None:
@@ -1381,7 +1338,7 @@ class ProxyTUI(App):
             event.button.label = "Auto-scroll: ON" if self._autoscroll_enabled else "Auto-scroll: OFF"
             event.button.variant = "primary" if self._autoscroll_enabled else "default"
         elif event.button.id == "config-refresh-btn":
-            self._config_snapshot = _load_config()
+            self._config_rows = _load_display_config()
             self._update_config_table_filtered()
         elif event.button.id == "config-grouped-btn":
             self._config_grouped = not self._config_grouped

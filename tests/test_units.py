@@ -1160,6 +1160,22 @@ class TestLoadConfig:
         assert config["rpm_limit"] == dashscope_module.CODING_PLAN_CONFIG["rpm_limit"]
 
 
+class TestLoadDisplayConfig:
+    def test_includes_network_and_provider_groups(self, dashscope_module, monkeypatch):
+        monkeypatch.setenv("DASHSCOPE_PROXY_PORT", "9999")
+        rows = dashscope_module._load_display_config()
+        keys = {r[1] for r in rows}
+        groups = {r[0] for r in rows}
+        assert "proxy_port" in keys
+        assert "upstream_timeout_total" in keys
+        assert "log_level" in keys
+        assert "Network" in groups
+        assert "Primary Limits" in groups
+        port_row = next(r for r in rows if r[1] == "proxy_port")
+        assert port_row[2] == "9999"
+        assert port_row[3] == "env"
+
+
 # ---------------------------------------------------------------------------
 # ProviderRouter
 # ---------------------------------------------------------------------------
