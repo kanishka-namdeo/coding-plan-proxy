@@ -1566,6 +1566,15 @@ class TestMultiProviderRateLimiter:
         assert status["tertiary"] is None
         assert status["quaternary"] is None
 
+    def test_status_includes_global_pending_and_max_queue(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), self._make_config())
+        mpl.pending_requests = 4
+        status = mpl.status()
+        assert status["pending_requests"] == 4
+        assert status["primary"]["pending_requests"] == 0
+        assert status["max_queue_size"] == mpl.max_queue_size
+        assert status["primary"]["max_queue_size"] == mpl.max_queue_size
+
     def test_status_shows_secondary_when_configured(self, dashscope_module):
         mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), self._make_config())
         status = mpl.status()

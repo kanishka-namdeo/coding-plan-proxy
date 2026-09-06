@@ -448,6 +448,7 @@ class RateLimiter:
             "total_request_bytes": total_request_bytes,
             "total_response_bytes": total_response_bytes,
             "pending_requests": pending_requests,
+            "max_queue_size": self.max_queue_size,
             "circuit_open": circuit_open,
             "circuit_failure_count": circuit_failure_count,
             "model_usage": model_usage_snapshot,
@@ -747,6 +748,7 @@ class MultiProviderRateLimiter:
         result["model_usage"] = merged_model_usage
         result["recent_latencies"] = combined_recent_latencies
         result["pending_requests"] = self._pending_requests
+        result["max_queue_size"] = self.max_queue_size
         result["queue_drops"] = primary_status.get("queue_drops", 0)
         result["uptime_seconds"] = primary_status.get("uptime_seconds", 0.0)
 
