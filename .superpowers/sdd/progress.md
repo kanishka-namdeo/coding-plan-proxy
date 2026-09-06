@@ -9,14 +9,14 @@ Previous ledger entries below were for the earlier TUI provider-support plan and
 
 ## Tasks (this plan)
 
-- Task 1: complete (commits 0e7a264..642e497, TDD RED then GREEN, 7/7 TestTuiStatusHelpers)
-- Task 2: pending (export max_queue_size on status())
-- Task 3: pending (poller uses envelope series)
-- Task 4: pending (show configured providers at zero traffic)
-- Task 5: pending (ungate failover alerts + Overview stats)
-- Task 6: pending (real Config display surface)
-- Task 7: pending (honor auto-scroll; drop dead helpers)
-- Task 8: pending (README + DOX + full unit/integration suite)
+- Task 1: complete (commits 0e7a264..642e497, TDD RED ModuleNotFoundError then GREEN 7/7 TestTuiStatusHelpers)
+- Task 2: complete (commits 642e497..5c8a836, TDD RED KeyError: max_queue_size then GREEN)
+- Task 3: complete (commits 5c8a836..1460787, poller uses series_from_status; note extra 8f6b13d sits between 5c8a836 and 1460787)
+- Task 4: complete (commits 1460787..8d33c36, idle configured providers visible)
+- Task 5: complete (commits 8d33c36..989f6c6, failover ungated + Overview rejected/pending/success)
+- Task 6: complete (commits 989f6c6..d45e80e, TDD RED AttributeError then GREEN TestLoadDisplayConfig + TestLoadConfig)
+- Task 7: complete (commits d45e80e..7e48261, auto-scroll + dead helpers removed)
+- Task 8: complete (commits 7e48261..9f9e7ba, README + DOX; 278 passed unit+integration)
 
 ---
 
