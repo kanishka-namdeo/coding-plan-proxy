@@ -88,10 +88,6 @@ class LatencyTracker:
         if len(self.latencies) > self.max_length:
             self.latencies = self.latencies[-self.max_length:]
 
-    def add_batch(self, values: list[float]):
-        for v in values:
-            self.add(v)
-
     def _percentile(self, p: float) -> float:
         if not self.latencies:
             return 0.0
@@ -173,9 +169,6 @@ class ProxyTUI(App):
         # Config tab state
         self._config_filter: str = ""
         self._config_grouped: bool = False
-
-        # Alert tracking
-        self._active_alerts: list[dict] = []
 
         # Cancellable sleep for the poll worker
         self._shutdown_event = threading.Event()
@@ -807,6 +800,9 @@ class ProxyTUI(App):
         except NoMatches:
             return 0
 
+        if widget_id == "#live-log-full":
+            log_widget.auto_scroll = self._autoscroll_enabled
+
         seq = self._log_seqs.get(widget_id, 0)
         new_entries = self.log_handler.get_logs(limit=50, from_seq=seq)
         written_count = 0
@@ -1290,18 +1286,6 @@ class ProxyTUI(App):
         mins = minutes % 60
         return f"{hours}h {mins}m"
 
-    def _fmt_time_delta(self, seconds: float) -> str:
-        """Format a time delta as human-readable string."""
-        if seconds < 60:
-            return f"{int(seconds)}s"
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        if minutes < 60:
-            return f"{minutes}m {secs}s"
-        hours = minutes // 60
-        mins = minutes % 60
-        return f"{hours}h {mins}m"
-
     def action_clear_logs(self) -> None:
         """Clear all log feeds."""
         for widget_id in ["#live-log", "#live-log-full"]:
@@ -1337,6 +1321,10 @@ class ProxyTUI(App):
             self._autoscroll_enabled = not self._autoscroll_enabled
             event.button.label = "Auto-scroll: ON" if self._autoscroll_enabled else "Auto-scroll: OFF"
             event.button.variant = "primary" if self._autoscroll_enabled else "default"
+            try:
+                self.query_one("#live-log-full", Log).auto_scroll = self._autoscroll_enabled
+            except NoMatches:
+                pass
         elif event.button.id == "config-refresh-btn":
             self._config_rows = _load_display_config()
             self._update_config_table_filtered()
