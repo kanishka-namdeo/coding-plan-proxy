@@ -489,6 +489,8 @@ class MultiProviderRateLimiter:
         secondary_config: dict | None = None,
         tertiary_config: dict | None = None,
         quaternary_config: dict | None = None,
+        quinary_config: dict | None = None,
+        senary_config: dict | None = None,
     ):
         self.primary = RateLimiter(primary_config)
         self.primary_config = primary_config
@@ -501,6 +503,12 @@ class MultiProviderRateLimiter:
 
         self.quaternary: RateLimiter | None = None
         self.quaternary_config = quaternary_config
+
+        self.quinary: RateLimiter | None = None
+        self.quinary_config = quinary_config
+
+        self.senary: RateLimiter | None = None
+        self.senary_config = senary_config
 
         if secondary_config:
             self.secondary = RateLimiter(secondary_config)
@@ -538,12 +546,40 @@ class MultiProviderRateLimiter:
             else:
                 _log(logging.INFO, "quaternary rate limiter created with shared limits")
 
+        if quinary_config:
+            self.quinary = RateLimiter(quinary_config)
+            limits_differ = any(
+                primary_config.get(k) != quinary_config.get(k)
+                for k in ["rpm_limit", "tpm_limit", "requests_per_5h",
+                         "requests_per_week", "requests_per_month"]
+            )
+            if limits_differ:
+                _log(logging.INFO, "quinary rate limiter created with independent limits")
+            else:
+                _log(logging.INFO, "quinary rate limiter created with shared limits")
+
+        if senary_config:
+            self.senary = RateLimiter(senary_config)
+            limits_differ = any(
+                primary_config.get(k) != senary_config.get(k)
+                for k in ["rpm_limit", "tpm_limit", "requests_per_5h",
+                         "requests_per_week", "requests_per_month"]
+            )
+            if limits_differ:
+                _log(logging.INFO, "senary rate limiter created with independent limits")
+            else:
+                _log(logging.INFO, "senary rate limiter created with shared limits")
+
         # Global pending request counter (shared across providers for queue management)
         self._pending_requests = 0
         self._pending_lock = asyncio.Lock()  # Protects _pending_requests from concurrent modification
 
     def get_limiter_for_provider(self, provider_name: str) -> RateLimiter:
         """Get the appropriate rate limiter for a provider."""
+        if provider_name == "senary" and self.senary:
+            return self.senary
+        if provider_name == "quinary" and self.quinary:
+            return self.quinary
         if provider_name == "quaternary" and self.quaternary:
             return self.quaternary
         if provider_name == "tertiary" and self.tertiary:
@@ -585,6 +621,10 @@ class MultiProviderRateLimiter:
             self.tertiary.max_queue_size = value
         if self.quaternary:
             self.quaternary.max_queue_size = value
+        if self.quinary:
+            self.quinary.max_queue_size = value
+        if self.senary:
+            self.senary.max_queue_size = value
 
     def is_queue_full(self) -> bool:
         return self._pending_requests > self.primary.max_queue_size
@@ -670,12 +710,14 @@ class MultiProviderRateLimiter:
         primary_status = self.primary.status()
         result = {
             "primary": primary_status,
-            "shared_limits": self.secondary is None and self.tertiary is None and self.quaternary is None,
+            "shared_limits": self.secondary is None and self.tertiary is None and self.quaternary is None and self.quinary is None and self.senary is None,
         }
 
         secondary_status = self.secondary.status() if self.secondary else None
         tertiary_status = self.tertiary.status() if self.tertiary else None
         quaternary_status = self.quaternary.status() if self.quaternary else None
+        quinary_status = self.quinary.status() if self.quinary else None
+        senary_status = self.senary.status() if self.senary else None
 
         if self.secondary:
             result["secondary"] = secondary_status
@@ -692,6 +734,16 @@ class MultiProviderRateLimiter:
         else:
             result["quaternary"] = None
 
+        if self.quinary:
+            result["quinary"] = quinary_status
+        else:
+            result["quinary"] = None
+
+        if self.senary:
+            result["senary"] = senary_status
+        else:
+            result["senary"] = None
+
         # Aggregate stats across all providers (using thread-safe status dicts)
         all_statuses = [primary_status]
         if secondary_status:
@@ -700,6 +752,10 @@ class MultiProviderRateLimiter:
             all_statuses.append(tertiary_status)
         if quaternary_status:
             all_statuses.append(quaternary_status)
+        if quinary_status:
+            all_statuses.append(quinary_status)
+        if senary_status:
+            all_statuses.append(senary_status)
 
         # Sum counters across all providers
         total_forwarded = sum(s.get("total_forwarded", 0) for s in all_statuses)

@@ -54,8 +54,8 @@ Configuration viewer with filter, grouped view toggle, and source indicator (env
 | Key | Action |
 |-----|--------|
 | `1` | Overview tab |
-| `2` | Metrics tab |
-| `3` | Logs tab |
+| `2` | Logs tab |
+| `3` | Metrics tab |
 | `4` | Models tab |
 | `5` | Config tab |
 | `r` | Clear logs |
@@ -122,13 +122,13 @@ Five-tab dashboard with live metrics, sparkline charts, log viewer with filters,
 
 ## Configuration
 
-Tweak `CODING_PLAN_CONFIG` in `dashscope_proxy.py` to match your plan:
+Tweak `CODING_PLAN_CONFIG` in `dashscope_proxy_lib/config.py` to match your plan:
 
 | Setting | Default | Description |
 |---|---|---|
-| `rpm_limit` | 12 | Max requests per minute (before safety factor) |
-| `tpm_limit` | 2,000,000 | Max tokens per minute |
-| `safety_factor` | 0.6 | Multiply all limits by this (0.6 = leave 40% headroom) |
+| `rpm_limit` | 9 | Max requests per minute (before safety factor) |
+| `tpm_limit` | 4,000,000 | Max tokens per minute |
+| `safety_factor` | 0.8 | Multiply all limits by this (0.8 = leave 20% headroom) |
 | `requests_per_5h` | 6000 | Rolling 5-hour request cap |
 | `requests_per_week` | 45000 | Weekly request cap |
 | `requests_per_month` | 90000 | Monthly request cap |

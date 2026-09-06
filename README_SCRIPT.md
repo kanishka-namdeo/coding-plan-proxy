@@ -198,6 +198,8 @@ The proxy supports multiple upstream providers:
 - **Secondary**: MIMO Coding Plan (optional)
 - **Tertiary**: OpenLux (optional)
 - **Quaternary**: ARK/BytePlus (optional)
+- **Quinary**: Meta AI / Muse Spark (optional)
+- **Senary**: DeepSeek (optional)
 
 Configure additional providers in `.env` to enable automatic routing based on model name.
 

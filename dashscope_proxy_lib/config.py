@@ -319,6 +319,7 @@ TERTIARY_MODELS = {
         {"id": "grok-4.6", "object": "model"},
         {"id": "MiniMax-M3", "object": "model"},
         {"id": "mimo-v2.5", "object": "model"},
+        {"id": "glm-5.3-flash", "object": "model"},
     ]
 }
 

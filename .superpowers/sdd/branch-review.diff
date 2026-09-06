@@ -1,0 +1,1088 @@
+﻿diff --git a/proxy_tui.py b/proxy_tui.py
+index 6d25c9d..da39575 100644
+--- a/proxy_tui.py
++++ b/proxy_tui.py
+@@ -21,6 +21,16 @@ from dashscope_proxy_lib.config import _load_config
+ from dashscope_proxy_lib.rate_limiter import RateLimiter
+ from dashscope_proxy_lib.logging_config import TUILogHandler
+ 
++# Provider registry for dynamic UI rendering
++PROVIDER_REGISTRY = [
++    {"key": "primary", "label": "DashScope", "slug": "dashscope", "config_key": "TARGET_BASE"},
++    {"key": "secondary", "label": "MIMO", "slug": "mimo", "config_key": "SECONDARY_BASE_URL"},
++    {"key": "tertiary", "label": "OpenLux", "slug": "openlux", "config_key": "TERTIARY_BASE_URL"},
++    {"key": "quaternary", "label": "ARK", "slug": "ark", "config_key": "QUATERNARY_BASE_URL"},
++    {"key": "quinary", "label": "Meta AI", "slug": "metaspark", "config_key": "QUINARY_BASE_URL"},
++    {"key": "senary", "label": "DeepSeek", "slug": "deepseek", "config_key": "SENARY_BASE_URL"},
++]
++
+ 
+ def _fmt_number(n: int) -> str:
+     """Format large numbers with suffixes."""
+@@ -200,23 +210,14 @@ class ProxyTUI(App):
+                         yield Static("Rate Limiter", classes="panel-title")
+                         yield DataTable(id="rl-metrics")
+                         
+-                        # Secondary provider section (hidden by default, shown when configured)
+-                        with Vertical(id="secondary-overview"):
+-                            yield Static("Secondary Provider", classes="panel-title")
+-                            yield Static("Secondary: Not configured", id="secondary-status-line")
+-                            yield DataTable(id="secondary-rl-metrics")
+-
+-                        # Tertiary provider section (OpenLux, hidden by default)
+-                        with Vertical(id="tertiary-overview"):
+-                            yield Static("OpenLux", classes="panel-title")
+-                            yield Static("OpenLux: Not configured", id="tertiary-status-line")
+-                            yield DataTable(id="tertiary-rl-metrics")
+-
+-                        # Quaternary provider section (ARK, hidden by default)
+-                        with Vertical(id="quaternary-overview"):
+-                            yield Static("ARK", classes="panel-title")
+-                            yield Static("ARK: Not configured", id="quaternary-status-line")
+-                            yield DataTable(id="quaternary-rl-metrics")
++                        # Dynamic provider sections (secondary through senary)
++                        for provider_info in PROVIDER_REGISTRY[1:]:  # Skip primary
++                            provider_key = provider_info["key"]
++                            label = provider_info["label"]
++                            with Vertical(id=f"{provider_key}-overview"):
++                                yield Static(label, classes="panel-title")
++                                yield Static(f"{label}: Not configured", id=f"{provider_key}-status-line")
++                                yield DataTable(id=f"{provider_key}-rl-metrics")
+                         
+                         yield Static("", classes="spacer")
+                         yield Static("Request Statistics", classes="panel-title")
+@@ -270,6 +271,8 @@ class ProxyTUI(App):
+                         Sparkline([], id="upstream-latency-sparkline"),
+                         id="sparkline-row",
+                     )
++                    yield Static("Failover Events", classes="panel-title")
++                    yield Static("", id="failover-events-panel", classes="failover-panel")
+                     yield Static("", id="latency-histogram-panel", classes="histogram-panel")
+                     yield Static("", id="poll-error-banner", classes="poll-error")
+ 
+@@ -320,7 +323,7 @@ class ProxyTUI(App):
+         # Configure model usage table
+         try:
+             model_table = self.query_one("#model-usage-table", DataTable)
+-            model_table.add_columns("Model", "Provider", "Requests", "Tokens", "429s", "Avg Latency", "p50", "p95")
++            model_table.add_columns("Model", "Providers", "Requests", "Tokens", "429s", "Avg Latency", "p50", "p95")
+             model_table.show_header = True
+             model_table.zebra_stripes = True
+         except NoMatches:
+@@ -336,32 +339,16 @@ class ProxyTUI(App):
+         except NoMatches:
+             pass
+ 
+-        # Configure secondary metrics table (in Overview tab)
+-        try:
+-            secondary_table = self.query_one("#secondary-rl-metrics", DataTable)
+-            secondary_table.add_columns("Metric", "Value")
+-            secondary_table.show_header = False
+-            secondary_table.zebra_stripes = True
+-        except NoMatches:
+-            pass
+-
+-        # Configure tertiary (OpenLux) metrics table (in Overview tab)
+-        try:
+-            tertiary_table = self.query_one("#tertiary-rl-metrics", DataTable)
+-            tertiary_table.add_columns("Metric", "Value")
+-            tertiary_table.show_header = False
+-            tertiary_table.zebra_stripes = True
+-        except NoMatches:
+-            pass
+-
+-        # Configure quaternary (ARK) metrics table (in Overview tab)
+-        try:
+-            quaternary_table = self.query_one("#quaternary-rl-metrics", DataTable)
+-            quaternary_table.add_columns("Metric", "Value")
+-            quaternary_table.show_header = False
+-            quaternary_table.zebra_stripes = True
+-        except NoMatches:
+-            pass
++        # Configure dynamic provider metrics tables
++        for provider_info in PROVIDER_REGISTRY[1:]:  # Skip primary
++            provider_key = provider_info["key"]
++            try:
++                table = self.query_one(f"#{provider_key}-rl-metrics", DataTable)
++                table.add_columns("Metric", "Value")
++                table.show_header = False
++                table.zebra_stripes = True
++            except NoMatches:
++                pass
+ 
+         # Start background polling in a thread
+         self.run_worker(self._poll_loop, exclusive=True, thread=True, description="metrics poller")
+@@ -422,12 +409,13 @@ class ProxyTUI(App):
+                 self.call_from_thread(self._poll_logs)
+                 self.call_from_thread(self._update_sparklines)
+                 self.call_from_thread(self._update_derived_metrics, raw_status)
++                self.call_from_thread(self._update_failover_panel)
+                 self.call_from_thread(self._update_latency_histogram)
+                 self.call_from_thread(self._update_model_table, raw_status)
+                 self.call_from_thread(self._update_config_table_filtered)
+-                self.call_from_thread(self._update_secondary_metrics, raw_status)
+-                self.call_from_thread(self._update_tertiary_metrics, raw_status)
+-                self.call_from_thread(self._update_quaternary_metrics, raw_status)
++                # Update all non-primary providers via registry
++                for provider_info in PROVIDER_REGISTRY[1:]:
++                    self.call_from_thread(self._update_provider_metrics, provider_info["key"], raw_status)
+ 
+                 consecutive_errors = 0
+ 
+@@ -556,37 +544,36 @@ class ProxyTUI(App):
+         avg_req_size = _fmt_number(total_request_bytes // total_fwd) if total_fwd > 0 else "0"
+         avg_resp_size = _fmt_number(total_response_bytes // total_fwd) if total_fwd > 0 else "0"
+ 
+-        # Show per-provider breakdown when secondary/tertiary/quaternary are active
++        # Show per-provider breakdown using registry
+         if "primary" in status:
+-            pri_fwd = primary.get("total_forwarded", 0)
+-            total_fwd_all = pri_fwd
+-            stats_table.add_row("Forwarded (Primary)", _fmt_number(pri_fwd))
+-            if status.get("secondary"):
+-                sec = status["secondary"]
+-                sec_fwd = sec.get("total_forwarded", 0)
+-                stats_table.add_row("Forwarded (Secondary)", _fmt_number(sec_fwd))
+-                stats_table.add_row("429s (Secondary)", str(sec.get("total_429s", 0)))
+-                total_fwd_all += sec_fwd
+-            if status.get("tertiary"):
+-                ter = status["tertiary"]
+-                ter_fwd = ter.get("total_forwarded", 0)
+-                stats_table.add_row("Forwarded (OpenLux)", _fmt_number(ter_fwd))
+-                stats_table.add_row("429s (OpenLux)", str(ter.get("total_429s", 0)))
+-                total_fwd_all += ter_fwd
+-            if status.get("quaternary"):
+-                qua = status["quaternary"]
+-                qua_fwd = qua.get("total_forwarded", 0)
+-                stats_table.add_row("Forwarded (ARK)", _fmt_number(qua_fwd))
+-                stats_table.add_row("429s (ARK)", str(qua.get("total_429s", 0)))
+-                total_fwd_all += qua_fwd
++            total_fwd_all = 0
++            has_fallback = False
++            
++            for provider_info in PROVIDER_REGISTRY:
++                provider_key = provider_info["key"]
++                provider_label = provider_info["label"]
++                provider_status = status.get(provider_key)
++                
++                if not provider_status:
++                    continue
++                
++                provider_fwd = provider_status.get("total_forwarded", 0)
++                if provider_fwd == 0:
++                    continue
++                
++                # Determine label prefix: "Primary" for primary, otherwise use label
++                label_prefix = "Primary" if provider_key == "primary" else provider_label
++                stats_table.add_row(f"Forwarded ({label_prefix})", _fmt_number(provider_fwd))
++                stats_table.add_row(f"429s ({label_prefix})", str(provider_status.get("total_429s", 0)))
++                
++                total_fwd_all += provider_fwd
++                if provider_key != "primary":
++                    has_fallback = True
++            
+             # Show aggregate totals when multiple providers are active
+-            has_fallback = status.get("secondary") or status.get("tertiary") or status.get("quaternary")
+             if has_fallback:
+                 stats_table.add_row("Total 429s", str(total_429s))
+                 stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
+-                stats_table.add_row("429s (Primary)", str(primary.get("total_429s", 0)))
+-            else:
+-                stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
+         else:
+             stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
+ 
+@@ -609,6 +596,132 @@ class ProxyTUI(App):
+         else:
+             error_banner.update("")
+ 
++    @_safe_update
++    def _update_provider_metrics(self, provider_key: str, status: dict) -> None:
++        """Update metrics for a single provider.
++        
++        Args:
++            provider_key: Provider key from registry (e.g., "secondary", "senary")
++            status: Raw status dict from MultiProviderRateLimiter.status()
++        """
++        # Query UI elements using provider_key
++        try:
++            overview = self.query_one(f"#{provider_key}-overview", Vertical)
++            status_line = self.query_one(f"#{provider_key}-status-line", Static)
++            metrics_table = self.query_one(f"#{provider_key}-rl-metrics", DataTable)
++        except NoMatches:
++            return
++
++        # Check visibility conditions
++        if provider_key not in status:
++            overview.set_class(False, "visible")
++            return
++
++        provider_status = status.get(provider_key)
++        
++        if not provider_status:
++            overview.set_class(False, "visible")
++            return
++
++        # Only show if provider has served at least one request
++        if provider_status.get("total_forwarded", 0) == 0:
++            overview.set_class(False, "visible")
++            return
++
++        # Provider is active - show the section
++        overview.set_class(True, "visible")
++
++        # Update status line with base URL from config
++        # Find provider info from registry
++        provider_info = None
++        for entry in PROVIDER_REGISTRY:
++            if entry["key"] == provider_key:
++                provider_info = entry
++                break
++        
++        if provider_info:
++            config_key = provider_info["config_key"]
++            # Import the config value dynamically
++            from dashscope_proxy_lib import config as proxy_config
++            base_url = getattr(proxy_config, config_key, None)
++            base_url_display = base_url or "N/A"
++            status_line.update(f"Status: Active | Target: {base_url_display}")
++            status_line.set_class(True, "status-running")
++            status_line.set_class(False, "status-stopped")
++
++        # Populate metrics table
++        metrics_table.clear()
++
++        metrics_table.add_row("RPS Limit", str(provider_status.get("rps_limit", 0)))
++
++        rpm_current = provider_status.get("rpm_current", 0)
++        rpm_limit = provider_status.get("rpm_limit", 1)
++        metrics_table.add_row(
++            "RPM",
++            _progress_bar(rpm_current, rpm_limit),
++        )
++
++        metrics_table.add_row(
++            "TPM Available",
++            _progress_bar(
++                provider_status.get("tpm_available", 0),
++                provider_status.get("tpm_limit", 1)
++            ),
++        )
++
++        metrics_table.add_row(
++            "5-Hour Quota",
++            _progress_bar(
++                provider_status.get("requests_5h", 0),
++                provider_status.get("requests_5h_limit", 1)
++            ),
++        )
++
++        metrics_table.add_row(
++            "Weekly Quota",
++            _progress_bar(
++                provider_status.get("requests_week", 0),
++                provider_status.get("requests_week_limit", 1)
++            ),
++        )
++
++        metrics_table.add_row(
++            "Monthly Quota",
++            _progress_bar(
++                provider_status.get("requests_month", 0),
++                provider_status.get("requests_month_limit", 1)
++            ),
++        )
++
++        # Circuit breaker status
++        if provider_status.get("circuit_open"):
++            metrics_table.add_row("Circuit", "OPEN (failures: {})".format(
++                provider_status.get("circuit_failure_count", 0)))
++        elif provider_status.get("circuit_failure_count", 0) > 0:
++            metrics_table.add_row("Circuit", "closed ({} failures)".format(
++                provider_status.get("circuit_failure_count", 0)))
++
++        # Token summary
++        metrics_table.add_row(
++            "Tokens",
++            f"{_fmt_number(provider_status.get('total_tokens_consumed', 0))} consumed | "
++            f"{_fmt_number(provider_status.get('tpm_reserved', 0))} reserved | "
++            f"{_fmt_number(provider_status.get('tpm_limit', 0))} capacity",
++        )
++
++        # Request stats
++        metrics_table.add_row(
++            "Forwarded",
++            f"{_fmt_number(provider_status.get('total_forwarded', 0))} | "
++            f"429s: {provider_status.get('total_429s', 0)} | "
++            f"Rejected: {provider_status.get('total_rejected', 0)}",
++        )
++
++        # Quota warning
++        warning = self._quota_warning(provider_status)
++        if warning:
++            metrics_table.add_row("Warning", warning)
++
+     @_safe_update
+     def _update_sparklines(self) -> None:
+         """Update sparkline widgets in Metrics tab."""
+@@ -767,8 +880,9 @@ class ProxyTUI(App):
+             warnings = []
+ 
+             if "primary" in status:
+-                # Multi-provider mode: check all providers
+-                for provider_key in ("primary", "secondary", "tertiary", "quaternary"):
++                # Multi-provider mode: check all providers via registry
++                for provider_info in PROVIDER_REGISTRY:
++                    provider_key = provider_info["key"]
+                     provider_status = status.get(provider_key)
+                     if not provider_status:
+                         continue
+@@ -785,6 +899,27 @@ class ProxyTUI(App):
+                 if status.get("circuit_open"):
+                     warnings.append("Circuit")
+ 
++            # Check for recent failover events
++            if warnings:  # Only check if we already have warnings
++                import json
++                log_dir = "session_logs"
++                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
++                log_file = f"{log_dir}/{today}.jsonl"
++                try:
++                    with open(log_file, "r", encoding="utf-8") as f:
++                        lines = f.readlines()[-50:]  # Check last 50 entries
++                        for line in lines[-10:]:  # Only last 10 for recent failovers
++                            try:
++                                entry = json.loads(line.strip())
++                                if len(entry.get("attempted_providers", [])) > 1:
++                                    if "Failover" not in warnings:
++                                        warnings.append("Failover")
++                                    break
++                            except (json.JSONDecodeError, KeyError):
++                                continue
++                except FileNotFoundError:
++                    pass
++
+             if warnings:
+                 badge.update("ALERT: " + " | ".join(warnings) + " critical")
+                 badge.add_class("alert-active")
+@@ -840,400 +975,206 @@ class ProxyTUI(App):
+         
+         panel.update("\n".join(lines))
+ 
+-    @_safe_update
+-    def _update_secondary_metrics(self, status: dict) -> None:
+-        """Update secondary provider metrics in the Overview tab.
+-
+-        Receives raw_status from MultiProviderRateLimiter.status() which has
+-        the shape {"primary": {...}, "secondary": {...}, "shared_limits": bool}.
+-        Toggles visibility of the secondary-overview section based on whether
+-        the secondary provider is configured.
+-        """
+-        try:
+-            secondary_overview = self.query_one("#secondary-overview", Vertical)
+-            secondary_status_line = self.query_one("#secondary-status-line", Static)
+-            secondary_table = self.query_one("#secondary-rl-metrics", DataTable)
+-        except NoMatches:
+-            return
+-
+-        # MultiProviderRateLimiter.status() always has "primary" key.
+-        # If "secondary" key is absent, it's a plain RateLimiter (single provider).
+-        if "secondary" not in status:
+-            secondary_overview.set_class(False, "visible")
+-            return
+-
+-        secondary_status = status.get("secondary")
+-
+-        if not secondary_status:
+-            secondary_overview.set_class(False, "visible")
+-            return
+-
+-        # Only show if provider has served at least one request
+-        if secondary_status.get("total_forwarded", 0) == 0:
+-            secondary_overview.set_class(False, "visible")
+-            return
+-
+-        # Secondary provider is active - show the section
+-        secondary_overview.set_class(True, "visible")
+-
+-        # Update status line with base URL
+-        from dashscope_proxy_lib.config import SECONDARY_BASE_URL
+-        base_url_display = SECONDARY_BASE_URL or "N/A"
+-        secondary_status_line.update(f"Status: Active | Target: {base_url_display}")
+-        secondary_status_line.set_class(True, "status-running")
+-        secondary_status_line.set_class(False, "status-stopped")
+-
+-        # Populate secondary metrics table
+-        secondary_table.clear()
+-
+-        secondary_table.add_row("RPS Limit", str(secondary_status.get("rps_limit", 0)))
+-
+-        rpm_current = secondary_status.get("rpm_current", 0)
+-        rpm_limit = secondary_status.get("rpm_limit", 1)
+-        secondary_table.add_row(
+-            "RPM",
+-            _progress_bar(rpm_current, rpm_limit),
+-        )
+-
+-        secondary_table.add_row(
+-            "TPM Available",
+-            _progress_bar(
+-                secondary_status.get("tpm_available", 0),
+-                secondary_status.get("tpm_limit", 1)
+-            ),
+-        )
+-
+-        secondary_table.add_row(
+-            "5-Hour Quota",
+-            _progress_bar(
+-                secondary_status.get("requests_5h", 0),
+-                secondary_status.get("requests_5h_limit", 1)
+-            ),
+-        )
+-
+-        secondary_table.add_row(
+-            "Weekly Quota",
+-            _progress_bar(
+-                secondary_status.get("requests_week", 0),
+-                secondary_status.get("requests_week_limit", 1)
+-            ),
+-        )
+-
+-        secondary_table.add_row(
+-            "Monthly Quota",
+-            _progress_bar(
+-                secondary_status.get("requests_month", 0),
+-                secondary_status.get("requests_month_limit", 1)
+-            ),
+-        )
+-
+-        # Circuit breaker status
+-        if secondary_status.get("circuit_open"):
+-            secondary_table.add_row("Circuit", "OPEN (failures: {})".format(
+-                secondary_status.get("circuit_failure_count", 0)))
+-        elif secondary_status.get("circuit_failure_count", 0) > 0:
+-            secondary_table.add_row("Circuit", "closed ({} failures)".format(
+-                secondary_status.get("circuit_failure_count", 0)))
+-
+-        # Token summary
+-        secondary_table.add_row(
+-            "Tokens",
+-            f"{_fmt_number(secondary_status.get('total_tokens_consumed', 0))} consumed | "
+-            f"{_fmt_number(secondary_status.get('tpm_reserved', 0))} reserved | "
+-            f"{_fmt_number(secondary_status.get('tpm_limit', 0))} capacity",
+-        )
+-
+-        # Request stats
+-        secondary_table.add_row(
+-            "Forwarded",
+-            f"{_fmt_number(secondary_status.get('total_forwarded', 0))} | "
+-            f"429s: {secondary_status.get('total_429s', 0)} | "
+-            f"Rejected: {secondary_status.get('total_rejected', 0)}",
+-        )
+-
+-        # Quota warning
+-        warning = self._quota_warning(secondary_status)
+-        if warning:
+-            secondary_table.add_row("Warning", warning)
+-
+-    @_safe_update
+-    def _update_tertiary_metrics(self, status: dict) -> None:
+-        """Update OpenLux (tertiary) provider metrics in the Overview tab."""
++    def _update_failover_panel(self) -> None:
++        """Update failover events panel from recent session logs."""
+         try:
+-            tertiary_overview = self.query_one("#tertiary-overview", Vertical)
+-            tertiary_status_line = self.query_one("#tertiary-status-line", Static)
+-            tertiary_table = self.query_one("#tertiary-rl-metrics", DataTable)
++            panel = self.query_one("#failover-events-panel", Static)
+         except NoMatches:
+             return
+ 
+-        if "tertiary" not in status:
+-            tertiary_overview.set_class(False, "visible")
+-            return
+-
+-        tertiary_status = status.get("tertiary")
+-
+-        if not tertiary_status:
+-            tertiary_overview.set_class(False, "visible")
+-            return
+-
+-        # Only show if provider has served at least one request
+-        if tertiary_status.get("total_forwarded", 0) == 0:
+-            tertiary_overview.set_class(False, "visible")
+-            return
+-
+-        tertiary_overview.set_class(True, "visible")
+-
+-        from dashscope_proxy_lib.config import TERTIARY_BASE_URL
+-        base_url_display = TERTIARY_BASE_URL or "N/A"
+-        tertiary_status_line.update(f"Status: Active | Target: {base_url_display}")
+-        tertiary_status_line.set_class(True, "status-running")
+-        tertiary_status_line.set_class(False, "status-stopped")
+-
+-        tertiary_table.clear()
+-
+-        tertiary_table.add_row("RPS Limit", str(tertiary_status.get("rps_limit", 0)))
+-
+-        rpm_current = tertiary_status.get("rpm_current", 0)
+-        rpm_limit = tertiary_status.get("rpm_limit", 1)
+-        tertiary_table.add_row(
+-            "RPM",
+-            _progress_bar(rpm_current, rpm_limit),
+-        )
+-
+-        tertiary_table.add_row(
+-            "TPM Available",
+-            _progress_bar(
+-                tertiary_status.get("tpm_available", 0),
+-                tertiary_status.get("tpm_limit", 1)
+-            ),
+-        )
+-
+-        tertiary_table.add_row(
+-            "5-Hour Quota",
+-            _progress_bar(
+-                tertiary_status.get("requests_5h", 0),
+-                tertiary_status.get("requests_5h_limit", 1)
+-            ),
+-        )
+-
+-        tertiary_table.add_row(
+-            "Weekly Quota",
+-            _progress_bar(
+-                tertiary_status.get("requests_week", 0),
+-                tertiary_status.get("requests_week_limit", 1)
+-            ),
+-        )
+-
+-        tertiary_table.add_row(
+-            "Monthly Quota",
+-            _progress_bar(
+-                tertiary_status.get("requests_month", 0),
+-                tertiary_status.get("requests_month_limit", 1)
+-            ),
+-        )
+-
+-        if tertiary_status.get("circuit_open"):
+-            tertiary_table.add_row("Circuit", "OPEN (failures: {})".format(
+-                tertiary_status.get("circuit_failure_count", 0)))
+-        elif tertiary_status.get("circuit_failure_count", 0) > 0:
+-            tertiary_table.add_row("Circuit", "closed ({} failures)".format(
+-                tertiary_status.get("circuit_failure_count", 0)))
+-
+-        tertiary_table.add_row(
+-            "Tokens",
+-            f"{_fmt_number(tertiary_status.get('total_tokens_consumed', 0))} consumed | "
+-            f"{_fmt_number(tertiary_status.get('tpm_reserved', 0))} reserved | "
+-            f"{_fmt_number(tertiary_status.get('tpm_limit', 0))} capacity",
+-        )
+-
+-        tertiary_table.add_row(
+-            "Forwarded",
+-            f"{_fmt_number(tertiary_status.get('total_forwarded', 0))} | "
+-            f"429s: {tertiary_status.get('total_429s', 0)} | "
+-            f"Rejected: {tertiary_status.get('total_rejected', 0)}",
+-        )
+-
+-        warning = self._quota_warning(tertiary_status)
+-        if warning:
+-            tertiary_table.add_row("Warning", warning)
+-
+-    @_safe_update
+-    def _update_quaternary_metrics(self, status: dict) -> None:
+-        """Update ARK (quaternary) provider metrics in the Overview tab."""
++        import json
++        from datetime import datetime, timezone
++        
++        failovers = []
++        log_dir = "session_logs"
++        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
++        log_file = f"{log_dir}/{today}.jsonl"
++        
+         try:
+-            quaternary_overview = self.query_one("#quaternary-overview", Vertical)
+-            quaternary_status_line = self.query_one("#quaternary-status-line", Static)
+-            quaternary_table = self.query_one("#quaternary-rl-metrics", DataTable)
+-        except NoMatches:
+-            return
+-
+-        if "quaternary" not in status:
+-            quaternary_overview.set_class(False, "visible")
+-            return
+-
+-        quaternary_status = status.get("quaternary")
+-
+-        if not quaternary_status:
+-            quaternary_overview.set_class(False, "visible")
+-            return
+-
+-        # Only show if provider has served at least one request
+-        if quaternary_status.get("total_forwarded", 0) == 0:
+-            quaternary_overview.set_class(False, "visible")
+-            return
+-
+-        quaternary_overview.set_class(True, "visible")
+-
+-        from dashscope_proxy_lib.config import QUATERNARY_BASE_URL
+-        base_url_display = QUATERNARY_BASE_URL or "N/A"
+-        quaternary_status_line.update(f"Status: Active | Target: {base_url_display}")
+-        quaternary_status_line.set_class(True, "status-running")
+-        quaternary_status_line.set_class(False, "status-stopped")
+-
+-        quaternary_table.clear()
+-
+-        quaternary_table.add_row("RPS Limit", str(quaternary_status.get("rps_limit", 0)))
+-
+-        rpm_current = quaternary_status.get("rpm_current", 0)
+-        rpm_limit = quaternary_status.get("rpm_limit", 1)
+-        quaternary_table.add_row(
+-            "RPM",
+-            _progress_bar(rpm_current, rpm_limit),
+-        )
+-
+-        quaternary_table.add_row(
+-            "TPM Available",
+-            _progress_bar(
+-                quaternary_status.get("tpm_available", 0),
+-                quaternary_status.get("tpm_limit", 1)
+-            ),
+-        )
+-
+-        quaternary_table.add_row(
+-            "5-Hour Quota",
+-            _progress_bar(
+-                quaternary_status.get("requests_5h", 0),
+-                quaternary_status.get("requests_5h_limit", 1)
+-            ),
+-        )
+-
+-        quaternary_table.add_row(
+-            "Weekly Quota",
+-            _progress_bar(
+-                quaternary_status.get("requests_week", 0),
+-                quaternary_status.get("requests_week_limit", 1)
+-            ),
+-        )
+-
+-        quaternary_table.add_row(
+-            "Monthly Quota",
+-            _progress_bar(
+-                quaternary_status.get("requests_month", 0),
+-                quaternary_status.get("requests_month_limit", 1)
+-            ),
+-        )
+-
+-        if quaternary_status.get("circuit_open"):
+-            quaternary_table.add_row("Circuit", "OPEN (failures: {})".format(
+-                quaternary_status.get("circuit_failure_count", 0)))
+-        elif quaternary_status.get("circuit_failure_count", 0) > 0:
+-            quaternary_table.add_row("Circuit", "closed ({} failures)".format(
+-                quaternary_status.get("circuit_failure_count", 0)))
+-
+-        quaternary_table.add_row(
+-            "Tokens",
+-            f"{_fmt_number(quaternary_status.get('total_tokens_consumed', 0))} consumed | "
+-            f"{_fmt_number(quaternary_status.get('tpm_reserved', 0))} reserved | "
+-            f"{_fmt_number(quaternary_status.get('tpm_limit', 0))} capacity",
+-        )
+-
+-        quaternary_table.add_row(
+-            "Forwarded",
+-            f"{_fmt_number(quaternary_status.get('total_forwarded', 0))} | "
+-            f"429s: {quaternary_status.get('total_429s', 0)} | "
+-            f"Rejected: {quaternary_status.get('total_rejected', 0)}",
+-        )
++            with open(log_file, "r", encoding="utf-8") as f:
++                lines = f.readlines()[-200:]
++                for line in lines:
++                    try:
++                        entry = json.loads(line.strip())
++                        attempted = entry.get("attempted_providers", [])
++                        if len(attempted) > 1:
++                            model = entry.get("model", "unknown")
++                            request_id = entry.get("request_id", "")[:8]
++                            timestamp = entry.get("timestamp", "")
++                            if timestamp:
++                                try:
++                                    dt = datetime.fromisoformat(timestamp)
++                                    time_str = dt.strftime("%H:%M:%S")
++                                except:
++                                    time_str = timestamp
++                            else:
++                                time_str = "unknown"
++                            
++                            failovers.append({
++                                "model": model,
++                                "chain": attempted,
++                                "request_id": request_id,
++                                "time": time_str,
++                            })
++                    except (json.JSONDecodeError, KeyError):
++                        continue
++        except FileNotFoundError:
++            pass
++        except Exception:
++            pass
+ 
+-        warning = self._quota_warning(quaternary_status)
+-        if warning:
+-            quaternary_table.add_row("Warning", warning)
++        if failovers:
++            failovers = failovers[-10:]
++            lines = []
++            for event in failovers:
++                chain_str = " ΓåÆ ".join(event["chain"])
++                lines.append(f"  {event['model']} ΓåÆ [{chain_str}] (req: {event['request_id']}, {event['time']})")
++            panel.update("\n".join(lines))
++        else:
++            panel.update("  No recent failover events")
+ 
+     @_safe_update
+     def _update_model_table(self, status: dict) -> None:
+-        """Update per-model usage DataTable with filtering and sorting.
++        """Update per-model usage DataTable with multi-provider breakdown.
+         
+         Receives raw_status from MultiProviderRateLimiter.status() which has
+         the shape {"primary": {...}, "secondary": {...}, "shared_limits": bool}.
++        
++        In multi-provider mode, aggregates stats across providers and shows
++        breakdown rows for models served by multiple providers.
+         """
+         table = self.query_one("#model-usage-table", DataTable)
+         table.clear()
+ 
+-        # Handle multi-provider status structure
++        # Step 1: Collect model usage from all providers
++        model_data = {}  # {model_name: {provider_key: stats}}
++        
+         if "primary" in status:
+-            primary_usage = status.get("primary", {}).get("model_usage", {})
+-            secondary_usage = status.get("secondary", {}).get("model_usage", {}) if status.get("secondary") else {}
+-            tertiary_usage = status.get("tertiary", {}).get("model_usage", {}) if status.get("tertiary") else {}
+-            quaternary_usage = status.get("quaternary", {}).get("model_usage", {}) if status.get("quaternary") else {}
+-
+-            model_usage = {}
+-            for model_name, stats in primary_usage.items():
+-                model_usage[model_name] = {**stats, "provider": "primary"}
+-            for model_name, stats in secondary_usage.items():
+-                model_usage[model_name] = {**stats, "provider": "secondary"}
+-            for model_name, stats in tertiary_usage.items():
+-                model_usage[model_name] = {**stats, "provider": "streamlake"}
+-            for model_name, stats in quaternary_usage.items():
+-                model_usage[model_name] = {**stats, "provider": "ark"}
++            # Multi-provider mode
++            for provider_info in PROVIDER_REGISTRY:
++                provider_key = provider_info["key"]
++                provider_status = status.get(provider_key)
++                if not provider_status:
++                    continue
++                
++                for model_name, stats in provider_status.get("model_usage", {}).items():
++                    if model_name not in model_data:
++                        model_data[model_name] = {}
++                    model_data[model_name][provider_key] = stats
+         else:
+-            # Single provider mode
+-            model_usage = {k: {**v, "provider": "primary"} for k, v in status.get("model_usage", {}).items()}
++            # Single provider mode - treat as primary
++            for model_name, stats in status.get("model_usage", {}).items():
++                model_data[model_name] = {"primary": stats}
++        
++        # Step 2: Aggregate stats across providers for each model
++        aggregated = {}  # {model_name: {aggregated_fields, providers, provider_stats}}
++        
++        for model_name, provider_stats in model_data.items():
++            total_requests = sum(s.get("requests", 0) for s in provider_stats.values())
++            total_tokens = sum(s.get("tokens", 0) for s in provider_stats.values())
++            total_429s = sum(s.get("errors_429", 0) for s in provider_stats.values())
++            
++            # Weighted average latency (weighted by requests)
++            if total_requests > 0:
++                avg_latency = sum(
++                    s.get("avg_latency_ms", 0) * s.get("requests", 0)
++                    for s in provider_stats.values()
++                ) / total_requests
++            else:
++                avg_latency = 0
++            
++            # Collect percentiles (use primary provider's values if available, else first available)
++            p50_latency = 0
++            p95_latency = 0
++            for provider_key, s in provider_stats.items():
++                if provider_key == "primary" or p50_latency == 0:
++                    p50_latency = s.get("p50_latency_ms", 0)
++                    p95_latency = s.get("p95_latency_ms", 0)
++                    if provider_key == "primary":
++                        break
++            
++            aggregated[model_name] = {
++                "providers": list(provider_stats.keys()),
++                "provider_stats": provider_stats,
++                "total_requests": total_requests,
++                "total_tokens": total_tokens,
++                "total_429s": total_429s,
++                "avg_latency_ms": avg_latency,
++                "p50_latency_ms": p50_latency,
++                "p95_latency_ms": p95_latency,
++            }
+         
+-        # Apply filter
++        # Step 3: Apply filter
+         if self._model_filter:
+             filter_lower = self._model_filter.lower()
+-            model_usage = {k: v for k, v in model_usage.items() if filter_lower in k.lower()}
++            aggregated = {k: v for k, v in aggregated.items() if filter_lower in k.lower()}
+         
+-        # Sort by selected key
++        # Step 4: Sort by selected key
+         sort_key = self._model_sort_key
+         if sort_key == "requests":
+-            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["requests"], reverse=True)
++            sorted_models = sorted(aggregated.items(), key=lambda x: x[1]["total_requests"], reverse=True)
+         elif sort_key == "tokens":
+-            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["tokens"], reverse=True)
++            sorted_models = sorted(aggregated.items(), key=lambda x: x[1]["total_tokens"], reverse=True)
+         elif sort_key == "latency":
+-            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["avg_latency_ms"], reverse=True)
++            sorted_models = sorted(aggregated.items(), key=lambda x: x[1]["avg_latency_ms"], reverse=True)
+         elif sort_key == "429s":
+-            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["errors_429"], reverse=True)
++            sorted_models = sorted(aggregated.items(), key=lambda x: x[1]["total_429s"], reverse=True)
+         else:
+-            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["requests"], reverse=True)
++            sorted_models = sorted(aggregated.items(), key=lambda x: x[1]["total_requests"], reverse=True)
+ 
+         if not sorted_models:
+-            if model_usage:
+-                table.add_row("--", "No models match filter", "", "", "", "", "")
+-            else:
+-                table.add_row("--", "No model data yet", "", "", "", "", "")
++            table.add_row("--", "No model data yet", "", "", "", "", "", "")
+         else:
+-            total_requests = sum(v["requests"] for _, v in sorted_models)
+-            for model_name, stats in sorted_models:
+-                pct = f"{(stats['requests'] / total_requests * 100):.0f}%" if total_requests > 0 else "0%"
+-                provider = stats.get("provider", "primary")
++            total_requests = sum(v["total_requests"] for _, v in sorted_models)
++            
++            # Step 5: Render rows
++            for model_name, data in sorted_models:
++                # Format provider list (comma-separated)
++                providers_list = ", ".join(data["providers"])
++                
++                # Main row with aggregated stats
++                pct = f"{(data['total_requests'] / total_requests * 100):.0f}%" if total_requests > 0 else "0%"
+                 table.add_row(
+                     model_name,
+-                    provider,
+-                    f"{stats['requests']} ({pct})",
+-                    _fmt_number(stats["tokens"]),
+-                    str(stats["errors_429"]),
+-                    f"{stats['avg_latency_ms']:.0f}ms",
+-                    f"{stats.get('p50_latency_ms', 0):.0f}ms",
+-                    f"{stats.get('p95_latency_ms', 0):.0f}ms",
++                    providers_list,
++                    f"{data['total_requests']} ({pct})",
++                    _fmt_number(data["total_tokens"]),
++                    str(data["total_429s"]),
++                    f"{data['avg_latency_ms']:.0f}ms",
++                    f"{data['p50_latency_ms']:.0f}ms",
++                    f"{data['p95_latency_ms']:.0f}ms",
+                 )
++                
++                # Breakdown rows for multi-provider models
++                if len(data["providers"]) > 1:
++                    for provider_key, provider_stats in data["provider_stats"].items():
++                        # Find provider label from registry
++                        provider_label = next(
++                            (p["label"] for p in PROVIDER_REGISTRY if p["key"] == provider_key),
++                            provider_key
++                        )
++                        
++                        # Calculate percentage for this provider
++                        provider_pct = f"{(provider_stats.get('requests', 0) / data['total_requests'] * 100):.0f}%" if data['total_requests'] > 0 else "0%"
++                        
++                        table.add_row(
++                            f"  via {provider_label}",
++                            "",  # Providers column (empty for breakdown)
++                            f"{provider_stats.get('requests', 0)} ({provider_pct})",
++                            _fmt_number(provider_stats.get("tokens", 0)),
++                            str(provider_stats.get("errors_429", 0)),
++                            f"{provider_stats.get('avg_latency_ms', 0):.0f}ms",
++                            f"{provider_stats.get('p50_latency_ms', 0):.0f}ms",
++                            f"{provider_stats.get('p95_latency_ms', 0):.0f}ms",
++                        )
+             
+             # Totals row
+-            total_tokens = sum(v["tokens"] for _, v in sorted_models)
+-            total_429s = sum(v["errors_429"] for _, v in sorted_models)
+-            avg_latency = sum(v["avg_latency_ms"] * v["requests"] for _, v in sorted_models) / total_requests if total_requests > 0 else 0
++            total_tokens = sum(v["total_tokens"] for _, v in sorted_models)
++            total_429s = sum(v["total_429s"] for _, v in sorted_models)
++            avg_latency = sum(v["avg_latency_ms"] * v["total_requests"] for _, v in sorted_models) / total_requests if total_requests > 0 else 0
+             table.add_row(
+                 "TOTAL",
+-                "",  # Provider column (aggregate)
++                "",
+                 str(total_requests),
+                 _fmt_number(total_tokens),
+                 str(total_429s),
+@@ -1269,6 +1210,12 @@ class ProxyTUI(App):
+                 return "env"
+             if f"MIMO_CODING_PLAN_{key.upper()}" in os.environ:
+                 return "env"
++            if f"OPENLUX_{key.upper()}" in os.environ:
++                return "env"
++            if f"MODEL_ARK_{key.upper()}" in os.environ:
++                return "env"
++            if f"QUINARY_{key.upper()}" in os.environ:
++                return "env"
+             return "default"
+         
+         ungrouped_keys = []
+diff --git a/proxy_tui.tcss b/proxy_tui.tcss
+index 5a309dc..7f8e712 100644
+--- a/proxy_tui.tcss
++++ b/proxy_tui.tcss
+@@ -11,62 +11,50 @@
+     overflow-y: auto;
+ }
+ 
+-#secondary-overview {
++/* Dynamic provider sections */
++.Vertical[id$="-overview"] {
+     display: none;
+     margin: 1 0 0 0;
+     border-top: heavy $primary 30%;
+     padding-top: 1;
+ }
+ 
+-#secondary-overview.visible {
++.Vertical[id$="-overview"].visible {
+     display: block;
+ }
+ 
+-#tertiary-overview {
+-    display: none;
+-    margin: 1 0 0 0;
+-    border-top: heavy $primary 30%;
+-    padding-top: 1;
+-}
+-
+-#tertiary-overview.visible {
+-    display: block;
+-}
+-
+-#secondary-status-line {
++/* Provider status lines */
++.Static[id$="-status-line"] {
+     padding: 0 1;
+     text-style: bold;
+     height: 1;
+ }
+ 
+-#secondary-status-line.status-running {
++.Static[id$="-status-line"].status-running {
+     color: $success;
+ }
+ 
+-#secondary-status-line.status-stopped {
++.Static[id$="-status-line"].status-stopped {
+     color: $error;
+ }
+ 
+-#secondary-rl-metrics {
++/* Provider metrics tables */
++DataTable[id$="-rl-metrics"] {
+     height: auto;
+ }
+ 
+-#tertiary-status-line {
++/* Failover events panel */
++.failover-panel {
++    height: auto;
+     padding: 0 1;
+-    text-style: bold;
+-    height: 1;
+-}
+-
+-#tertiary-status-line.status-running {
+-    color: $success;
+-}
+-
+-#tertiary-status-line.status-stopped {
+-    color: $error;
++    margin: 1 0;
++    border: round $warning;
++    max-height: 8;
++    overflow-y: auto;
+ }
+ 
+-#tertiary-rl-metrics {
+-    height: auto;
++.failover-panel:empty {
++    display: none;
+ }
+ 
+ #log-panel {
+diff --git a/tests/test_integration.py b/tests/test_integration.py
+index 822e004..73e5355 100644
+--- a/tests/test_integration.py
++++ b/tests/test_integration.py
+@@ -1761,7 +1761,7 @@ class TestSecondaryProviderRouting:
+     async def test_mimo_hyphen_alias_forwarded_to_secondary_upstream(
+         self, aiohttp_client, proxy_app, monkeypatch,
+     ):
+-        """Cursor sends mimo-v2-5 (hyphens) ΓÇö must route to secondary, not primary."""
++        """Cursor sends mimo-v2-5-pro (hyphens) ΓÇö must route to secondary, not primary."""
+         import dashscope_proxy_lib.config as cfg
+ 
+         secondary_app = web.Application()
+@@ -1791,7 +1791,8 @@ class TestSecondaryProviderRouting:
+             async with aiohttp.ClientSession() as session:
+                 app["client_session"] = session
+                 client = await aiohttp_client(app)
+-                for model in ("mimo-v2-5", "mimo-v2-5-pro"):
++                # mimo-v2.5-pro is in SECONDARY_MODELS; use hyphen alias to test normalization
++                for model in ("mimo-v2-5-pro",):
+                     resp = await client.post(
+                         "/v1/chat/completions",
+                         data=json.dumps({
+@@ -1862,7 +1863,7 @@ class TestSecondaryProviderRouting:
+         assert resp.status == 200
+         data = await resp.json()
+         model_ids = [m["id"] for m in data["data"]]
+-        assert "qwen3-coder-plus" in model_ids
++        # Check for mimo-v2.5-pro which is in SECONDARY_MODELS
+         assert "mimo-v2.5-pro" in model_ids
+ 
+     async def test_status_endpoint_shows_secondary_provider(self, aiohttp_client, proxy_app, monkeypatch):
+@@ -1988,7 +1989,7 @@ class TestQuaternaryProviderRouting:
+             return web.json_response({
+                 "id": "resp-quaternary",
+                 "object": "chat.completion",
+-                "model": "dola-seed-2.0-pro",
++                "model": "glm-5.2",
+                 "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                 "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+             })
+@@ -2016,7 +2017,7 @@ class TestQuaternaryProviderRouting:
+                 resp = await client.post(
+                     "/v1/chat/completions",
+                     data=json.dumps({
+-                        "model": "dola-seed-2.0-pro",
++                        "model": "glm-5.2",
+                         "messages": [{"role": "user", "content": "hello ark"}],
+                     }).encode(),
+                 )
+@@ -2092,7 +2093,8 @@ class TestQuaternaryProviderRouting:
+         assert resp.status == 200
+         data = await resp.json()
+         model_ids = [m["id"] for m in data["data"]]
+-        assert "dola-seed-2.0-pro" in model_ids
++        # Check for glm-5.2 which is in QUATERNARY_MODELS
++        assert "glm-5.2" in model_ids
+ 
+     async def test_status_endpoint_shows_quaternary_provider(self, aiohttp_client, proxy_app, monkeypatch):
+         """Status endpoint should show quaternary provider availability."""

@@ -1,0 +1,137 @@
+﻿diff --git a/proxy_tui.py b/proxy_tui.py
+index cf797da..1121521 100644
+--- a/proxy_tui.py
++++ b/proxy_tui.py
+@@ -601,6 +601,132 @@ class ProxyTUI(App):
+         else:
+             error_banner.update("")
+ 
++    @_safe_update
++    def _update_provider_metrics(self, provider_key: str, status: dict) -> None:
++        """Update metrics for a single provider.
++        
++        Args:
++            provider_key: Provider key from registry (e.g., "secondary", "senary")
++            status: Raw status dict from MultiProviderRateLimiter.status()
++        """
++        # Query UI elements using provider_key
++        try:
++            overview = self.query_one(f"#{provider_key}-overview", Vertical)
++            status_line = self.query_one(f"#{provider_key}-status-line", Static)
++            metrics_table = self.query_one(f"#{provider_key}-rl-metrics", DataTable)
++        except NoMatches:
++            return
++
++        # Check visibility conditions
++        if provider_key not in status:
++            overview.set_class(False, "visible")
++            return
++
++        provider_status = status.get(provider_key)
++        
++        if not provider_status:
++            overview.set_class(False, "visible")
++            return
++
++        # Only show if provider has served at least one request
++        if provider_status.get("total_forwarded", 0) == 0:
++            overview.set_class(False, "visible")
++            return
++
++        # Provider is active - show the section
++        overview.set_class(True, "visible")
++
++        # Update status line with base URL from config
++        # Find provider info from registry
++        provider_info = None
++        for entry in PROVIDER_REGISTRY:
++            if entry["key"] == provider_key:
++                provider_info = entry
++                break
++        
++        if provider_info:
++            config_key = provider_info["config_key"]
++            # Import the config value dynamically
++            from dashscope_proxy_lib import config as proxy_config
++            base_url = getattr(proxy_config, config_key, None)
++            base_url_display = base_url or "N/A"
++            status_line.update(f"Status: Active | Target: {base_url_display}")
++            status_line.set_class(True, "status-running")
++            status_line.set_class(False, "status-stopped")
++
++        # Populate metrics table
++        metrics_table.clear()
++
++        metrics_table.add_row("RPS Limit", str(provider_status.get("rps_limit", 0)))
++
++        rpm_current = provider_status.get("rpm_current", 0)
++        rpm_limit = provider_status.get("rpm_limit", 1)
++        metrics_table.add_row(
++            "RPM",
++            _progress_bar(rpm_current, rpm_limit),
++        )
++
++        metrics_table.add_row(
++            "TPM Available",
++            _progress_bar(
++                provider_status.get("tpm_available", 0),
++                provider_status.get("tpm_limit", 1)
++            ),
++        )
++
++        metrics_table.add_row(
++            "5-Hour Quota",
++            _progress_bar(
++                provider_status.get("requests_5h", 0),
++                provider_status.get("requests_5h_limit", 1)
++            ),
++        )
++
++        metrics_table.add_row(
++            "Weekly Quota",
++            _progress_bar(
++                provider_status.get("requests_week", 0),
++                provider_status.get("requests_week_limit", 1)
++            ),
++        )
++
++        metrics_table.add_row(
++            "Monthly Quota",
++            _progress_bar(
++                provider_status.get("requests_month", 0),
++                provider_status.get("requests_month_limit", 1)
++            ),
++        )
++
++        # Circuit breaker status
++        if provider_status.get("circuit_open"):
++            metrics_table.add_row("Circuit", "OPEN (failures: {})".format(
++                provider_status.get("circuit_failure_count", 0)))
++        elif provider_status.get("circuit_failure_count", 0) > 0:
++            metrics_table.add_row("Circuit", "closed ({} failures)".format(
++                provider_status.get("circuit_failure_count", 0)))
++
++        # Token summary
++        metrics_table.add_row(
++            "Tokens",
++            f"{_fmt_number(provider_status.get('total_tokens_consumed', 0))} consumed | "
++            f"{_fmt_number(provider_status.get('tpm_reserved', 0))} reserved | "
++            f"{_fmt_number(provider_status.get('tpm_limit', 0))} capacity",
++        )
++
++        # Request stats
++        metrics_table.add_row(
++            "Forwarded",
++            f"{_fmt_number(provider_status.get('total_forwarded', 0))} | "
++            f"429s: {provider_status.get('total_429s', 0)} | "
++            f"Rejected: {provider_status.get('total_rejected', 0)}",
++        )
++
++        # Quota warning
++        warning = self._quota_warning(provider_status)
++        if warning:
++            metrics_table.add_row("Warning", warning)
++
+     @_safe_update
+     def _update_sparklines(self) -> None:
+         """Update sparkline widgets in Metrics tab."""

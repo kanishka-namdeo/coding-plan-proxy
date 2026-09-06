@@ -1,0 +1,208 @@
+﻿diff --git a/proxy_tui.py b/proxy_tui.py
+index 7c8d868..038fd98 100644
+--- a/proxy_tui.py
++++ b/proxy_tui.py
+@@ -321,7 +321,7 @@ class ProxyTUI(App):
+         # Configure model usage table
+         try:
+             model_table = self.query_one("#model-usage-table", DataTable)
+-            model_table.add_columns("Model", "Provider", "Requests", "Tokens", "429s", "Avg Latency", "p50", "p95")
++            model_table.add_columns("Model", "Providers", "Requests", "Tokens", "429s", "Avg Latency", "p50", "p95")
+             model_table.show_header = True
+             model_table.zebra_stripes = True
+         except NoMatches:
+@@ -953,83 +953,146 @@ class ProxyTUI(App):
+ 
+     @_safe_update
+     def _update_model_table(self, status: dict) -> None:
+-        """Update per-model usage DataTable with filtering and sorting.
++        """Update per-model usage DataTable with multi-provider breakdown.
+         
+         Receives raw_status from MultiProviderRateLimiter.status() which has
+         the shape {"primary": {...}, "secondary": {...}, "shared_limits": bool}.
++        
++        In multi-provider mode, aggregates stats across providers and shows
++        breakdown rows for models served by multiple providers.
+         """
+         table = self.query_one("#model-usage-table", DataTable)
+         table.clear()
+ 
+-        # Handle multi-provider status structure
++        # Step 1: Collect model usage from all providers
++        model_data = {}  # {model_name: {provider_key: stats}}
++        
+         if "primary" in status:
+-            primary_usage = status.get("primary", {}).get("model_usage", {})
+-            secondary_usage = status.get("secondary", {}).get("model_usage", {}) if status.get("secondary") else {}
+-            tertiary_usage = status.get("tertiary", {}).get("model_usage", {}) if status.get("tertiary") else {}
+-            quaternary_usage = status.get("quaternary", {}).get("model_usage", {}) if status.get("quaternary") else {}
+-            quinary_usage = status.get("quinary", {}).get("model_usage", {}) if status.get("quinary") else {}
+-
+-            model_usage = {}
+-            for model_name, stats in primary_usage.items():
+-                model_usage[model_name] = {**stats, "provider": "primary"}
+-            for model_name, stats in secondary_usage.items():
+-                model_usage[model_name] = {**stats, "provider": "secondary"}
+-            for model_name, stats in tertiary_usage.items():
+-                model_usage[model_name] = {**stats, "provider": "openlux"}
+-            for model_name, stats in quaternary_usage.items():
+-                model_usage[model_name] = {**stats, "provider": "ark"}
+-            for model_name, stats in quinary_usage.items():
+-                model_usage[model_name] = {**stats, "provider": "meta-ai"}
++            # Multi-provider mode
++            for provider_info in PROVIDER_REGISTRY:
++                provider_key = provider_info["key"]
++                provider_status = status.get(provider_key)
++                if not provider_status:
++                    continue
++                
++                for model_name, stats in provider_status.get("model_usage", {}).items():
++                    if model_name not in model_data:
++                        model_data[model_name] = {}
++                    model_data[model_name][provider_key] = stats
+         else:
+-            # Single provider mode
+-            model_usage = {k: {**v, "provider": "primary"} for k, v in status.get("model_usage", {}).items()}
++            # Single provider mode - treat as primary
++            for model_name, stats in status.get("model_usage", {}).items():
++                model_data[model_name] = {"primary": stats}
++        
++        # Step 2: Aggregate stats across providers for each model
++        aggregated = {}  # {model_name: {aggregated_fields, providers, provider_stats}}
+         
+-        # Apply filter
++        for model_name, provider_stats in model_data.items():
++            total_requests = sum(s.get("requests", 0) for s in provider_stats.values())
++            total_tokens = sum(s.get("tokens", 0) for s in provider_stats.values())
++            total_429s = sum(s.get("errors_429", 0) for s in provider_stats.values())
++            
++            # Weighted average latency (weighted by requests)
++            if total_requests > 0:
++                avg_latency = sum(
++                    s.get("avg_latency_ms", 0) * s.get("requests", 0)
++                    for s in provider_stats.values()
++                ) / total_requests
++            else:
++                avg_latency = 0
++            
++            # Collect percentiles (use primary provider's values if available, else first available)
++            p50_latency = 0
++            p95_latency = 0
++            for provider_key, s in provider_stats.items():
++                if provider_key == "primary" or p50_latency == 0:
++                    p50_latency = s.get("p50_latency_ms", 0)
++                    p95_latency = s.get("p95_latency_ms", 0)
++                    if provider_key == "primary":
++                        break
++            
++            aggregated[model_name] = {
++                "providers": list(provider_stats.keys()),
++                "provider_stats": provider_stats,
++                "total_requests": total_requests,
++                "total_tokens": total_tokens,
++                "total_429s": total_429s,
++                "avg_latency_ms": avg_latency,
++                "p50_latency_ms": p50_latency,
++                "p95_latency_ms": p95_latency,
++            }
++        
++        # Step 3: Apply filter
+         if self._model_filter:
+             filter_lower = self._model_filter.lower()
+-            model_usage = {k: v for k, v in model_usage.items() if filter_lower in k.lower()}
++            aggregated = {k: v for k, v in aggregated.items() if filter_lower in k.lower()}
+         
+-        # Sort by selected key
++        # Step 4: Sort by selected key
+         sort_key = self._model_sort_key
+         if sort_key == "requests":
+-            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["requests"], reverse=True)
++            sorted_models = sorted(aggregated.items(), key=lambda x: x[1]["total_requests"], reverse=True)
+         elif sort_key == "tokens":
+-            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["tokens"], reverse=True)
++            sorted_models = sorted(aggregated.items(), key=lambda x: x[1]["total_tokens"], reverse=True)
+         elif sort_key == "latency":
+-            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["avg_latency_ms"], reverse=True)
++            sorted_models = sorted(aggregated.items(), key=lambda x: x[1]["avg_latency_ms"], reverse=True)
+         elif sort_key == "429s":
+-            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["errors_429"], reverse=True)
++            sorted_models = sorted(aggregated.items(), key=lambda x: x[1]["total_429s"], reverse=True)
+         else:
+-            sorted_models = sorted(model_usage.items(), key=lambda x: x[1]["requests"], reverse=True)
++            sorted_models = sorted(aggregated.items(), key=lambda x: x[1]["total_requests"], reverse=True)
+ 
+         if not sorted_models:
+-            if model_usage:
+-                table.add_row("--", "No models match filter", "", "", "", "", "")
+-            else:
+-                table.add_row("--", "No model data yet", "", "", "", "", "")
++            table.add_row("--", "No model data yet", "", "", "", "", "", "")
+         else:
+-            total_requests = sum(v["requests"] for _, v in sorted_models)
+-            for model_name, stats in sorted_models:
+-                pct = f"{(stats['requests'] / total_requests * 100):.0f}%" if total_requests > 0 else "0%"
+-                provider = stats.get("provider", "primary")
++            total_requests = sum(v["total_requests"] for _, v in sorted_models)
++            
++            # Step 5: Render rows
++            for model_name, data in sorted_models:
++                # Format provider list (comma-separated)
++                providers_list = ", ".join(data["providers"])
++                
++                # Main row with aggregated stats
++                pct = f"{(data['total_requests'] / total_requests * 100):.0f}%" if total_requests > 0 else "0%"
+                 table.add_row(
+                     model_name,
+-                    provider,
+-                    f"{stats['requests']} ({pct})",
+-                    _fmt_number(stats["tokens"]),
+-                    str(stats["errors_429"]),
+-                    f"{stats['avg_latency_ms']:.0f}ms",
+-                    f"{stats.get('p50_latency_ms', 0):.0f}ms",
+-                    f"{stats.get('p95_latency_ms', 0):.0f}ms",
++                    providers_list,
++                    f"{data['total_requests']} ({pct})",
++                    _fmt_number(data["total_tokens"]),
++                    str(data["total_429s"]),
++                    f"{data['avg_latency_ms']:.0f}ms",
++                    f"{data['p50_latency_ms']:.0f}ms",
++                    f"{data['p95_latency_ms']:.0f}ms",
+                 )
++                
++                # Breakdown rows for multi-provider models
++                if len(data["providers"]) > 1:
++                    for provider_key, provider_stats in data["provider_stats"].items():
++                        # Find provider label from registry
++                        provider_label = next(
++                            (p["label"] for p in PROVIDER_REGISTRY if p["key"] == provider_key),
++                            provider_key
++                        )
++                        
++                        # Calculate percentage for this provider
++                        provider_pct = f"{(provider_stats.get('requests', 0) / data['total_requests'] * 100):.0f}%" if data['total_requests'] > 0 else "0%"
++                        
++                        table.add_row(
++                            f"  via {provider_label}",
++                            "",  # Providers column (empty for breakdown)
++                            f"{provider_stats.get('requests', 0)} ({provider_pct})",
++                            _fmt_number(provider_stats.get("tokens", 0)),
++                            str(provider_stats.get("errors_429", 0)),
++                            f"{provider_stats.get('avg_latency_ms', 0):.0f}ms",
++                            f"{provider_stats.get('p50_latency_ms', 0):.0f}ms",
++                            f"{provider_stats.get('p95_latency_ms', 0):.0f}ms",
++                        )
+             
+             # Totals row
+-            total_tokens = sum(v["tokens"] for _, v in sorted_models)
+-            total_429s = sum(v["errors_429"] for _, v in sorted_models)
+-            avg_latency = sum(v["avg_latency_ms"] * v["requests"] for _, v in sorted_models) / total_requests if total_requests > 0 else 0
++            total_tokens = sum(v["total_tokens"] for _, v in sorted_models)
++            total_429s = sum(v["total_429s"] for _, v in sorted_models)
++            avg_latency = sum(v["avg_latency_ms"] * v["total_requests"] for _, v in sorted_models) / total_requests if total_requests > 0 else 0
+             table.add_row(
+                 "TOTAL",
+-                "",  # Provider column (aggregate)
++                "",
+                 str(total_requests),
+                 _fmt_number(total_tokens),
+                 str(total_429s),
