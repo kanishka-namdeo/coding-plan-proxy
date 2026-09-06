@@ -513,13 +513,12 @@ class ProxyTUI(App):
             rl_table.add_row("Warning", warning)
 
         # Request statistics — use AGGREGATED totals across all providers
+        from tui_status import overview_request_stats
+        stats = overview_request_stats(status)
         stats_table = self.query_one("#request-stats", DataTable)
         stats_table.clear()
-        total_fwd = multi.get("total_forwarded", 0)
-        total_rejected = multi.get("total_rejected", 0)
-        total_429s = multi.get("total_429s", 0)
-        total_attempts = total_fwd + total_rejected + total_429s
-        success_rate = (total_fwd / total_attempts * 100) if total_attempts > 0 else 0.0
+        total_fwd = stats["total_forwarded"]
+        total_429s = stats["total_429s"]
 
         total_request_bytes = multi.get("total_request_bytes", 0)
         total_response_bytes = multi.get("total_response_bytes", 0)
@@ -559,6 +558,9 @@ class ProxyTUI(App):
         else:
             stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
 
+        stats_table.add_row("Rejected", str(stats["total_rejected"]))
+        stats_table.add_row("Pending", f"{stats['pending_requests']}/{stats['max_queue_size']}")
+        stats_table.add_row("Success Rate", f"{stats['success_rate']:.1f}%")
         stats_table.add_row("Queue Drops", str(primary.get("queue_drops", 0)))
         queue_p50 = primary.get("queue_p50_ms", 0)
         queue_p95 = primary.get("queue_p95_ms", 0)
@@ -888,26 +890,29 @@ class ProxyTUI(App):
                 if status.get("circuit_open"):
                     warnings.append("Circuit")
 
-            # Check for recent failover events
-            if warnings:  # Only check if we already have warnings
-                import json
-                log_dir = "session_logs"
-                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                log_file = f"{log_dir}/{today}.jsonl"
-                try:
-                    with open(log_file, "r", encoding="utf-8") as f:
-                        lines = f.readlines()[-50:]  # Check last 50 entries
-                        for line in lines[-10:]:  # Only last 10 for recent failovers
-                            try:
-                                entry = json.loads(line.strip())
-                                if len(entry.get("attempted_providers", [])) > 1:
-                                    if "Failover" not in warnings:
-                                        warnings.append("Failover")
-                                    break
-                            except (json.JSONDecodeError, KeyError):
-                                continue
-                except FileNotFoundError:
-                    pass
+            # Check for recent failover events (independent of other warnings)
+            import json
+            from tui_status import failover_alert_should_show
+            recent_failovers = False
+            log_dir = "session_logs"
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            log_file = f"{log_dir}/{today}.jsonl"
+            try:
+                with open(log_file, "r", encoding="utf-8") as f:
+                    lines = f.readlines()[-50:]  # Check last 50 entries
+                    for line in lines[-10:]:  # Only last 10 for recent failovers
+                        try:
+                            entry = json.loads(line.strip())
+                            if len(entry.get("attempted_providers", [])) > 1:
+                                recent_failovers = True
+                                break
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+            except FileNotFoundError:
+                pass
+            if failover_alert_should_show(warnings, recent_failovers):
+                if "Failover" not in warnings:
+                    warnings.append("Failover")
 
             if warnings:
                 badge.update("ALERT: " + " | ".join(warnings) + " critical")
