@@ -370,39 +370,21 @@ class ProxyTUI(App):
 
         while not worker.is_cancelled:
             interval = base_interval
-            status = None
             try:
                 # Respect cancellation even during sleep
                 if worker.is_cancelled:
                     break
                 raw_status = self.rate_limiter.status()
-
-                # Handle multi-provider status structure
-                # MultiProviderRateLimiter.status() returns {"primary": {...}, "secondary": {...}}
-                # Single RateLimiter.status() returns flat dict with rate limit keys
-                if "primary" in raw_status:
-                    # Multi-provider mode - use primary for main display
-                    status = raw_status["primary"]
-                    # Store full status for model table and secondary tab
-                    status["_multi_provider"] = raw_status
-                else:
-                    # Single provider mode
-                    status = raw_status
-
-                # Update history buffers for sparklines
-                tpm_used = status.get("tpm_limit", 0) - status.get("tpm_available", 0)
-                # Compute avg upstream latency from recent latencies
-                recent_lats = status.get("recent_latencies", [])
-                avg_upstream = statistics.mean(recent_lats) if recent_lats else 0.0
+                from tui_status import series_from_status
+                series = series_from_status(raw_status)
+                avg_upstream = statistics.mean(series["recent_latencies"]) if series["recent_latencies"] else 0.0
                 self.history.append(
-                    rpm=status.get("rpm_current", 0),
-                    tpm_used=tpm_used,
-                    queue_depth=status.get("pending_requests", 0),
+                    rpm=series["rpm"],
+                    tpm_used=series["tpm_used"],
+                    queue_depth=series["queue_depth"],
                     upstream_latency_ms=avg_upstream,
                 )
-
-                # Update latency tracker with fresh data (replace to avoid duplicates)
-                self.latency_tracker.latencies = list(status.get("recent_latencies", []))
+                self.latency_tracker.latencies = list(series["recent_latencies"])
 
                 # Update all UI components
                 self.call_from_thread(self._update_metrics, raw_status)
@@ -420,7 +402,7 @@ class ProxyTUI(App):
                 consecutive_errors = 0
 
                 # Adaptive: poll faster when activity detected
-                if status.get("pending_requests", 0) > 0:
+                if series["queue_depth"] > 0:
                     interval = 0.5
 
             except Exception:
