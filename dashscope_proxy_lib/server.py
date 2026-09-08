@@ -17,7 +17,8 @@ from dashscope_proxy_lib.config import (
     TERTIARY_CODING_PLAN_CONFIG, QUATERNARY_API_KEY, QUATERNARY_BASE_URL,
     QUATERNARY_CODING_PLAN_CONFIG, QUINARY_API_KEY, QUINARY_BASE_URL,
     QUINARY_CODING_PLAN_CONFIG, SENARY_API_KEY, SENARY_BASE_URL,
-    SENARY_CODING_PLAN_CONFIG,
+    SENARY_CODING_PLAN_CONFIG, SEPTENARY_API_KEY, SEPTENARY_BASE_URL,
+    SEPTENARY_CODING_PLAN_CONFIG,
 )
 from dashscope_proxy_lib.rate_limiter import RateLimiter, MultiProviderRateLimiter
 from dashscope_proxy_lib.session_log import SessionLogWriter, SESSION_LOG_DIR, SESSION_LOG_ENABLED
@@ -109,17 +110,19 @@ async def create_proxy_resources() -> tuple[MultiProviderRateLimiter, web.Applic
     quaternary_config = QUATERNARY_CODING_PLAN_CONFIG if (QUATERNARY_API_KEY and QUATERNARY_BASE_URL) else None
     quinary_config = QUINARY_CODING_PLAN_CONFIG if (QUINARY_API_KEY and QUINARY_BASE_URL) else None
     senary_config = SENARY_CODING_PLAN_CONFIG if (SENARY_API_KEY and SENARY_BASE_URL) else None
-    rate_limiter = MultiProviderRateLimiter(config, secondary_config, tertiary_config, quaternary_config, quinary_config, senary_config)
+    septenary_config = SEPTENARY_CODING_PLAN_CONFIG if (SEPTENARY_API_KEY and SEPTENARY_BASE_URL) else None
+    rate_limiter = MultiProviderRateLimiter(config, secondary_config, tertiary_config, quaternary_config, quinary_config, senary_config, septenary_config)
 
-    if secondary_config or tertiary_config or quaternary_config or quinary_config or senary_config:
+    if secondary_config or tertiary_config or quaternary_config or quinary_config or senary_config or septenary_config:
         _log(logging.INFO, "multi-provider mode enabled",
              secondary_url=SECONDARY_BASE_URL if secondary_config else None,
              tertiary_url=TERTIARY_BASE_URL if tertiary_config else None,
              quaternary_url=QUATERNARY_BASE_URL if quaternary_config else None,
              quinary_url=QUINARY_BASE_URL if quinary_config else None,
-             senary_url=SENARY_BASE_URL if senary_config else None)
+             senary_url=SENARY_BASE_URL if senary_config else None,
+             septenary_url=SEPTENARY_BASE_URL if septenary_config else None)
     else:
-        _log(logging.INFO, "single-provider mode (secondary/tertiary/quaternary/quinary/senary not configured)")
+        _log(logging.INFO, "single-provider mode (secondary/tertiary/quaternary/quinary/senary/septenary not configured)")
 
     app = create_app()
     timeout = aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_TOTAL, connect=UPSTREAM_TIMEOUT_CONNECT)
@@ -148,9 +151,6 @@ async def create_proxy_resources() -> tuple[MultiProviderRateLimiter, web.Applic
          host=PROXY_HOST, port=PROXY_PORT, target=TARGET_BASE,
          rps=rate_limiter.primary.rps_limit, rpm=rate_limiter.primary.rpm_limit,
          tpm=rate_limiter.primary.tpm_limit,
-         quota_5h=rate_limiter.primary.hour5_limit,
-         quota_week=rate_limiter.primary.week_limit,
-         quota_month=rate_limiter.primary.month_limit,
          safety_factor=config["safety_factor"])
 
     # Signal handlers
