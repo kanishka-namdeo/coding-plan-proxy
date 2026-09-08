@@ -1,72 +1,62 @@
-# Task 3 Report: Update on_mount() for Dynamic Table Configuration
+# Task 3 Report: Remove Quota Retry Logic from Handlers
 
-## Status
-✅ Complete
+**Status:** DONE_WITH_CONCERNS
 
-## Changes
-Refactored `on_mount()` method in `proxy_tui.py` to use dynamic table configuration via `PROVIDER_REGISTRY` loop.
+## Commit Hashes
 
-### Before (hardcoded, 35 lines)
-```python
-# Configure secondary metrics table (in Overview tab)
-try:
-    secondary_table = self.query_one("#secondary-rl-metrics", DataTable)
-    secondary_table.add_columns("Metric", "Value")
-    secondary_table.show_header = False
-    secondary_table.zebra_stripes = True
-except NoMatches:
-    pass
-
-# Configure tertiary (OpenLux) metrics table (in Overview tab)
-try:
-    tertiary_table = self.query_one("#tertiary-rl-metrics", DataTable)
-    ...
-except NoMatches:
-    pass
-
-# Configure quaternary (ARK) metrics table (in Overview tab)
-try:
-    quaternary_table = self.query_one("#quaternary-rl-metrics", DataTable)
-    ...
-except NoMatches:
-    pass
-
-# Configure quinary (Meta AI) metrics table (in Overview tab)
-try:
-    quinary_table = self.query_one("#quinary-rl-metrics", DataTable)
-    ...
-except NoMatches:
-    pass
-```
-
-### After (dynamic, 10 lines)
-```python
-# Configure dynamic provider metrics tables
-for provider_info in PROVIDER_REGISTRY[1:]:  # Skip primary
-    provider_key = provider_info["key"]
-    try:
-        table = self.query_one(f"#{provider_key}-rl-metrics", DataTable)
-        table.add_columns("Metric", "Value")
-        table.show_header = False
-        table.zebra_stripes = True
-    except NoMatches:
-        pass
-```
-
-## Benefits
-- **Reduced code**: 35 lines → 10 lines (25 lines saved)
-- **Automatic senary support**: DeepSeek table now auto-configured
-- **Future-proof**: Adding new providers only requires updating `PROVIDER_REGISTRY`
-- **Consistent with Task 2**: Mirrors the `compose()` refactoring pattern
-
-## Commits
-- `fdfd37f` - refactor(tui): dynamic table configuration via registry loop
-
-## Verification
-```bash
-$ python -m py_compile proxy_tui.py
-# Exit code: 0 (no syntax errors)
-```
+- `fc11027fc641eea13d08c73655d6a84a7bf24481` — refactor(handlers): remove quota retry logic, immediate terminal 429
 
 ## Test Summary
-Syntax verification passed. The loop correctly iterates over `PROVIDER_REGISTRY[1:]` (secondary through senary), configuring each provider's metrics table with consistent settings.
+
+### Tests Run
+
+| Test | Result |
+|------|--------|
+| `test_retries_on_429_then_succeeds` | PASSED |
+| `test_streaming_429_retries_then_succeeds` | PASSED |
+| `test_streaming_429_forwards_retry_after_header` | PASSED |
+| `test_non_streaming_429_after_max_retries` | PASSED |
+| `test_multiple_429s_then_success` | PASSED |
+| `test_non_200_non_429_non_5xx_forwarded` | PASSED |
+| `test_quota_exceeded_429_not_retried` | FAILED (expected) |
+
+**Summary:** 6 passed, 1 failed. The failing test is the quota-specific test that was testing the old quota retry behavior. Per the brief, "Quota-specific tests will be updated in Task 5."
+
+## Concerns
+
+1. **Quota-specific test failure:** `test_quota_exceeded_429_not_retried` fails because it was testing the old quota retry behavior (expecting 2 calls due to cooldown retry). The new behavior immediately returns the terminal 429 without retry, so only 1 upstream call is made. This test will be updated in Task 5 per the brief.
+
+## Implementation Details
+
+### Changes Made
+
+1. **Removed quota retry variables** (around line 410):
+   - Removed `quota_retries = 0`
+   - Removed `quota_max = getattr(limiter, "quota_max_retries", 0)`
+   - Removed `quota_cooldown = getattr(limiter, "quota_retry_cooldown", 1800)`
+
+2. **Streaming 429 handling** (around line 560):
+   - Replaced the quota retry logic (20+ lines of cooldown sleep and retry) with immediate return:
+     - Changed `error_reason` from `"upstream_quota_exceeded"` to `"upstream_429_terminal"`
+     - Changed log message from `"upstream quota exceeded, not retrying"` to `"upstream terminal 429, not retrying"`
+     - Removed the cooldown sleep and retry loop entirely
+     - Returns HTTP 429 immediately with the upstream body and headers
+
+3. **Non-streaming 429 handling** (around line 800):
+   - Same changes as streaming: immediate return for terminal 429, no cooldown retry
+
+### Unchanged Behavior
+
+- `should_retry_429()` function remains unchanged — it still classifies 429s as retryable or terminal
+- Generic 429 retry logic (for retryable 429s) remains unchanged — still uses backoff and max retries
+- The proxy still distinguishes between terminal 429s (immediate return) and retryable 429s (normal retry path)
+
+### Verification
+
+- No linter errors in `handlers.py`
+- No remaining references to `quota_retries`, `quota_max`, or `quota_cooldown` in the codebase
+- All generic 429 retry tests pass
+
+## Files Modified
+
+- `dashscope_proxy_lib/handlers.py` — 1 file changed, 5 insertions(+), 32 deletions(-)

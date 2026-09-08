@@ -112,16 +112,9 @@ CODING_PLAN_CONFIG = {
     "rpm_limit": 9,
     "tpm_limit": 4_000_000,
     "safety_factor": 0.8,
-    "requests_per_5h": 6000,
-    "requests_per_week": 45000,
-    "requests_per_month": 90000,
     "max_queue_size": 500,
     "max_retries": 40,
     "base_backoff": 1.0,
-    # Quota-exceeded retry: wait this many seconds then retry once.
-    # Alibaba Coding Plan cooldown is ~30 min; default covers it with margin.
-    "quota_retry_cooldown": _safe_int("PROXY_QUOTA_RETRY_COOLDOWN", 1800),
-    "quota_max_retries": _safe_int("PROXY_QUOTA_MAX_RETRIES", 1),
 }
 
 # ---------------------------------------------------------------------------
@@ -131,14 +124,9 @@ SECONDARY_CODING_PLAN_CONFIG = {
     "rpm_limit": _safe_int("SECONDARY_RPM_LIMIT", CODING_PLAN_CONFIG["rpm_limit"]),
     "tpm_limit": _safe_int("SECONDARY_TPM_LIMIT", CODING_PLAN_CONFIG["tpm_limit"]),
     "safety_factor": _safe_float("SECONDARY_SAFETY_FACTOR", CODING_PLAN_CONFIG["safety_factor"]),
-    "requests_per_5h": _safe_int("SECONDARY_REQUESTS_PER_5H", CODING_PLAN_CONFIG["requests_per_5h"]),
-    "requests_per_week": _safe_int("SECONDARY_REQUESTS_PER_WEEK", CODING_PLAN_CONFIG["requests_per_week"]),
-    "requests_per_month": _safe_int("SECONDARY_REQUESTS_PER_MONTH", CODING_PLAN_CONFIG["requests_per_month"]),
     "max_queue_size": _safe_int("SECONDARY_MAX_QUEUE_SIZE", CODING_PLAN_CONFIG["max_queue_size"]),
     "max_retries": _safe_int("SECONDARY_MAX_RETRIES", CODING_PLAN_CONFIG["max_retries"]),
     "base_backoff": _safe_float("SECONDARY_BASE_BACKOFF", CODING_PLAN_CONFIG["base_backoff"]),
-    "quota_retry_cooldown": _safe_int("SECONDARY_QUOTA_RETRY_COOLDOWN", CODING_PLAN_CONFIG["quota_retry_cooldown"]),
-    "quota_max_retries": _safe_int("SECONDARY_QUOTA_MAX_RETRIES", CODING_PLAN_CONFIG["quota_max_retries"]),
 }
 
 # ---------------------------------------------------------------------------
@@ -148,28 +136,18 @@ TERTIARY_DEFAULTS = {
     "rpm_limit": 40,
     "tpm_limit": 6_000_000,
     "safety_factor": 0.8,
-    "requests_per_5h": 3000,
-    "requests_per_week": 20000,
-    "requests_per_month": 50000,
     "max_queue_size": 200,
     "max_retries": 20,
     "base_backoff": 1.0,
-    "quota_retry_cooldown": 1800,
-    "quota_max_retries": 1,
 }
 
 TERTIARY_CODING_PLAN_CONFIG = {
     "rpm_limit": _safe_int("TERTIARY_RPM_LIMIT", TERTIARY_DEFAULTS["rpm_limit"]),
     "tpm_limit": _safe_int("TERTIARY_TPM_LIMIT", TERTIARY_DEFAULTS["tpm_limit"]),
     "safety_factor": _safe_float("TERTIARY_SAFETY_FACTOR", TERTIARY_DEFAULTS["safety_factor"]),
-    "requests_per_5h": _safe_int("TERTIARY_REQUESTS_PER_5H", TERTIARY_DEFAULTS["requests_per_5h"]),
-    "requests_per_week": _safe_int("TERTIARY_REQUESTS_PER_WEEK", TERTIARY_DEFAULTS["requests_per_week"]),
-    "requests_per_month": _safe_int("TERTIARY_REQUESTS_PER_MONTH", TERTIARY_DEFAULTS["requests_per_month"]),
     "max_queue_size": _safe_int("TERTIARY_MAX_QUEUE_SIZE", TERTIARY_DEFAULTS["max_queue_size"]),
     "max_retries": _safe_int("TERTIARY_MAX_RETRIES", TERTIARY_DEFAULTS["max_retries"]),
     "base_backoff": _safe_float("TERTIARY_BASE_BACKOFF", TERTIARY_DEFAULTS["base_backoff"]),
-    "quota_retry_cooldown": _safe_int("TERTIARY_QUOTA_RETRY_COOLDOWN", TERTIARY_DEFAULTS["quota_retry_cooldown"]),
-    "quota_max_retries": _safe_int("TERTIARY_QUOTA_MAX_RETRIES", TERTIARY_DEFAULTS["quota_max_retries"]),
 }
 
 # ---------------------------------------------------------------------------
@@ -179,28 +157,18 @@ QUATERNARY_DEFAULTS = {
     "rpm_limit": 40,
     "tpm_limit": 6_000_000,
     "safety_factor": 0.8,
-    "requests_per_5h": 3000,
-    "requests_per_week": 20000,
-    "requests_per_month": 50000,
     "max_queue_size": 200,
     "max_retries": 20,
     "base_backoff": 1.0,
-    "quota_retry_cooldown": 1800,
-    "quota_max_retries": 1,
 }
 
 QUATERNARY_CODING_PLAN_CONFIG = {
     "rpm_limit": _safe_int("QUATERNARY_RPM_LIMIT", QUATERNARY_DEFAULTS["rpm_limit"]),
     "tpm_limit": _safe_int("QUATERNARY_TPM_LIMIT", QUATERNARY_DEFAULTS["tpm_limit"]),
     "safety_factor": _safe_float("QUATERNARY_SAFETY_FACTOR", QUATERNARY_DEFAULTS["safety_factor"]),
-    "requests_per_5h": _safe_int("QUATERNARY_REQUESTS_PER_5H", QUATERNARY_DEFAULTS["requests_per_5h"]),
-    "requests_per_week": _safe_int("QUATERNARY_REQUESTS_PER_WEEK", QUATERNARY_DEFAULTS["requests_per_week"]),
-    "requests_per_month": _safe_int("QUATERNARY_REQUESTS_PER_MONTH", QUATERNARY_DEFAULTS["requests_per_month"]),
     "max_queue_size": _safe_int("QUATERNARY_MAX_QUEUE_SIZE", QUATERNARY_DEFAULTS["max_queue_size"]),
     "max_retries": _safe_int("QUATERNARY_MAX_RETRIES", QUATERNARY_DEFAULTS["max_retries"]),
     "base_backoff": _safe_float("QUATERNARY_BASE_BACKOFF", QUATERNARY_DEFAULTS["base_backoff"]),
-    "quota_retry_cooldown": _safe_int("QUATERNARY_QUOTA_RETRY_COOLDOWN", QUATERNARY_DEFAULTS["quota_retry_cooldown"]),
-    "quota_max_retries": _safe_int("QUATERNARY_QUOTA_MAX_RETRIES", QUATERNARY_DEFAULTS["quota_max_retries"]),
 }
 
 # ---------------------------------------------------------------------------
@@ -210,28 +178,18 @@ QUINARY_DEFAULTS = {
     "rpm_limit": 3000,
     "tpm_limit": 4_000_000,
     "safety_factor": 0.8,
-    "requests_per_5h": 10000,
-    "requests_per_week": 50000,
-    "requests_per_month": 100000,
     "max_queue_size": 500,
     "max_retries": 20,
     "base_backoff": 0.5,
-    "quota_retry_cooldown": 60,
-    "quota_max_retries": 1,
 }
 
 QUINARY_CODING_PLAN_CONFIG = {
     "rpm_limit": _safe_int("QUINARY_RPM_LIMIT", QUINARY_DEFAULTS["rpm_limit"]),
     "tpm_limit": _safe_int("QUINARY_TPM_LIMIT", QUINARY_DEFAULTS["tpm_limit"]),
     "safety_factor": _safe_float("QUINARY_SAFETY_FACTOR", QUINARY_DEFAULTS["safety_factor"]),
-    "requests_per_5h": _safe_int("QUINARY_REQUESTS_PER_5H", QUINARY_DEFAULTS["requests_per_5h"]),
-    "requests_per_week": _safe_int("QUINARY_REQUESTS_PER_WEEK", QUINARY_DEFAULTS["requests_per_week"]),
-    "requests_per_month": _safe_int("QUINARY_REQUESTS_PER_MONTH", QUINARY_DEFAULTS["requests_per_month"]),
     "max_queue_size": _safe_int("QUINARY_MAX_QUEUE_SIZE", QUINARY_DEFAULTS["max_queue_size"]),
     "max_retries": _safe_int("QUINARY_MAX_RETRIES", QUINARY_DEFAULTS["max_retries"]),
     "base_backoff": _safe_float("QUINARY_BASE_BACKOFF", QUINARY_DEFAULTS["base_backoff"]),
-    "quota_retry_cooldown": _safe_int("QUINARY_QUOTA_RETRY_COOLDOWN", QUINARY_DEFAULTS["quota_retry_cooldown"]),
-    "quota_max_retries": _safe_int("QUINARY_QUOTA_MAX_RETRIES", QUINARY_DEFAULTS["quota_max_retries"]),
 }
 
 # ---------------------------------------------------------------------------
@@ -241,28 +199,18 @@ SENARY_DEFAULTS = {
     "rpm_limit": 60,
     "tpm_limit": 4_000_000,
     "safety_factor": 0.8,
-    "requests_per_5h": 10000,
-    "requests_per_week": 50000,
-    "requests_per_month": 100000,
     "max_queue_size": 500,
     "max_retries": 20,
     "base_backoff": 0.5,
-    "quota_retry_cooldown": 60,
-    "quota_max_retries": 1,
 }
 
 SENARY_CODING_PLAN_CONFIG = {
     "rpm_limit": _safe_int("SENARY_RPM_LIMIT", SENARY_DEFAULTS["rpm_limit"]),
     "tpm_limit": _safe_int("SENARY_TPM_LIMIT", SENARY_DEFAULTS["tpm_limit"]),
     "safety_factor": _safe_float("SENARY_SAFETY_FACTOR", SENARY_DEFAULTS["safety_factor"]),
-    "requests_per_5h": _safe_int("SENARY_REQUESTS_PER_5H", SENARY_DEFAULTS["requests_per_5h"]),
-    "requests_per_week": _safe_int("SENARY_REQUESTS_PER_WEEK", SENARY_DEFAULTS["requests_per_week"]),
-    "requests_per_month": _safe_int("SENARY_REQUESTS_PER_MONTH", SENARY_DEFAULTS["requests_per_month"]),
     "max_queue_size": _safe_int("SENARY_MAX_QUEUE_SIZE", SENARY_DEFAULTS["max_queue_size"]),
     "max_retries": _safe_int("SENARY_MAX_RETRIES", SENARY_DEFAULTS["max_retries"]),
     "base_backoff": _safe_float("SENARY_BASE_BACKOFF", SENARY_DEFAULTS["base_backoff"]),
-    "quota_retry_cooldown": _safe_int("SENARY_QUOTA_RETRY_COOLDOWN", SENARY_DEFAULTS["quota_retry_cooldown"]),
-    "quota_max_retries": _safe_int("SENARY_QUOTA_MAX_RETRIES", SENARY_DEFAULTS["quota_max_retries"]),
 }
 
 # ---------------------------------------------------------------------------
@@ -272,28 +220,18 @@ SEPTENARY_DEFAULTS = {
     "rpm_limit": 60,
     "tpm_limit": 4_000_000,
     "safety_factor": 0.8,
-    "requests_per_5h": 10000,
-    "requests_per_week": 50000,
-    "requests_per_month": 100000,
     "max_queue_size": 500,
     "max_retries": 20,
     "base_backoff": 0.5,
-    "quota_retry_cooldown": 60,
-    "quota_max_retries": 1,
 }
 
 SEPTENARY_CODING_PLAN_CONFIG = {
     "rpm_limit": _safe_int("SEPTENARY_RPM_LIMIT", SEPTENARY_DEFAULTS["rpm_limit"]),
     "tpm_limit": _safe_int("SEPTENARY_TPM_LIMIT", SEPTENARY_DEFAULTS["tpm_limit"]),
     "safety_factor": _safe_float("SEPTENARY_SAFETY_FACTOR", SEPTENARY_DEFAULTS["safety_factor"]),
-    "requests_per_5h": _safe_int("SEPTENARY_REQUESTS_PER_5H", SEPTENARY_DEFAULTS["requests_per_5h"]),
-    "requests_per_week": _safe_int("SEPTENARY_REQUESTS_PER_WEEK", SEPTENARY_DEFAULTS["requests_per_week"]),
-    "requests_per_month": _safe_int("SEPTENARY_REQUESTS_PER_MONTH", SEPTENARY_DEFAULTS["requests_per_month"]),
     "max_queue_size": _safe_int("SEPTENARY_MAX_QUEUE_SIZE", SEPTENARY_DEFAULTS["max_queue_size"]),
     "max_retries": _safe_int("SEPTENARY_MAX_RETRIES", SEPTENARY_DEFAULTS["max_retries"]),
     "base_backoff": _safe_float("SEPTENARY_BASE_BACKOFF", SEPTENARY_DEFAULTS["base_backoff"]),
-    "quota_retry_cooldown": _safe_int("SEPTENARY_QUOTA_RETRY_COOLDOWN", SEPTENARY_DEFAULTS["quota_retry_cooldown"]),
-    "quota_max_retries": _safe_int("SEPTENARY_QUOTA_MAX_RETRIES", SEPTENARY_DEFAULTS["quota_max_retries"]),
 }
 
 

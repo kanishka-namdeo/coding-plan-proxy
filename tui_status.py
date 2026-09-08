@@ -10,11 +10,11 @@ def series_from_status(status: dict) -> dict:
     if is_multi_provider(status):
         rpm = sum(
             (status.get(k) or {}).get("rpm_current", 0)
-            for k in ("primary", "secondary", "tertiary", "quaternary", "quinary", "senary")
+            for k in ("primary", "secondary", "tertiary", "quaternary", "quinary", "senary", "septenary")
             if isinstance(status.get(k), dict)
         )
         tpm_used = 0
-        for k in ("primary", "secondary", "tertiary", "quaternary", "quinary", "senary"):
+        for k in ("primary", "secondary", "tertiary", "quaternary", "quinary", "senary", "septenary"):
             p = status.get(k)
             if isinstance(p, dict):
                 tpm_used += p.get("tpm_limit", 0) - p.get("tpm_available", 0)

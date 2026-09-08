@@ -200,6 +200,7 @@ The proxy supports multiple upstream providers:
 - **Quaternary**: ARK/BytePlus (optional)
 - **Quinary**: Meta AI / Muse Spark (optional)
 - **Senary**: DeepSeek (optional)
+- **Septenary**: GLM (optional)
 
 Configure additional providers in `.env` to enable automatic routing based on model name.
 

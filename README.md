@@ -129,9 +129,6 @@ Tweak `CODING_PLAN_CONFIG` in `dashscope_proxy_lib/config.py` to match your plan
 | `rpm_limit` | 9 | Max requests per minute (before safety factor) |
 | `tpm_limit` | 4,000,000 | Max tokens per minute |
 | `safety_factor` | 0.8 | Multiply all limits by this (0.8 = leave 20% headroom) |
-| `requests_per_5h` | 6000 | Rolling 5-hour request cap |
-| `requests_per_week` | 45000 | Weekly request cap |
-| `requests_per_month` | 90000 | Monthly request cap |
 | `max_queue_size` | 500 | Max requests waiting in queue |
 | `max_retries` | 40 | Max retries on 429 responses |
 | `base_backoff` | 1.0 | Base seconds for exponential backoff |

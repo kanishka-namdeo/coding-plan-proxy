@@ -1,63 +1,41 @@
-# Task 8: Verification and Integration Testing
+# Task 8: Update Screenshot Capture Mock Status
 
-**What to do:**
+**Goal:** Remove quota fields from mock status in screenshot capture script.
 
-Perform final verification that all StreamLake references have been replaced with OpenLux across the entire codebase.
+**Files:**
+- Modify: `capture_screenshots.py`
 
-## Verification Steps
+## Exact Requirements
 
-1. **Search for remaining StreamLake references** (excluding design docs):
-   ```
-   rg -n "StreamLake" --type py --type md .env.example 2>&1
-   ```
-   Expected: No output (all references updated)
+### _default_status() method (around line 35)
+Remove quota fields:
+```python
+    def _default_status(self) -> dict:
+        return {
+            "rps_limit": 0, "rpm_limit": 0, "rpm_current": 0,
+            "tpm_limit": 0, "tpm_available": 0, "tpm_reserved": 0,
+            # Remove: "requests_5h": 0, "requests_5h_limit": 0,
+            # Remove: "requests_week": 0, "requests_week_limit": 0,
+            # Remove: "requests_month": 0, "requests_month_limit": 0,
+            "total_forwarded": 0, "queue_drops": 0, "queue_p50_ms": 0, "queue_p95_ms": 0, "queue_p99_ms": 0, "total_429s": 0,
+            "total_rejected": 0, "total_tokens_consumed": 0,
+            "pending_requests": 0, "recent_latencies": [],
+            "model_usage": {}, "uptime_seconds": 0,
+            "circuit_open": False, "circuit_failure_count": 0,
+        }
+```
 
-2. **Verify OpenLux references are present**:
-   ```
-   rg -n "OpenLux" --type py --type md .env.example | head -20
-   ```
-   Expected: Multiple lines showing OpenLux references
+## Tests to Run
 
-3. **Run full test suite**:
-   ```
-   python -m pytest tests/ -v
-   ```
-   Expected: All tests pass (note: integration tests may have pre-existing fixture issues)
+After making changes:
+1. Run: `py -m pytest tests/test_units.py::TestSlidingWindowCounter -v`
 
-4. **Verify configuration loads correctly**:
-   ```python
-   python -c "from dashscope_proxy_lib.config import TERTIARY_MODELS; import json; print(json.dumps(TERTIARY_MODELS, indent=2))"
-   ```
-   Expected: JSON output showing 4 new models (gemini-3.7-flash, gpt-5.6-terra, gpt-5.6-sol, qwen3.8-max)
+Expected: Tests pass (mock status only).
 
-5. **Verify provider router initialization**:
-   ```python
-   python -c "
-   from dashscope_proxy_lib.provider_router import ProviderRouter
-   router = ProviderRouter()
-   print('Tertiary configured:', router.is_tertiary_configured())
-   print('Tertiary model IDs:', router._tertiary_model_ids)
-   "
-   ```
-   Expected:
-   - Tertiary configured: False (unless OPENLUX_API_KEY is set)
-   - Tertiary model IDs: {'gemini-3.7-flash', 'gpt-5.6-terra', 'gpt-5.6-sol', 'qwen3.8-max'}
+## Commit
 
-6. **Create final summary commit** (if any files were missed):
-   ```
-   git add -A
-   git status
-   ```
-
-## Report Format
-
-Write your full report to `.superpowers/sdd/task-8-report.md`:
-- Verification results for each step
-- Any issues found
-- Final status of the migration
-
-Then report back with ONLY (under 15 lines):
-- **Status:** DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
-- One-line summary of verification results
-- Any concerns or issues found
-- The report file path
+After implementing:
+```bash
+git add capture_screenshots.py
+git commit -m "refactor(screenshots): remove quota fields from mock status"
+```

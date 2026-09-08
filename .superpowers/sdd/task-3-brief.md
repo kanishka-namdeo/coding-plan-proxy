@@ -1,99 +1,77 @@
-### Task 3: Prefix-pin routing + 400 on bad pin
+# Task 3: Remove Quota Retry Logic from Handlers
+
+**Goal:** Remove quota retry variables and special quota-429 branches from request handler.
 
 **Files:**
-- Modify: `dashscope_proxy_lib/provider_router.py` (`get_provider_for_model()`)
-- Modify: `dashscope_proxy_lib/handlers.py` (parse prefix at model extraction, strip before upstream, 400 on unknown/unconfigured pin)
-- Test: `tests/test_units.py` + `tests/test_integration.py` (append tests)
+- Modify: `dashscope_proxy_lib/handlers.py`
 
-**Interfaces:**
-- Consumes: `split_provider_prefix()` from Task 1 (returns `(provider_or_None, bare_model)` with tail already alias-normalized).
-- Produces: `get_provider_for_model()` honors pins (no signature change); handler sends 400 for bad pins before queue/TPM.
+## Exact Requirements
 
-- [ ] **Step 1: Write the failing tests**
-
-Unit (`tests/test_units.py`):
-
+### Remove quota retry variables
+From the variable initialization section (around line 410), remove:
 ```python
-class TestPinnedRouting:
-    def test_pinned_model_routes_to_pinned_provider(self, dashscope_module, monkeypatch):
-        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "k")
-        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "https://t.example.com/v1")
-        router = dashscope_module.ProviderRouter()
-        assert router.get_provider_for_model("openlux/gemini-3.7-flash").name == "tertiary"
-
-    def test_pin_to_unconfigured_provider_falls_back(self, dashscope_module, monkeypatch):
-        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "")
-        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "")
-        router = dashscope_module.ProviderRouter()
-        assert router.get_provider_for_model("openlux/gemini-3.7-flash").name == "primary"
+    quota_retries = 0
+    quota_max = getattr(limiter, "quota_max_retries", 0)
+    quota_cooldown = getattr(limiter, "quota_retry_cooldown", 1800)
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `py -m pytest tests/test_units.py::TestPinnedRouting -v`
-Expected: FAIL (pinned name not found in model sets → routes primary; first test fails)
-
-- [ ] **Step 3: Write minimal implementation**
-
-1. In `provider_router.py::get_provider_for_model`, at the top after `normalize_model_name`:
-
+### Streaming 429 handling (around line 560)
+Replace the quota retry logic:
 ```python
-from dashscope_proxy_lib.request_transform import split_provider_prefix
-pinned, bare = split_provider_prefix(model_name)
-if pinned is not None:
-    provider = getattr(self, pinned)
-    if provider.is_available:
-        return provider
-    model_name = bare  # fall through to normal resolution on bare name
-else:
-    model_name = bare
+                        if not should_retry_429(error_body):
+                            if quota_retries < quota_max:
+                                quota_retries += 1
+                                _log(logging.WARNING, "upstream quota exceeded, retrying after cooldown",
+                                     request_id=request_id, model=model_name,
+                                     quota_retry=quota_retries, quota_max=quota_max,
+                                     cooldown_sec=quota_cooldown)
+                                del error_body
+                                if not await _sleep_interruptible(request, quota_cooldown):
+                                    error_reason = "client_disconnected"
+                                    status_code = 499
+                                    await limiter.refund_tokens(estimated_tokens)
+                                    return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
+                                continue
+                            error_reason = "upstream_quota_exceeded"
+                            status_code = 429
+                            _log(logging.WARNING, "upstream quota exceeded, not retrying",
+                                 request_id=request_id, model=model_name)
+                            await limiter.refund_tokens(estimated_tokens)
+                            resp = web.Response(status=429, body=error_body, content_type="application/json")
+                            resp.headers["X-Request-ID"] = request_id
+                            _add_forwarded_headers(resp, upstream_headers)
+                            return resp
 ```
 
-If a pin targets an unconfigured provider, fall through to normal resolution
-on the bare name (layered semantics, pre-flight decision: router falls back so
-`get_provider_for_model` stays total; the HTTP handler below returns 400
-for the same request, so users never see a silent reroute).
-
-2. In `handlers.py::handle_request`, after `model_name`/`is_stream` extraction (around line 234), insert pin validation before router selection:
-
+With immediate return:
 ```python
-from dashscope_proxy_lib.request_transform import split_provider_prefix
-pinned_name, bare_name = split_provider_prefix(model_name or "")
-if "/" in (model_name or "") and pinned_name is None:
-    error_reason = "unknown_provider_prefix"
-    status_code = 400
-    return _make_error_response(
-        400,
-        json.dumps({"error": "unknown provider prefix", "model": model_name}).encode(),
-        request_id,
-    )
-if pinned_name is not None:
-    provider_check = getattr(router, pinned_name)
-    if not provider_check.is_available:
-        error_reason = "provider_not_configured"
-        status_code = 400
-        return _make_error_response(
-            400,
-            json.dumps({"error": f"provider '{pinned_name}' not configured", "model": model_name}).encode(),
-            request_id,
-        )
-    model_name = bare_name
-    body["model"] = bare_name
-    body_bytes = json.dumps(body).encode()
+                        if not should_retry_429(error_body):
+                            error_reason = "upstream_429_terminal"
+                            status_code = 429
+                            _log(logging.WARNING, "upstream terminal 429, not retrying",
+                                 request_id=request_id, model=model_name)
+                            await limiter.refund_tokens(estimated_tokens)
+                            resp = web.Response(status=429, body=error_body, content_type="application/json")
+                            resp.headers["X-Request-ID"] = request_id
+                            _add_forwarded_headers(resp, upstream_headers)
+                            return resp
 ```
 
-Note: `router = get_provider_router()` already exists at line 238 — place the validation after it. The stripped `body_bytes` ensures upstream never sees the prefix (LiteLLM convention).
+### Non-streaming 429 handling (around line 810)
+Replace the same quota retry logic with immediate return.
 
-CAUTION (early-exit session logging): the function's early 400-exits before the main try/finally write session entries via `_maybe_flush_session_log(request.app, session_entry)` — follow that pattern for both new 400 returns (set `session_entry["status_code"]`/`["error_reason"]`, await `_maybe_flush_session_log`, then return). Also set `session_entry["model"]` if needed for log usefulness — check how neighboring early-exits do it and match.
+## Tests to Run
 
-- [ ] **Step 4: Run tests to verify they pass**
+After making changes:
+1. Run: `py -m pytest tests/test_integration.py::TestMaxRetriesExhausted -v`
+2. Run: `py -m pytest tests/test_integration.py::TestNonStreaming429 -v`
 
-Run: `py -m pytest tests/test_units.py tests/test_integration.py -v`
-Expected: PASS
+Expected: Generic 429 retry tests pass. Quota-specific tests will be updated in Task 5.
 
-- [ ] **Step 5: Commit**
+## Commit
 
+After implementing:
 ```bash
-git add dashscope_proxy_lib/provider_router.py dashscope_proxy_lib/handlers.py tests/test_units.py tests/test_integration.py
-git commit -m "feat: provider-prefixed model routing with 400 on bad pin"
+git add dashscope_proxy_lib/handlers.py
+git commit -m "refactor(handlers): remove quota retry logic, immediate terminal 429"
 ```

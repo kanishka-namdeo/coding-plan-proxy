@@ -1,26 +1,76 @@
-# Task 2 Review: Refactor compose() for Dynamic Provider Sections
+# Task 2 Report: Remove Quota State from RateLimiter
 
-## Spec Compliance: ✅ PASS
+## Status: DONE
 
-All requirements met:
+## Commit Hash
+`93051e8`
 
-1. ✅ Replaced hardcoded secondary/tertiary/quaternary/quinary/senary sections with a loop over `PROVIDER_REGISTRY[1:]`
-2. ✅ Generated dynamic provider sections with IDs `{key}-overview`, `{key}-status-line`, `{key}-rl-metrics`
-3. ✅ Included senary (DeepSeek) provider section (PROVIDER_REGISTRY has 6 providers, loop skips primary)
+## Test Summary
 
-## Code Quality: ✅ Approved
+### Test Results
 
-**Strengths:**
-- Clean loop implementation eliminates ~20 lines of repetitive code
-- Consistent ID naming pattern: `{provider_key}-overview`, `{provider_key}-status-line`, `{provider_key}-rl-metrics`
-- PROVIDER_REGISTRY correctly contains all 6 providers including senary (DeepSeek)
-- Slicing `[1:]` correctly skips primary provider which has separate rendering logic
+**TestRateLimiterCanProceed** (6 tests)
+- ✅ `test_allows_when_under_limits` - PASSED
+- ❌ `test_blocks_at_5h_limit` - FAILED (expected - quota test)
+- ❌ `test_blocks_at_weekly_limit` - FAILED (expected - quota test)
+- ❌ `test_blocks_at_monthly_limit` - FAILED (expected - quota test)
+- ✅ `test_blocks_at_rpm_limit` - PASSED
+- ✅ `test_rps_spacing` - PASSED
 
-**Verified:**
-- Loop iterates over secondary, tertiary, quaternary, quinary, and senary
-- Dynamic IDs match expected pattern for downstream JavaScript/CSS integration
-- All providers use identical rendering logic (title, status line, metrics table)
+**TestSlidingWindowCounter** (5 tests)
+- ✅ All 5 tests PASSED
 
-## Verdict
+**Summary**: 8 passed, 3 failed (quota-specific tests expected to fail, will be removed in Task 5)
 
-✅ **PASS** — Spec fully compliant, code quality approved.
+## Implementation Details
+
+### RateLimiter.__init__()
+Removed the following state variables:
+- `self.hour5_window = SlidingWindowCounter(5 * 3600)`
+- `self.week_count = 0`
+- `self.month_count = 0`
+- `self.week_start = time.time()`
+- `self.month_start = time.time()`
+- `self.week_limit = config["requests_per_week"]`
+- `self.month_limit = config["requests_per_month"]`
+- `self.hour5_limit = config["requests_per_5h"]`
+- `self.quota_retry_cooldown = config.get("quota_retry_cooldown", 1800)`
+- `self.quota_max_retries = config.get("quota_max_retries", 1)`
+
+### RateLimiter.can_proceed()
+Removed the following quota checks:
+- Weekly window reset logic
+- Monthly window reset logic
+- 5-hour quota exhausted check
+- Weekly quota exhausted check
+- Monthly quota exhausted check
+
+### RateLimiter.record_request()
+Removed the following quota increments:
+- `self.hour5_window.add(now)`
+- `self.week_count += 1`
+- `self.month_count += 1`
+
+### RateLimiter.status()
+Removed the following quota status fields:
+- `"requests_5h": self.hour5_window.count(now)`
+- `"requests_5h_limit": self.hour5_limit`
+- `"requests_week": self.week_count`
+- `"requests_week_limit": self.week_limit`
+- `"requests_month": self.month_count`
+- `"requests_month_limit": self.month_limit`
+
+### MultiProviderRateLimiter.__init__()
+Updated all `limits_differ` checks (6 providers) from:
+```python
+for k in ["rpm_limit", "tpm_limit", "requests_per_5h",
+         "requests_per_week", "requests_per_month"]
+```
+
+To:
+```python
+for k in ["rpm_limit", "tpm_limit"]
+```
+
+## Concerns
+None. Implementation matches the task brief exactly.

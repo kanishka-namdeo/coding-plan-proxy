@@ -1,59 +1,100 @@
-### Task 5: Status overlaps, facade exports, docs, full suite
+# Task 5: Update Tests for Quota Removal
+
+**Goal:** Remove quota-related tests and update test configs to use reduced config shape.
 
 **Files:**
-- Modify: `dashscope_proxy_lib/handlers.py` (`/v1/proxy/status` → add `model_overlaps`)
-- Modify: `dashscope_proxy.py` (re-export `PROVIDER_SLUGS`, `MODEL_FALLBACK_ORDER`)
-- Modify: `dashscope_proxy_lib/AGENTS.md` (update provider-routing bullet)
-- Modify: `.env.example` (document `MODEL_FALLBACK_ORDER`)
-- Test: full suite `py -m pytest tests/`
+- Modify: `tests/test_units.py`
+- Modify: `tests/test_integration.py`
 
-**Interfaces:**
-- Consumes: `get_model_overlaps()` from Task 2.
-- Produces: `GET /v1/proxy/status` includes `model_overlaps: {model_id: [providers]}`.
+## Exact Requirements
 
-- [ ] **Step 1: Add `model_overlaps` to status endpoint**
+### test_units.py - Remove quota tests
 
-In `handlers.py`, in the `/v1/proxy/status` branch (around line 111), extend the status dict:
+Delete these test methods from `TestRateLimiterCanProceed`:
+- `test_blocks_at_5h_limit` (lines 62-67)
+- `test_blocks_at_weekly_limit` (lines 69-74)
+- `test_blocks_at_monthly_limit` (lines 76-81)
 
+Delete entire class `TestRateLimiterQuotaReset` (lines 115-141)
+
+### test_units.py - Update test configs
+
+Remove `requests_per_5h`, `requests_per_week`, `requests_per_month` from:
+- `test_rps_spacing` config (lines 97-99)
+- `TestComputeBackoff::test_backoff_grows_with_attempt` (lines 496-497)
+- `TestComputeBackoff::test_backoff_respects_base_config` (lines 515-516)
+- `TestWaitForSlot::test_immediate_success_under_limits` (lines 691-692)
+- `TestWaitForSlot::test_none_when_queue_full` (lines 707-708)
+- `TestWaitForSlot::test_none_when_client_disconnects` (lines 724-725)
+- `TestMultiProviderRateLimiter::_make_config` (lines 1620-1621)
+
+### test_integration.py - Update config
+
+Remove quota keys from `make_test_config` (lines 45-47)
+
+### test_integration.py - Update terminal 429 test
+
+Rename and update `test_quota_exceeded_429_not_retried` to test immediate return:
 ```python
-status = {
-    "rate_limits": rate_limiter.status(),
-    "providers": router.get_provider_status(),
-    "model_overlaps": router.get_model_overlaps(),
-}
+    async def test_terminal_429_returned_immediately(self, aiohttp_client, proxy_app):
+        """Terminal 429 from upstream is returned immediately without retry."""
+        upstream_app = web.Application()
+        quota_body = json.dumps({
+            "error": {
+                "code": "throttling",
+                "message": "usage allocated quota exceeded. please try again later.",
+            }
+        }).encode()
+        call_count = 0
+
+        async def terminal_429(request):
+            nonlocal call_count
+            call_count += 1
+            return web.Response(status=429, body=quota_body, content_type="application/json")
+
+        upstream_app.router.add_post("/v1/chat/completions", terminal_429)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                app, rl = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }).encode(),
+                    )
+                    assert resp.status == 429
+                    data = await resp.json()
+                    assert "quota exceeded" in data["error"]["message"].lower()
+                    assert call_count == 1  # Only one upstream call, no retry
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
 ```
 
-- [ ] **Step 2: Update facade exports**
+## Tests to Run
 
-In `dashscope_proxy.py`, add `PROVIDER_SLUGS` and `MODEL_FALLBACK_ORDER` to the config import block (around line 50-80) and to `__all__` (around line 160-190), alongside the other config names.
+After making changes:
+1. Run: `py -m pytest tests/`
+Expected: All tests PASS
 
-- [ ] **Step 3: Update docs**
+## Commit
 
-**AGENTS.md** — The Task 4 reviewer may have already updated the routing bullet in the working tree. Verify and complete if needed. The provider-routing bullet should document:
-- Explicit `provider/model` pin first (prefix stripped before upstream)
-- Then `MODEL_PROVIDER_MAP`
-- Then overlap-set failover in `MODEL_FALLBACK_ORDER` order (default senary→quinary→quaternary→tertiary→secondary→primary)
-- Then primary default
-- `/v1/models` is deduped with `providers`/`provider_models` fields
-
-**.env.example** — Append:
-
-```
-# Optional: overlap failover try-order (canonical provider names, comma-separated).
-# Unset = senary,quinary,quaternary,tertiary,secondary,primary.
-# MODEL_FALLBACK_ORDER=openlux,ark,dashscope
-```
-
-- [ ] **Step 4: Run full test suite**
-
-Run: `python -m pytest tests/ -v`
-Expected: unit + integration pass; e2e skipped without API key; the 4 pre-existing failures in secondary/quaternary routing tests will still be present (unrelated to this work)
-
-- [ ] **Step 5: Commit**
-
+After implementing:
 ```bash
-git add dashscope_proxy_lib/handlers.py dashscope_proxy.py dashscope_proxy_lib/AGENTS.md .env.example
-git commit -m "feat: overlap status, exports, and docs"
+git add tests/test_units.py tests/test_integration.py
+git commit -m "test: update tests for quota removal"
 ```
-
-NOTE: The tree has unrelated uncommitted changes in other files (rate_limiter.py, server.py, proxy_tui.py, etc.) — DO NOT commit them. Use `git add` on only the four paths listed above.

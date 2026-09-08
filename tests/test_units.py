@@ -439,8 +439,7 @@ class TestComputeBackoff:
     def test_backoff_grows_with_attempt(self, dashscope_module):
         config = {
             "rpm_limit": 100, "tpm_limit": 1_000_000, "safety_factor": 0.8,
-            "requests_per_5h": 1000, "requests_per_week": 1000,
-            "requests_per_month": 1000, "max_queue_size": 10,
+            "max_queue_size": 10,
             "max_retries": 5, "base_backoff": 1.0,
         }
         rl = dashscope_module.RateLimiter(config)
@@ -458,8 +457,7 @@ class TestComputeBackoff:
     def test_backoff_respects_base_config(self, dashscope_module):
         config = {
             "rpm_limit": 100, "tpm_limit": 1_000_000, "safety_factor": 0.8,
-            "requests_per_5h": 1000, "requests_per_week": 1000,
-            "requests_per_month": 1000, "max_queue_size": 10,
+            "max_queue_size": 10,
             "max_retries": 5, "base_backoff": 0.5,
         }
         rl = dashscope_module.RateLimiter(config)
@@ -634,8 +632,7 @@ class TestWaitForSlot:
     async def test_immediate_success_under_limits(self, dashscope_module):
         config = {
             "rpm_limit": 100, "tpm_limit": 1_000_000, "safety_factor": 0.8,
-            "requests_per_5h": 1000, "requests_per_week": 1000,
-            "requests_per_month": 1000, "max_queue_size": 10,
+            "max_queue_size": 10,
             "max_retries": 5, "base_backoff": 0.1,
         }
         rl = dashscope_module.RateLimiter(config)
@@ -650,8 +647,7 @@ class TestWaitForSlot:
     async def test_none_when_queue_full(self, dashscope_module):
         config = {
             "rpm_limit": 100, "tpm_limit": 1_000_000, "safety_factor": 0.8,
-            "requests_per_5h": 1000, "requests_per_week": 1000,
-            "requests_per_month": 1000, "max_queue_size": 0,
+            "max_queue_size": 0,
             "max_retries": 5, "base_backoff": 0.1,
         }
         rl = dashscope_module.RateLimiter(config)
@@ -667,8 +663,7 @@ class TestWaitForSlot:
         config = {
             "rpm_limit": 10,  # after safety_factor 0.8 -> 8, not 0
             "tpm_limit": 1_000_000, "safety_factor": 0.8,
-            "requests_per_5h": 1000, "requests_per_week": 1000,
-            "requests_per_month": 1000, "max_queue_size": 10,
+            "max_queue_size": 10,
             "max_retries": 5, "base_backoff": 0.01,
         }
         rl = dashscope_module.RateLimiter(config)
@@ -1563,8 +1558,7 @@ class TestMultiProviderRateLimiter:
     def _make_config(self):
         return {
             "rpm_limit": 60, "tpm_limit": 100_000, "safety_factor": 0.8,
-            "requests_per_5h": 100, "requests_per_week": 100,
-            "requests_per_month": 100, "max_queue_size": 5,
+            "max_queue_size": 5,
             "max_retries": 3, "base_backoff": 0.1,
         }
 

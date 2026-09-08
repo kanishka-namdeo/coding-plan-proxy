@@ -1,28 +1,57 @@
-# Task 6: Update Test Files
+# Task 6: Update Documentation
+
+**Goal:** Remove quota configuration and behavior descriptions from documentation.
 
 **Files:**
-- Modify: `tests/test_units.py`
-- Modify: `tests/test_integration.py`
+- Modify: `.env.example`
+- Modify: `README.md`
+- Modify: `README_SCRIPT.md`
+- Modify: `dashscope_proxy_lib/AGENTS.md`
 
-**What to do:**
+## Exact Requirements
 
-1. Search for all "StreamLake" references in test files
-2. Replace each occurrence with "OpenLux" in comments and test data
-3. Fix the 3 failing tests that reference the old model name `kat-coder-pro-v2.5`:
-   - `test_tertiary_model_routed_to_tertiary`
-   - `test_get_all_models_includes_tertiary_when_configured`
-   - `test_model_provider_map_tertiary_override`
-4. Update these tests to use one of the new model names (e.g., `gemini-3.7-flash`)
-5. Verify all tests pass
-6. Commit the changes
+### .env.example
+Remove all lines containing:
+- `REQUESTS_PER_5H`
+- `REQUESTS_PER_WEEK`
+- `REQUESTS_PER_MONTH`
+- `QUOTA_RETRY_COOLDOWN`
+- `QUOTA_MAX_RETRIES`
 
-**Verification:**
-- Run: `rg -n "StreamLake" tests/`
-- Expected: No output (all references updated)
-- Run: `py -m pytest tests/test_units.py tests/test_integration.py -v`
-- Expected: All tests pass (0 failures)
-
-**Commit message:**
+### README.md
+1. Remove the quota configuration table entries:
+```markdown
+| `requests_per_5h` | 6000 | Rolling 5-hour request cap |
+| `requests_per_week` | 45000 | Weekly request cap |
+| `requests_per_month` | 90000 | Monthly request cap |
 ```
-test: update test files from StreamLake to OpenLux
+
+2. Update the rate limiting feature description:
+```markdown
+**Multi-layer rate limiting**
+Enforces RPS, RPM, and TPM (via Token Bucket). A configurable safety factor keeps usage below the hard limits.
+```
+
+### README_SCRIPT.md
+Remove quota references from TUI feature description.
+
+### dashscope_proxy_lib/AGENTS.md
+Update the `RateLimiter` description:
+```markdown
+- `RateLimiter` — combines sliding window + token bucket + circuit breaker
+```
+
+## Tests to Run
+
+After making changes:
+1. Run: `py -m pytest tests/test_units.py::TestSlidingWindowCounter -v`
+
+Expected: Tests pass (documentation changes don't affect code).
+
+## Commit
+
+After implementing:
+```bash
+git add .env.example README.md README_SCRIPT.md dashscope_proxy_lib/AGENTS.md
+git commit -m "docs: remove quota configuration and behavior descriptions"
 ```

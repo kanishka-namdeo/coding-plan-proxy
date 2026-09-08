@@ -1,104 +1,120 @@
-### Task 1: Prefix parsing + new provider slugs
+# Task 1: Update RateLimiter Configuration
+
+**Goal:** Remove quota configuration keys from all provider config dictionaries.
 
 **Files:**
-- Modify: `dashscope_proxy_lib/request_transform.py` (add `split_provider_prefix()`, extend `normalize_model_name()`)
-- Modify: `dashscope_proxy.py` (re-export `split_provider_prefix`)
-- Modify: `dashscope_proxy_lib/config.py` (add `PROVIDER_SLUGS` dict, `MODEL_FALLBACK_ORDER` env)
-- Test: `tests/test_units.py` (append new test class)
+- Modify: `dashscope_proxy_lib/config.py`
+- Modify: `tests/conftest.py`
 
-**Interfaces:**
-- Consumes: existing `normalize_model_name(model_name: str) -> str`.
-- Produces: `split_provider_prefix(model: str) -> tuple[str | None, str]`; `PROVIDER_SLUGS: dict[str, str]` mapping new slug → canonical provider name (`{"dashscope": "primary", "mimo": "secondary", "openlux": "tertiary", "ark": "quaternary", "metaspark": "quinary", "deepseek": "senary"}`); `MODEL_FALLBACK_ORDER: list[str]` (parsed from env, may be `[]`).
+## Exact Requirements
 
-- [ ] **Step 1: Write the failing test**
+Remove the following keys from every provider config dictionary:
 
+### CODING_PLAN_CONFIG
+Remove these lines:
 ```python
-class TestSplitProviderPrefix:
-    def test_bare_model_returns_no_prefix(self, dashscope_module):
-        from dashscope_proxy_lib.request_transform import split_provider_prefix
-        assert split_provider_prefix("gpt-5.6-sol") == (None, "gpt-5.6-sol")
-
-    def test_openlux_prefix_splits(self, dashscope_module):
-        from dashscope_proxy_lib.request_transform import split_provider_prefix
-        assert split_provider_prefix("openlux/gpt-5.6-sol") == ("tertiary", "gpt-5.6-sol")
-
-    def test_prefix_alias_normalized(self, dashscope_module):
-        from dashscope_proxy_lib.request_transform import split_provider_prefix
-        assert split_provider_prefix("mimo/mimo-v2-5-pro") == ("secondary", "mimo-v2.5-pro")
-
-    def test_unknown_slug_returns_none(self, dashscope_module):
-        from dashscope_proxy_lib.request_transform import split_provider_prefix
-        assert split_provider_prefix("nosuch/gpt-5.6-sol") == (None, "nosuch/gpt-5.6-sol")
-
-    def test_positional_alias_still_works(self, dashscope_module):
-        from dashscope_proxy_lib.request_transform import split_provider_prefix
-        assert split_provider_prefix("tertiary/gpt-5.6-sol") == ("tertiary", "gpt-5.6-sol")
+    "requests_per_5h": 6000,
+    "requests_per_week": 45000,
+    "requests_per_month": 90000,
+    # Quota-exceeded retry: wait this many seconds then retry once.
+    # Alibaba Coding Plan cooldown is ~30 min; default covers it with margin.
+    "quota_retry_cooldown": _safe_int("PROXY_QUOTA_RETRY_COOLDOWN", 1800),
+    "quota_max_retries": _safe_int("PROXY_QUOTA_MAX_RETRIES", 1),
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `py -m pytest tests/test_units.py::TestSplitProviderPrefix -v`
-Expected: FAIL with "cannot import name 'split_provider_prefix'"
-
-- [ ] **Step 3: Write minimal implementation**
-
-In `dashscope_proxy_lib/request_transform.py`, after `normalize_model_name`, add:
-
+### SECONDARY_CODING_PLAN_CONFIG
+Remove these lines:
 ```python
-PROVIDER_SLUG_MAP = {
-    "dashscope": "primary", "primary": "primary",
-    "mimo": "secondary", "secondary": "secondary",
-    "openlux": "tertiary", "tertiary": "tertiary",
-    "ark": "quaternary", "quaternary": "quaternary",
-    "metaspark": "quinary", "quinary": "quinary",
-    "deepseek": "senary", "senary": "senary",
-}
-
-
-def split_provider_prefix(model: str) -> tuple:
-    """Split optional '<provider>/<model>' prefix. Returns (provider_or_None, bare_model)."""
-    if "/" not in model:
-        return None, model
-    head, _, tail = model.partition("/")
-    provider = PROVIDER_SLUG_MAP.get(head.lower())
-    if provider is None or not tail:
-        return None, model
-    return provider, normalize_model_name(tail)
+    "requests_per_5h": _safe_int("SECONDARY_REQUESTS_PER_5H", CODING_PLAN_CONFIG["requests_per_5h"]),
+    "requests_per_week": _safe_int("SECONDARY_REQUESTS_PER_WEEK", CODING_PLAN_CONFIG["requests_per_week"]),
+    "requests_per_month": _safe_int("SECONDARY_REQUESTS_PER_MONTH", CODING_PLAN_CONFIG["requests_per_month"]),
+    "quota_retry_cooldown": _safe_int("SECONDARY_QUOTA_RETRY_COOLDOWN", CODING_PLAN_CONFIG["quota_retry_cooldown"]),
+    "quota_max_retries": _safe_int("SECONDARY_QUOTA_MAX_RETRIES", CODING_PLAN_CONFIG["quota_max_retries"]),
 ```
 
-In `dashscope_proxy_lib/config.py`, after `MODEL_PROVIDER_MAP`, add:
-
+### TERTIARY_DEFAULTS
+Remove these lines:
 ```python
-import os as _os
-
-PROVIDER_SLUGS: dict[str, str] = {
-    "dashscope": "primary",
-    "mimo": "secondary",
-    "openlux": "tertiary",
-    "ark": "quaternary",
-    "metaspark": "quinary",
-    "deepseek": "senary",
-}
-
-MODEL_FALLBACK_ORDER: list[str] = [
-    s.strip().lower()
-    for s in _os.environ.get("MODEL_FALLBACK_ORDER", "").split(",")
-    if s.strip()
-]
+    "requests_per_5h": 3000,
+    "requests_per_week": 20000,
+    "requests_per_month": 50000,
+    "quota_retry_cooldown": 1800,
+    "quota_max_retries": 1,
 ```
 
-NOTE: `config.py` already has `import os` at the top — use plain `os`, not `os as _os`.
+### TERTIARY_CODING_PLAN_CONFIG
+Remove these lines:
+```python
+    "requests_per_5h": _safe_int("TERTIARY_REQUESTS_PER_5H", TERTIARY_DEFAULTS["requests_per_5h"]),
+    "requests_per_week": _safe_int("TERTIARY_REQUESTS_PER_WEEK", TERTIARY_DEFAULTS["requests_per_week"]),
+    "requests_per_month": _safe_int("TERTIARY_REQUESTS_PER_MONTH", TERTIARY_DEFAULTS["requests_per_month"]),
+    "quota_retry_cooldown": _safe_int("TERTIARY_QUOTA_RETRY_COOLDOWN", TERTIARY_DEFAULTS["quota_retry_cooldown"]),
+    "quota_max_retries": _safe_int("TERTIARY_QUOTA_MAX_RETRIES", TERTIARY_DEFAULTS["quota_max_retries"]),
+```
 
-In `dashscope_proxy.py`, add `split_provider_prefix` to the `request_transform` import and `__all__` list (same import block at lines 120-124, same `__all__` section at lines 178-179). Also add `PROVIDER_SLUGS` and `MODEL_FALLBACK_ORDER` to the config import block and `__all__` (alongside the other config names).
+### QUATERNARY_DEFAULTS and QUATERNARY_CODING_PLAN_CONFIG
+Remove the same 5 keys.
 
-- [ ] **Step 4: Run test to verify it passes**
+### QUINARY_DEFAULTS and QUINARY_CODING_PLAN_CONFIG
+Remove the same 5 keys.
 
-Run: `py -m pytest tests/test_units.py::TestSplitProviderPrefix tests/test_units.py -v`
-Expected: PASS (full unit file, no regressions)
+### SENARY_DEFAULTS and SENARY_CODING_PLAN_CONFIG
+Remove the same 5 keys.
 
-- [ ] **Step 5: Commit**
+### SEPTENARY_DEFAULTS and SEPTENARY_CODING_PLAN_CONFIG
+Remove the same 5 keys.
 
+### tests/conftest.py
+Update the `rate_limiter` fixture config:
+```python
+@pytest.fixture
+def rate_limiter(dashscope_module):
+    """Create a RateLimiter with tiny limits for fast tests."""
+    config = {
+        "rpm_limit": 60,
+        "tpm_limit": 100_000,
+        "safety_factor": 0.8,
+        # Remove these three lines:
+        # "requests_per_5h": 100,
+        # "requests_per_week": 100,
+        # "requests_per_month": 100,
+        "max_queue_size": 5,
+        "max_retries": 3,
+        "base_backoff": 0.1,
+    }
+    return dashscope_module.RateLimiter(config)
+```
+
+Update the `make_test_config` fixture:
+```python
+@pytest.fixture
+def make_test_config(dashscope_module):
+    """Return a config dict with large limits for fast tests."""
+    def _make():
+        return {
+            "rpm_limit": 6000,
+            "tpm_limit": 10_000_000,
+            "safety_factor": 0.8,
+            # Remove quota keys
+            "max_queue_size": 50,
+            "max_retries": 2,
+            "base_backoff": 0.05,
+        }
+    return _make
+```
+
+## Tests to Run
+
+After making changes:
+1. Run: `py -m pytest tests/test_units.py::TestSlidingWindowCounter -v`
+2. Run: `py -m pytest tests/test_units.py::TestRateLimiterCanProceed::test_allows_when_under_limits -v`
+
+Expected: These tests should pass (quota-related tests will fail in later tasks).
+
+## Commit
+
+After implementing:
 ```bash
-git add dashscope_proxy_lib/request_transform.py dashscope_proxy_lib/config.py dashscope_proxy.py tests/test_units.py
-git commit -m "feat: provider prefix parsing with slug aliases"
+git add dashscope_proxy_lib/config.py tests/conftest.py
+git commit -m "refactor(config): remove quota configuration keys"
 ```

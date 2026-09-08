@@ -29,6 +29,7 @@ PROVIDER_REGISTRY = [
     {"key": "quaternary", "label": "ARK", "slug": "ark", "config_key": "QUATERNARY_BASE_URL"},
     {"key": "quinary", "label": "Meta AI", "slug": "metaspark", "config_key": "QUINARY_BASE_URL"},
     {"key": "senary", "label": "DeepSeek", "slug": "deepseek", "config_key": "SENARY_BASE_URL"},
+    {"key": "septenary", "label": "GLM", "slug": "glm", "config_key": "SEPTENARY_BASE_URL"},
 ]
 
 
@@ -469,19 +470,6 @@ class ProxyTUI(App):
             _progress_bar(primary.get("tpm_available", 0), primary.get("tpm_limit", 1)),
         )
 
-        rl_table.add_row(
-            "5-Hour Quota",
-            _progress_bar(primary.get('requests_5h', 0), primary.get('requests_5h_limit', 1)),
-        )
-        rl_table.add_row(
-            "Weekly Quota",
-            _progress_bar(primary.get('requests_week', 0), primary.get('requests_week_limit', 1)),
-        )
-        rl_table.add_row(
-            "Monthly Quota",
-            _progress_bar(primary.get('requests_month', 0), primary.get('requests_month_limit', 1)),
-        )
-
         # Circuit breaker status (primary)
         if primary.get("circuit_open"):
             rl_table.add_row("Circuit", "OPEN (failures: {})".format(primary.get("circuit_failure_count", 0)))
@@ -649,30 +637,6 @@ class ProxyTUI(App):
             ),
         )
 
-        metrics_table.add_row(
-            "5-Hour Quota",
-            _progress_bar(
-                provider_status.get("requests_5h", 0),
-                provider_status.get("requests_5h_limit", 1)
-            ),
-        )
-
-        metrics_table.add_row(
-            "Weekly Quota",
-            _progress_bar(
-                provider_status.get("requests_week", 0),
-                provider_status.get("requests_week_limit", 1)
-            ),
-        )
-
-        metrics_table.add_row(
-            "Monthly Quota",
-            _progress_bar(
-                provider_status.get("requests_month", 0),
-                provider_status.get("requests_month_limit", 1)
-            ),
-        )
-
         # Circuit breaker status
         if provider_status.get("circuit_open"):
             metrics_table.add_row("Circuit", "OPEN (failures: {})".format(
@@ -754,9 +718,6 @@ class ProxyTUI(App):
         thresholds = [
             ("RPM", status.get("rpm_current", 0), status.get("rpm_limit", 1)),
             ("TPM", status.get("tpm_limit", 0) - status.get("tpm_available", 0) - status.get("tpm_reserved", 0), status.get("tpm_limit", 1) - status.get("tpm_reserved", 0)),
-            ("5H", status.get("requests_5h", 0), status.get("requests_5h_limit", 1)),
-            ("Week", status.get("requests_week", 0), status.get("requests_week_limit", 1)),
-            ("Month", status.get("requests_month", 0), status.get("requests_month_limit", 1)),
         ]
         for name, used, limit in thresholds:
             if limit > 0 and used / limit >= 0.9:

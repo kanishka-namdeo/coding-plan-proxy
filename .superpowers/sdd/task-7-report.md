@@ -1,32 +1,36 @@
-# Task 7 Report: Update _update_alert_badge() for All Providers
+# Task 7: Update Documentation Files - Report
 
-## Status: COMPLETED
+## Status: DONE
 
-## Changes Made
+## Summary
 
-### File Modified
-- `proxy_tui.py` — Updated `_update_alert_badge()` method (lines 886-903)
+Verification completed successfully. No StreamLake references were found in the documentation files (`AGENTS.md` and `README_SCRIPT.md`).
 
-### Before
-```python
-for provider_key in ("primary", "secondary", "tertiary", "quaternary", "quinary"):
-    provider_status = status.get(provider_key)
+## Findings
+
+### Files Checked
+
+1. **AGENTS.md** (root DOX file)
+   - No StreamLake references found
+   - Already contains updated references to OpenLux in the Child DOX Index: "proxy routing (DashScope/MIMO/OpenLux/ARK/MetaAI/DeepSeek/GLM)"
+
+2. **README_SCRIPT.md** (TUI launcher documentation)
+   - No StreamLake references found
+   - Already contains updated provider list:
+     - "Tertiary: OpenLux (optional)" in Multi-Provider Support section
+
+### Verification Command
+
+```bash
+rg -n "StreamLake" AGENTS.md README_SCRIPT.md 2>&1
 ```
 
-### After
-```python
-for provider_info in PROVIDER_REGISTRY:
-    provider_key = provider_info["key"]
-    provider_status = status.get(provider_key)
-```
+**Result:** Exit code 1 with no output (no matches found) - **PASS**
 
-## Impact
-- Now includes all 6 providers (added "senary" / DeepSeek)
-- Registry-driven iteration ensures consistency with UI composition
-- No behavior change for existing providers
+## Commit
 
-## Commits
-- `1b3a3e5` — refactor(tui): registry-based alert badge for all providers
+No changes were needed. The documentation files already had the correct "OpenLux" references and no stale "StreamLake" references.
 
-## Verification
-- `python -m py_compile proxy_tui.py` — PASS (exit code 0)
+## Conclusion
+
+The documentation files were already updated as part of the OpenLux replacement project. No additional changes were required for this task.

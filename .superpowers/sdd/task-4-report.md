@@ -1,87 +1,57 @@
-# Task 4 Report: Create Unified _update_provider_metrics() Method
+# Task 4 Report: Remove Quota Fields from Startup Log
 
-## Status: ✅ COMPLETED
+**Status:** DONE
 
-## Implementation
+**Commit:** 4712d1e
 
-Added a new unified method `_update_provider_metrics(provider_key: str, status: dict)` that can render metrics for ANY provider (secondary, tertiary, quaternary, quinary, senary, etc.).
+## Test Summary
 
-### Method Location
-- **File**: `proxy_tui.py`
-- **Line**: 600 (after `_update_metrics`)
-- **Lines added**: 126
+**Tests run:** 286 tests
+**Results:** 279 passed, 7 failed
 
-### Method Signature
+**Failed tests (expected):**
+- `test_blocks_at_5h_limit` - Tests quota blocking (to be removed)
+- `test_blocks_at_weekly_limit` - Tests quota blocking (to be removed)
+- `test_blocks_at_monthly_limit` - Tests quota blocking (to be removed)
+- `test_weekly_counter_resets_after_7_days` - Tests quota reset (to be removed)
+- `test_monthly_counter_resets_after_30_days` - Tests quota reset (to be removed)
+- `test_weekly_counter_does_not_reset_prematurely` - Tests quota reset (to be removed)
+- `test_quota_exceeded_429_not_retried` - Tests quota-specific retry behavior (to be removed)
+
+These failures are expected and will be addressed by other tasks in the quota removal effort. They are testing quota functionality that's being removed from the rate limiter, handlers, and configuration.
+
+## Concerns
+
+None. The test failures are expected and align with the broader quota removal design spec. The specific task requirement (removing quota fields from startup log) was completed successfully.
+
+## Implementation Details
+
+**Modified file:** `dashscope_proxy_lib/server.py`
+
+**Change:** Removed three quota fields from the startup log message at line 150:
+- `quota_5h=rate_limiter.primary.hour5_limit`
+- `quota_week=rate_limiter.primary.week_limit`
+- `quota_month=rate_limiter.primary.month_limit`
+
+**Before:**
 ```python
-@_safe_update
-def _update_provider_metrics(self, provider_key: str, status: dict) -> None:
-    """Update metrics for a single provider.
-    
-    Args:
-        provider_key: Provider key from registry (e.g., "secondary", "senary")
-        status: Raw status dict from MultiProviderRateLimiter.status()
-    """
+_log(logging.INFO, "proxy started",
+     host=PROXY_HOST, port=PROXY_PORT, target=TARGET_BASE,
+     rps=rate_limiter.primary.rps_limit, rpm=rate_limiter.primary.rpm_limit,
+     tpm=rate_limiter.primary.tpm_limit,
+     quota_5h=rate_limiter.primary.hour5_limit,
+     quota_week=rate_limiter.primary.week_limit,
+     quota_month=rate_limiter.primary.month_limit,
+     safety_factor=config["safety_factor"])
 ```
 
-### Implementation Details
-
-1. **Dynamic UI element queries**: Uses f-strings with `provider_key` to query:
-   - `#{provider_key}-overview` (Vertical container)
-   - `#{provider_key}-status-line` (Static widget)
-   - `#{provider_key}-rl-metrics` (DataTable)
-
-2. **Visibility conditions**: Checks three conditions before showing:
-   - Provider key exists in status dict
-   - Provider status is not None
-   - Provider has forwarded at least one request (`total_forwarded > 0`)
-   - Sets `visible` class if all conditions pass
-
-3. **Status line update**: 
-   - Looks up provider info in `PROVIDER_REGISTRY`
-   - Gets base URL from config using `provider_info["config_key"]`
-   - Formats: `"Status: Active | Target: {base_url}"`
-
-4. **Metrics table population**: Identical to existing per-provider methods:
-   - RPS Limit
-   - RPM (with progress bar)
-   - TPM Available (with progress bar)
-   - 5-Hour Quota (with progress bar)
-   - Weekly Quota (with progress bar)
-   - Monthly Quota (with progress bar)
-   - Circuit breaker status (if open or has failures)
-   - Token summary (consumed/reserved/capacity)
-   - Forwarded/429s/Rejected stats
-   - Quota warning (if any)
-
-### Key Features
-
-- **Reusability**: One method replaces all duplicated per-provider methods
-- **Future-proof**: Works with any provider defined in `PROVIDER_REGISTRY`
-- **Consistent output**: Produces same metrics as existing methods
-- **Dynamic config lookup**: Uses registry to get the correct config key for each provider
-
-## Testing
-
-### Syntax Verification
-```bash
-$ python -m py_compile proxy_tui.py
-# Exit code: 0 (success)
+**After:**
+```python
+_log(logging.INFO, "proxy started",
+     host=PROXY_HOST, port=PROXY_PORT, target=TARGET_BASE,
+     rps=rate_limiter.primary.rps_limit, rpm=rate_limiter.primary.rpm_limit,
+     tpm=rate_limiter.primary.tpm_limit,
+     safety_factor=config["safety_factor"])
 ```
 
-### Commit
-```bash
-$ git commit -m "feat(tui): add unified _update_provider_metrics method"
-[tui-provider-support 9a03019] feat(tui): add unified _update_provider_metrics method
- 1 file changed, 126 insertions(+)
-```
-
-## Notes
-
-- Old methods (`_update_secondary_metrics`, `_update_tertiary_metrics`, etc.) are **NOT removed** yet - that's Task 6
-- The method uses existing helper functions: `_progress_bar()`, `_fmt_number()`, `_quota_warning()`
-- Senary provider is now supported (missing in original implementation)
-- The method can be called for any provider in the registry, making it easy to add new providers in the future
-
-## Next Steps
-
-Task 5 will integrate this unified method into the poll loop, and Task 6 will remove the old duplicated methods.
+**Impact:** The startup log no longer includes legacy quota tracking fields, aligning with the design spec to remove all quota-related functionality. All other log fields remain unchanged.

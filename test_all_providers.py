@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Real-world tests against all three providers through the running proxy."""
+"""Real-world tests against providers through the running proxy.
+
+NOTE: This script is stale — it only covers primary, secondary, and tertiary
+providers. It does not test quaternary (ARK), quinary (Meta AI), senary
+(DeepSeek), or septenary (GLM). For comprehensive provider testing, use the
+pytest suite (tests/test_integration.py) or configure additional providers
+manually.
+"""
 
 import asyncio
 import aiohttp
