@@ -79,6 +79,13 @@ SENARY_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 SENARY_BASE_URL = os.environ.get("DEEPSEEK_TARGET_BASE", "https://api.deepseek.com").strip()
 
 # ---------------------------------------------------------------------------
+# Septenary provider configuration (optional - GLM / Z.ai)
+# Only used if both KEY and BASE_URL are set
+# ---------------------------------------------------------------------------
+SEPTENARY_API_KEY = os.environ.get("GLM_API_KEY", "").strip()
+SEPTENARY_BASE_URL = os.environ.get("GLM_TARGET_BASE", "https://api.z.ai/api/paas/v4").strip()
+
+# ---------------------------------------------------------------------------
 # Timeout and connection limits
 # ---------------------------------------------------------------------------
 UPSTREAM_TIMEOUT_TOTAL = _safe_int("UPSTREAM_TIMEOUT_TOTAL", 300)
@@ -258,6 +265,37 @@ SENARY_CODING_PLAN_CONFIG = {
     "quota_max_retries": _safe_int("SENARY_QUOTA_MAX_RETRIES", SENARY_DEFAULTS["quota_max_retries"]),
 }
 
+# ---------------------------------------------------------------------------
+# Septenary provider rate limits (GLM - independent defaults)
+# ---------------------------------------------------------------------------
+SEPTENARY_DEFAULTS = {
+    "rpm_limit": 60,
+    "tpm_limit": 4_000_000,
+    "safety_factor": 0.8,
+    "requests_per_5h": 10000,
+    "requests_per_week": 50000,
+    "requests_per_month": 100000,
+    "max_queue_size": 500,
+    "max_retries": 20,
+    "base_backoff": 0.5,
+    "quota_retry_cooldown": 60,
+    "quota_max_retries": 1,
+}
+
+SEPTENARY_CODING_PLAN_CONFIG = {
+    "rpm_limit": _safe_int("SEPTENARY_RPM_LIMIT", SEPTENARY_DEFAULTS["rpm_limit"]),
+    "tpm_limit": _safe_int("SEPTENARY_TPM_LIMIT", SEPTENARY_DEFAULTS["tpm_limit"]),
+    "safety_factor": _safe_float("SEPTENARY_SAFETY_FACTOR", SEPTENARY_DEFAULTS["safety_factor"]),
+    "requests_per_5h": _safe_int("SEPTENARY_REQUESTS_PER_5H", SEPTENARY_DEFAULTS["requests_per_5h"]),
+    "requests_per_week": _safe_int("SEPTENARY_REQUESTS_PER_WEEK", SEPTENARY_DEFAULTS["requests_per_week"]),
+    "requests_per_month": _safe_int("SEPTENARY_REQUESTS_PER_MONTH", SEPTENARY_DEFAULTS["requests_per_month"]),
+    "max_queue_size": _safe_int("SEPTENARY_MAX_QUEUE_SIZE", SEPTENARY_DEFAULTS["max_queue_size"]),
+    "max_retries": _safe_int("SEPTENARY_MAX_RETRIES", SEPTENARY_DEFAULTS["max_retries"]),
+    "base_backoff": _safe_float("SEPTENARY_BASE_BACKOFF", SEPTENARY_DEFAULTS["base_backoff"]),
+    "quota_retry_cooldown": _safe_int("SEPTENARY_QUOTA_RETRY_COOLDOWN", SEPTENARY_DEFAULTS["quota_retry_cooldown"]),
+    "quota_max_retries": _safe_int("SEPTENARY_QUOTA_MAX_RETRIES", SEPTENARY_DEFAULTS["quota_max_retries"]),
+}
+
 
 def _load_config() -> dict:
     """Load rate limiter config with environment variable overrides.
@@ -314,6 +352,7 @@ def _load_display_config() -> list[tuple[str, str, str, str]]:
         ("ARK Limits", QUATERNARY_CODING_PLAN_CONFIG, "QUATERNARY_"),
         ("Meta AI Limits", QUINARY_CODING_PLAN_CONFIG, "QUINARY_"),
         ("DeepSeek Limits", SENARY_CODING_PLAN_CONFIG, "SENARY_"),
+        ("GLM Limits", SEPTENARY_CODING_PLAN_CONFIG, "SEPTENARY_"),
     ]
     for group, cfg, prefix in provider_cfgs:
         for key, value in cfg.items():
@@ -325,6 +364,7 @@ def _load_display_config() -> list[tuple[str, str, str, str]]:
     add("Providers", "quaternary_base_url", QUATERNARY_BASE_URL or "(unset)", ["MODEL_ARK_TARGET_BASE"])
     add("Providers", "quinary_base_url", QUINARY_BASE_URL or "(unset)", ["META_AI_TARGET_BASE"])
     add("Providers", "senary_base_url", SENARY_BASE_URL or "(unset)", ["DEEPSEEK_TARGET_BASE"])
+    add("Providers", "septenary_base_url", SEPTENARY_BASE_URL or "(unset)", ["GLM_TARGET_BASE"])
     add("Providers", "model_fallback_order", ",".join(MODEL_FALLBACK_ORDER) or "(default)", ["MODEL_FALLBACK_ORDER"])
     return rows
 
@@ -408,8 +448,27 @@ SENARY_MODELS = {
 }
 
 # ---------------------------------------------------------------------------
+# Septenary provider models (GLM / Z.ai)
+# ---------------------------------------------------------------------------
+SEPTENARY_MODELS = {
+    "object": "list",
+    "data": [
+        {"id": "glm-5.3", "object": "model"},
+        {"id": "glm-5.3-flash", "object": "model"},
+        {"id": "glm-5.2", "object": "model"},
+        {"id": "glm-5.1", "object": "model"},
+        {"id": "glm-5-turbo", "object": "model"},
+        {"id": "glm-5", "object": "model"},
+        {"id": "glm-4.7", "object": "model"},
+        {"id": "glm-4.6", "object": "model"},
+        {"id": "glm-4.5", "object": "model"},
+        {"id": "glm-4.5-air", "object": "model"},
+    ]
+}
+
+# ---------------------------------------------------------------------------
 # Explicit model-to-provider mapping (optional overrides)
-# Keys are model names, values are "primary", "secondary", "tertiary", "quaternary", "quinary", or "senary".
+# Keys are model names, values are "primary", "secondary", "tertiary", "quaternary", "quinary", "senary", or "septenary".
 # When a model is listed here, this mapping takes priority over
 # the model list lookups for routing decisions.
 # ---------------------------------------------------------------------------
@@ -422,6 +481,7 @@ PROVIDER_SLUGS: dict[str, str] = {
     "ark": "quaternary",
     "metaspark": "quinary",
     "deepseek": "senary",
+    "glm": "septenary",
 }
 
 MODEL_FALLBACK_ORDER: list[str] = [

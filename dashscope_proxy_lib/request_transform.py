@@ -41,6 +41,7 @@ PROVIDER_SLUG_MAP = {
     "ark": "quaternary", "quaternary": "quaternary",
     "metaspark": "quinary", "quinary": "quinary",
     "deepseek": "senary", "senary": "senary",
+    "glm": "septenary", "zai": "septenary", "septenary": "septenary",
 }
 
 

@@ -1297,7 +1297,6 @@ class TestProviderRouter:
         "gpt-5.6-sol", "gemini-3.7-flash", "gpt-5.6-terra", "qwen3.8-max",
         "qwen3.8-max-0902",
         "gpt-5.6-luna", "gemini-3.8-flash", "grok-4.6", "MiniMax-M3", "mimo-v2.5",
-        "glm-5.3-flash",
     ])
     def test_all_tertiary_models_routed_to_tertiary(self, dashscope_module, monkeypatch, model_id):
         monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-openlux")
@@ -1305,8 +1304,38 @@ class TestProviderRouter:
             "dashscope_proxy_lib.config.TERTIARY_BASE_URL",
             "https://api.openlux.ai/v1",
         )
+        # Disable septenary to ensure these models route to tertiary
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_BASE_URL", "")
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model(model_id).name == "tertiary"
+
+    def test_glm_5_3_flash_routes_to_septenary_over_tertiary(self, dashscope_module, monkeypatch):
+        """glm-5.3-flash exists in both tertiary and septenary; septenary has higher priority."""
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-openlux")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.TERTIARY_BASE_URL",
+            "https://api.openlux.ai/v1",
+        )
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "sk-glm")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SEPTENARY_BASE_URL",
+            "https://api.z.ai/api/paas/v4",
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("glm-5.3-flash").name == "septenary"
+
+    def test_glm_5_3_flash_falls_back_to_tertiary_when_septenary_unconfigured(self, dashscope_module, monkeypatch):
+        """When septenary is not configured, glm-5.3-flash routes to tertiary."""
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-openlux")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.TERTIARY_BASE_URL",
+            "https://api.openlux.ai/v1",
+        )
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("glm-5.3-flash").name == "tertiary"
 
     def test_mimo_v25_routes_to_tertiary_not_secondary(self, dashscope_module, monkeypatch):
         """mimo-v2.5 is tertiary-only; secondary config must not capture it."""
@@ -1384,12 +1413,18 @@ class TestProviderRouter:
             "dashscope_proxy_lib.config.QUATERNARY_BASE_URL",
             "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
         )
+        # Disable septenary to ensure glm-5.2 routes to quaternary
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_BASE_URL", "")
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model("glm-5.2").name == "quaternary"
 
     def test_quaternary_unconfigured_returns_primary(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "")
         monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_BASE_URL", "")
+        # Also disable septenary
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_BASE_URL", "")
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model("glm-5.2").name == "primary"
 
@@ -1407,6 +1442,9 @@ class TestProviderRouter:
     def test_get_all_models_excludes_quaternary_when_not_configured(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "")
         monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_BASE_URL", "")
+        # Also disable septenary to ensure glm-5.2 doesn't appear from there
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_BASE_URL", "")
         router = dashscope_module.ProviderRouter()
         models = router.get_all_models()
         model_ids = [m["id"] for m in models["data"]]
@@ -1429,12 +1467,30 @@ class TestProviderRouter:
             "dashscope_proxy_lib.config.QUATERNARY_BASE_URL",
             "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
         )
+        # Disable septenary to ensure MODEL_PROVIDER_MAP takes effect
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_BASE_URL", "")
         monkeypatch.setattr(
             "dashscope_proxy_lib.config.MODEL_PROVIDER_MAP",
             {"glm-5.2": "quaternary"},
         )
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model("glm-5.2").name == "quaternary"
+
+    def test_glm_5_2_routes_to_septenary_over_quaternary(self, dashscope_module, monkeypatch):
+        """glm-5.2 exists in both quaternary and septenary; septenary has higher priority."""
+        monkeypatch.setattr("dashscope_proxy_lib.config.QUATERNARY_API_KEY", "sk-ark")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.QUATERNARY_BASE_URL",
+            "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+        )
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "sk-glm")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SEPTENARY_BASE_URL",
+            "https://api.z.ai/api/paas/v4",
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("glm-5.2").name == "septenary"
 
     def test_senary_model_routed_to_senary(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_API_KEY", "sk-deepseek")
@@ -1493,6 +1549,64 @@ class TestProviderRouter:
         )
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model("deepseek-v4-pro").name == "senary"
+
+    def test_septenary_model_routed_to_septenary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "sk-glm")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SEPTENARY_BASE_URL",
+            "https://api.z.ai/api/paas/v4",
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("glm-4.7").name == "septenary"
+
+    def test_septenary_unconfigured_returns_primary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("glm-4.7").name == "primary"
+
+    def test_get_all_models_includes_septenary_when_configured(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "sk-glm")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SEPTENARY_BASE_URL",
+            "https://api.z.ai/api/paas/v4",
+        )
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        model_ids = [m["id"] for m in models["data"]]
+        assert "glm-4.7" in model_ids
+
+    def test_get_all_models_excludes_septenary_when_not_configured(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        model_ids = [m["id"] for m in models["data"]]
+        assert "glm-4.7" not in model_ids
+
+    def test_get_provider_status_includes_septenary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "sk-glm")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SEPTENARY_BASE_URL",
+            "https://api.z.ai/api/paas/v4",
+        )
+        router = dashscope_module.ProviderRouter()
+        status = router.get_provider_status()
+        assert "septenary" in status
+        assert status["septenary"]["available"] is True
+
+    def test_model_provider_map_septenary_override(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "sk-glm")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SEPTENARY_BASE_URL",
+            "https://api.z.ai/api/paas/v4",
+        )
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.MODEL_PROVIDER_MAP",
+            {"glm-5.3": "septenary"},
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("glm-5.3").name == "septenary"
 
 
 # ---------------------------------------------------------------------------
