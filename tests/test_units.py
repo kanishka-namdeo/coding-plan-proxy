@@ -60,27 +60,6 @@ class TestRateLimiterCanProceed:
         assert reason == "ok"
 
     @pytest.mark.asyncio
-    async def test_blocks_at_5h_limit(self, rate_limiter):
-        rate_limiter.hour5_limit = 0
-        allowed, reason, _ = await rate_limiter.can_proceed()
-        assert allowed is False
-        assert "5-hour" in reason.lower() or "quota" in reason.lower()
-
-    @pytest.mark.asyncio
-    async def test_blocks_at_weekly_limit(self, rate_limiter):
-        rate_limiter.week_count = rate_limiter.week_limit
-        allowed, reason, _ = await rate_limiter.can_proceed()
-        assert allowed is False
-        assert "weekly" in reason.lower()
-
-    @pytest.mark.asyncio
-    async def test_blocks_at_monthly_limit(self, rate_limiter):
-        rate_limiter.month_count = rate_limiter.month_limit
-        allowed, reason, _ = await rate_limiter.can_proceed()
-        assert allowed is False
-        assert "monthly" in reason.lower()
-
-    @pytest.mark.asyncio
     async def test_blocks_at_rpm_limit(self, rate_limiter):
         rate_limiter.rpm_limit = 1
         await rate_limiter.record_request(0, now=time.monotonic())
@@ -94,9 +73,6 @@ class TestRateLimiterCanProceed:
             "rpm_limit": 6000,
             "tpm_limit": 10_000_000,
             "safety_factor": 0.8,
-            "requests_per_5h": 100_000,
-            "requests_per_week": 100_000,
-            "requests_per_month": 100_000,
             "max_queue_size": 200,
             "max_retries": 3,
             "base_backoff": 0.1,
@@ -109,36 +85,6 @@ class TestRateLimiterCanProceed:
         assert allowed is False
         assert "rps" in reason.lower()
         assert wait > 0
-
-
-# ---------------------------------------------------------------------------
-# RateLimiter quota reset
-# ---------------------------------------------------------------------------
-
-class TestRateLimiterQuotaReset:
-    @pytest.mark.asyncio
-    async def test_weekly_counter_resets_after_7_days(self, rate_limiter):
-        rate_limiter.week_count = rate_limiter.week_limit
-        # Force week_start to 8 days ago
-        rate_limiter.week_start = time.time() - (8 * 24 * 3600)
-        allowed, _, _ = await rate_limiter.can_proceed()
-        assert allowed is True
-        assert rate_limiter.week_count == 0
-
-    @pytest.mark.asyncio
-    async def test_monthly_counter_resets_after_30_days(self, rate_limiter):
-        rate_limiter.month_count = rate_limiter.month_limit
-        rate_limiter.month_start = time.time() - (31 * 24 * 3600)
-        allowed, _, _ = await rate_limiter.can_proceed()
-        assert allowed is True
-        assert rate_limiter.month_count == 0
-
-    @pytest.mark.asyncio
-    async def test_weekly_counter_does_not_reset_prematurely(self, rate_limiter):
-        rate_limiter.week_count = rate_limiter.week_limit
-        rate_limiter.week_start = time.time() - (3 * 24 * 3600)  # 3 days ago
-        allowed, _, _ = await rate_limiter.can_proceed()
-        assert allowed is False
 
 
 # ---------------------------------------------------------------------------

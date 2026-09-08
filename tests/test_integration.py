@@ -1099,7 +1099,7 @@ class TestMaxRetriesExhausted:
             await upstream_runner.cleanup()
 
     async def test_quota_exceeded_429_not_retried(self, aiohttp_client, proxy_app):
-        """Hard quota 429 from upstream is retried once after cooldown, then passed through."""
+        """Hard quota 429 from upstream is returned immediately without retry."""
         upstream_app = web.Application()
         quota_body = json.dumps({
             "error": {
@@ -1128,8 +1128,6 @@ class TestMaxRetriesExhausted:
             try:
                 app, rl = proxy_app
                 limiter = rl.primary if hasattr(rl, "primary") else rl
-                limiter.quota_retry_cooldown = 0.1
-                limiter.quota_max_retries = 1
                 async with aiohttp.ClientSession() as session:
                     app["client_session"] = session
                     client = await aiohttp_client(app)
@@ -1143,8 +1141,9 @@ class TestMaxRetriesExhausted:
                     assert resp.status == 429
                     data = await resp.json()
                     assert "quota exceeded" in data["error"]["message"].lower()
-                    assert limiter.total_429s == 2
-                    assert call_count == 2
+                    # Terminal 429 is not retried - only one call to upstream
+                    assert limiter.total_429s == 1
+                    assert call_count == 1
             finally:
                 dashscope_proxy.TARGET_BASE = original_target
         finally:
@@ -2007,6 +2006,9 @@ class TestQuaternaryProviderRouting:
 
         monkeypatch.setattr(cfg, "QUATERNARY_API_KEY", "sk-ark-test")
         monkeypatch.setattr(cfg, "QUATERNARY_BASE_URL", f"http://127.0.0.1:{quaternary_port}")
+        # Disable septenary to ensure glm-5.2 routes to quaternary
+        monkeypatch.setattr(cfg, "SEPTENARY_API_KEY", "")
+        monkeypatch.setattr(cfg, "SEPTENARY_BASE_URL", "")
         handlers_mod._provider_router = None
 
         try:
