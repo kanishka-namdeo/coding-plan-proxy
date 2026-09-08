@@ -42,19 +42,21 @@ An upstream 429 classified as non-retryable by `should_retry_429()` will be retu
 
 ## Error handling
 
-- Terminal/non-retryable upstream 429: return HTTP 429 with the upstream body and headers, refund any reserved TPM, and record the 429/model metric as currently done.
+- Terminal/non-retryable upstream 429: **currently** triggers a quota-specific cooldown retry (up to `quota_max_retries` times); **after removal** return HTTP 429 immediately with the upstream body and headers, refund any reserved TPM, and record the 429/model metric.
 - Retryable upstream 429: retain the current retry counter, backoff, disconnect handling, failover behavior, and terminal response after retry exhaustion.
 - No new error responses or fallback behavior are introduced.
 - Legacy quota environment variables are ignored because they are no longer part of configuration; they are not preserved as compatibility aliases.
+- The existing `should_retry_429()` function and `_NON_RETRYABLE_429_MARKERS` in `http_helpers.py` remain unchanged - they continue to classify upstream 429 responses as retryable or terminal.
 
 ## Files and contracts
 
 Expected implementation files:
 
 - `dashscope_proxy_lib/config.py`: remove quota defaults, overrides, and display rows indirectly supplied by provider configs.
-- `dashscope_proxy_lib/rate_limiter.py`: remove quota state, checks, increments, and status serialization.
-- `dashscope_proxy_lib/handlers.py`: remove quota cooldown variables and both special quota-429 branches.
+- `dashscope_proxy_lib/rate_limiter.py`: remove quota state, checks, increments, status serialization, and the `limits_differ` logic in `MultiProviderRateLimiter.__init__()` that compares quota keys.
+- `dashscope_proxy_lib/handlers.py`: remove quota cooldown variables (`quota_retries`, `quota_max`, `quota_cooldown`) and both special quota-429 branches (streaming and non-streaming). Terminal 429 responses should be returned immediately without cooldown retry.
 - `dashscope_proxy_lib/server.py`: remove quota fields from startup logging.
+- `proxy_tui.py`: keep existing RPM/TPM quota warning methods (`_check_quota_thresholds`, `_quota_warning`, `_update_alert_badge`) unchanged - these check active RPM/TPM limits, not the removed 5h/weekly/monthly quotas.
 - `tests/conftest.py`, `tests/test_units.py`, and `tests/test_integration.py`: use the reduced config shape and verify immediate terminal handling plus unchanged generic retries.
 - `.env.example`, `README.md`, `README_SCRIPT.md`, and applicable DOX/project reports: remove obsolete quota configuration and behavior descriptions.
 
