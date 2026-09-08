@@ -533,13 +533,88 @@ git commit -m "docs: remove quota configuration and behavior descriptions"
 
 ---
 
-## Task 7: Final Verification
+## Task 7: Update E2E Test Configuration
+
+**Files:**
+- Modify: `tests/test_e2e_real.py`
+
+**Interfaces:**
+- Consumes: Config dicts from Task 1
+- Produces: E2E tests using reduced config shape
+
+- [ ] **Step 1: Remove quota keys from e2e_config fixture**
+
+```python
+# In tests/test_e2e_real.py, update e2e_config fixture:
+@pytest.fixture(scope="module")
+def e2e_config(real_api_key):
+    """Config for e2e tests."""
+    return {
+        "rpm_limit": 2400,
+        "tpm_limit": 5_000_000,
+        "safety_factor": 0.8,
+        # Remove: "requests_per_5h": 6000,
+        # Remove: "requests_per_week": 45000,
+        # Remove: "requests_per_month": 90000,
+        "max_queue_size": 200,
+        "max_retries": 2,
+        "base_backoff": 1.0,
+    }
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add tests/test_e2e_real.py
+git commit -m "test(e2e): remove quota configuration from e2e tests"
+```
+
+---
+
+## Task 8: Update Screenshot Capture Mock Status
+
+**Files:**
+- Modify: `capture_screenshots.py`
+
+**Interfaces:**
+- Consumes: Status structure from Task 2
+- Produces: Mock status without quota fields
+
+- [ ] **Step 1: Remove quota fields from _default_status()**
+
+```python
+# In capture_screenshots.py, update _default_status() method:
+    def _default_status(self) -> dict:
+        return {
+            "rps_limit": 0, "rpm_limit": 0, "rpm_current": 0,
+            "tpm_limit": 0, "tpm_available": 0, "tpm_reserved": 0,
+            # Remove: "requests_5h": 0, "requests_5h_limit": 0,
+            # Remove: "requests_week": 0, "requests_week_limit": 0,
+            # Remove: "requests_month": 0, "requests_month_limit": 0,
+            "total_forwarded": 0, "queue_drops": 0, "queue_p50_ms": 0, "queue_p95_ms": 0, "queue_p99_ms": 0, "total_429s": 0,
+            "total_rejected": 0, "total_tokens_consumed": 0,
+            "pending_requests": 0, "recent_latencies": [],
+            "model_usage": {}, "uptime_seconds": 0,
+            "circuit_open": False, "circuit_failure_count": 0,
+        }
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add capture_screenshots.py
+git commit -m "refactor(screenshots): remove quota fields from mock status"
+```
+
+---
+
+## Task 9: Final Verification
 
 **Files:**
 - All project files
 
 **Interfaces:**
-- Consumes: All changes from Tasks 1-6
+- Consumes: All changes from Tasks 1-8
 - Produces: Clean codebase with no quota references
 
 - [ ] **Step 1: Search for remaining quota references**
