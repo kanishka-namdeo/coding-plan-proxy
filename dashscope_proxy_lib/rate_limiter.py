@@ -176,23 +176,11 @@ class RateLimiter:
 
         self.rpm_window = SlidingWindowCounter(60)
         self.tpm_bucket = TokenWindowCounter(self.tpm_limit)
-        self.hour5_window = SlidingWindowCounter(5 * 3600)
-
-        self.week_count = 0
-        self.month_count = 0
-        self.week_start = time.time()
-        self.month_start = time.time()
-
-        self.week_limit = config["requests_per_week"]
-        self.month_limit = config["requests_per_month"]
-        self.hour5_limit = config["requests_per_5h"]
 
         self.max_queue_size = config["max_queue_size"]
         self.max_retries = config["max_retries"]
         self.base_backoff = config["base_backoff"]
         self.pending_requests = 0
-        self.quota_retry_cooldown = config.get("quota_retry_cooldown", 1800)
-        self.quota_max_retries = config.get("quota_max_retries", 1)
 
         self.total_forwarded = 0
         self.queue_drops = 0
@@ -232,29 +220,6 @@ class RateLimiter:
         """
         async with self._lock:
             now_mono = time.monotonic()
-            now_wall = time.time()
-
-            if now_wall - self.week_start >= 7 * 24 * 3600:
-                self.week_count = 0
-                self.week_start = now_wall
-            if now_wall - self.month_start >= 30 * 24 * 3600:
-                self.month_count = 0
-                self.month_start = now_wall
-
-            h5_count = self.hour5_window.count(now_mono)
-            if h5_count >= self.hour5_limit:
-                oldest = self.hour5_window.events[0] if self.hour5_window.events else now_mono
-                wait = max(0, oldest + 5 * 3600 - now_mono)
-                _log(logging.DEBUG, "can_proceed denied: 5-hour quota exhausted", wait_seconds=wait)
-                return False, "5-hour quota exhausted", wait
-
-            if self.week_count >= self.week_limit:
-                _log(logging.DEBUG, "can_proceed denied: weekly quota exhausted", wait_seconds=60)
-                return False, "Weekly quota exhausted", 60
-
-            if self.month_count >= self.month_limit:
-                _log(logging.DEBUG, "can_proceed denied: monthly quota exhausted", wait_seconds=60)
-                return False, "Monthly quota exhausted", 60
 
             rpm_count = self.rpm_window.count(now_mono)
             if rpm_count >= self.rpm_limit:
@@ -297,9 +262,6 @@ class RateLimiter:
         async with self._lock:
             now = now or time.monotonic()
             self.rpm_window.add(now)
-            self.hour5_window.add(now)
-            self.week_count += 1
-            self.month_count += 1
             self.total_forwarded += 1
             self.total_tokens_consumed += tokens_used
             self.last_request_time = now
@@ -431,12 +393,6 @@ class RateLimiter:
             "tpm_limit": tpm_status["tpm_capacity"],
             "tpm_available": tpm_status["tpm_available"],
             "tpm_reserved": tpm_status["tpm_reserved"],
-            "requests_5h": self.hour5_window.count(now),
-            "requests_5h_limit": self.hour5_limit,
-            "requests_week": self.week_count,
-            "requests_week_limit": self.week_limit,
-            "requests_month": self.month_count,
-            "requests_month_limit": self.month_limit,
             "total_forwarded": total_forwarded,
             "queue_drops": queue_drops,
             "queue_p50_ms": round(queue_p50, 1),
@@ -491,6 +447,7 @@ class MultiProviderRateLimiter:
         quaternary_config: dict | None = None,
         quinary_config: dict | None = None,
         senary_config: dict | None = None,
+        septenary_config: dict | None = None,
     ):
         self.primary = RateLimiter(primary_config)
         self.primary_config = primary_config
@@ -510,12 +467,14 @@ class MultiProviderRateLimiter:
         self.senary: RateLimiter | None = None
         self.senary_config = senary_config
 
+        self.septenary: RateLimiter | None = None
+        self.septenary_config = septenary_config
+
         if secondary_config:
             self.secondary = RateLimiter(secondary_config)
             limits_differ = any(
                 primary_config.get(k) != secondary_config.get(k)
-                for k in ["rpm_limit", "tpm_limit", "requests_per_5h",
-                         "requests_per_week", "requests_per_month"]
+                for k in ["rpm_limit", "tpm_limit"]
             )
             if limits_differ:
                 _log(logging.INFO, "secondary rate limiter created with independent limits")
@@ -526,8 +485,7 @@ class MultiProviderRateLimiter:
             self.tertiary = RateLimiter(tertiary_config)
             limits_differ = any(
                 primary_config.get(k) != tertiary_config.get(k)
-                for k in ["rpm_limit", "tpm_limit", "requests_per_5h",
-                         "requests_per_week", "requests_per_month"]
+                for k in ["rpm_limit", "tpm_limit"]
             )
             if limits_differ:
                 _log(logging.INFO, "tertiary rate limiter created with independent limits")
@@ -538,8 +496,7 @@ class MultiProviderRateLimiter:
             self.quaternary = RateLimiter(quaternary_config)
             limits_differ = any(
                 primary_config.get(k) != quaternary_config.get(k)
-                for k in ["rpm_limit", "tpm_limit", "requests_per_5h",
-                         "requests_per_week", "requests_per_month"]
+                for k in ["rpm_limit", "tpm_limit"]
             )
             if limits_differ:
                 _log(logging.INFO, "quaternary rate limiter created with independent limits")
@@ -550,8 +507,7 @@ class MultiProviderRateLimiter:
             self.quinary = RateLimiter(quinary_config)
             limits_differ = any(
                 primary_config.get(k) != quinary_config.get(k)
-                for k in ["rpm_limit", "tpm_limit", "requests_per_5h",
-                         "requests_per_week", "requests_per_month"]
+                for k in ["rpm_limit", "tpm_limit"]
             )
             if limits_differ:
                 _log(logging.INFO, "quinary rate limiter created with independent limits")
@@ -562,13 +518,23 @@ class MultiProviderRateLimiter:
             self.senary = RateLimiter(senary_config)
             limits_differ = any(
                 primary_config.get(k) != senary_config.get(k)
-                for k in ["rpm_limit", "tpm_limit", "requests_per_5h",
-                         "requests_per_week", "requests_per_month"]
+                for k in ["rpm_limit", "tpm_limit"]
             )
             if limits_differ:
                 _log(logging.INFO, "senary rate limiter created with independent limits")
             else:
                 _log(logging.INFO, "senary rate limiter created with shared limits")
+
+        if septenary_config:
+            self.septenary = RateLimiter(septenary_config)
+            limits_differ = any(
+                primary_config.get(k) != septenary_config.get(k)
+                for k in ["rpm_limit", "tpm_limit"]
+            )
+            if limits_differ:
+                _log(logging.INFO, "septenary rate limiter created with independent limits")
+            else:
+                _log(logging.INFO, "septenary rate limiter created with shared limits")
 
         # Global pending request counter (shared across providers for queue management)
         self._pending_requests = 0
@@ -576,6 +542,8 @@ class MultiProviderRateLimiter:
 
     def get_limiter_for_provider(self, provider_name: str) -> RateLimiter:
         """Get the appropriate rate limiter for a provider."""
+        if provider_name == "septenary" and self.septenary:
+            return self.septenary
         if provider_name == "senary" and self.senary:
             return self.senary
         if provider_name == "quinary" and self.quinary:
@@ -625,6 +593,8 @@ class MultiProviderRateLimiter:
             self.quinary.max_queue_size = value
         if self.senary:
             self.senary.max_queue_size = value
+        if self.septenary:
+            self.septenary.max_queue_size = value
 
     def is_queue_full(self) -> bool:
         return self._pending_requests > self.primary.max_queue_size
@@ -710,7 +680,7 @@ class MultiProviderRateLimiter:
         primary_status = self.primary.status()
         result = {
             "primary": primary_status,
-            "shared_limits": self.secondary is None and self.tertiary is None and self.quaternary is None and self.quinary is None and self.senary is None,
+            "shared_limits": self.secondary is None and self.tertiary is None and self.quaternary is None and self.quinary is None and self.senary is None and self.septenary is None,
         }
 
         secondary_status = self.secondary.status() if self.secondary else None
@@ -718,6 +688,7 @@ class MultiProviderRateLimiter:
         quaternary_status = self.quaternary.status() if self.quaternary else None
         quinary_status = self.quinary.status() if self.quinary else None
         senary_status = self.senary.status() if self.senary else None
+        septenary_status = self.septenary.status() if self.septenary else None
 
         if self.secondary:
             result["secondary"] = secondary_status
@@ -744,6 +715,11 @@ class MultiProviderRateLimiter:
         else:
             result["senary"] = None
 
+        if self.septenary:
+            result["septenary"] = septenary_status
+        else:
+            result["septenary"] = None
+
         # Aggregate stats across all providers (using thread-safe status dicts)
         all_statuses = [primary_status]
         if secondary_status:
@@ -756,6 +732,8 @@ class MultiProviderRateLimiter:
             all_statuses.append(quinary_status)
         if senary_status:
             all_statuses.append(senary_status)
+        if septenary_status:
+            all_statuses.append(septenary_status)
 
         # Sum counters across all providers
         total_forwarded = sum(s.get("total_forwarded", 0) for s in all_statuses)
