@@ -34,9 +34,6 @@ class LiveRateLimiterProxy:
         return {
             "rps_limit": 0, "rpm_limit": 0, "rpm_current": 0,
             "tpm_limit": 0, "tpm_available": 0, "tpm_reserved": 0,
-            "requests_5h": 0, "requests_5h_limit": 0,
-            "requests_week": 0, "requests_week_limit": 0,
-            "requests_month": 0, "requests_month_limit": 0,
             "total_forwarded": 0, "queue_drops": 0, "queue_p50_ms": 0, "queue_p95_ms": 0, "queue_p99_ms": 0, "total_429s": 0,
             "total_rejected": 0, "total_tokens_consumed": 0,
             "pending_requests": 0, "recent_latencies": [],
