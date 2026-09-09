@@ -1,6 +1,6 @@
 # Coding Plan Proxy
 
-An HTTP proxy for the DashScope Coding API with rate limiting, request queuing, automatic retries, and a rich Textual TUI dashboard.
+An HTTP proxy for the DashScope Coding API with multi-provider routing, rate limiting, request queuing, automatic retries, and a rich Textual TUI dashboard.
 
 ## Quick Start
 
@@ -63,10 +63,24 @@ Grouped network, timeout, connection, buffering, logging, and per-provider limit
 
 ## Features
 
+### Multi-Provider Routing
+
+**Seven providers supported**
+Route requests to DashScope (primary), MIMO (secondary), OpenLux (tertiary), ARK/BytePlus (quaternary), Meta AI/Muse Spark (quinary), DeepSeek (senary), or GLM/Z.ai (septenary).
+
+**Provider pinning**
+Force a specific provider by prefixing the model name: `openlux/gpt-5.6-sol`, `deepseek/deepseek-v4-flash`, `glm/glm-5.3`. Available slugs: `dashscope`, `mimo`, `openlux`, `ark`, `metaspark`, `deepseek`, `glm`, `zai`.
+
+**Cross-provider failover**
+Overlapping models (present in multiple provider lists) support automatic failover on 429/5xx/timeout. After per-provider retries are exhausted, the handler advances to the next available provider with a closed circuit.
+
+**Model overlap detection**
+`GET /v1/models` returns `providers` and `provider_models` fields indicating which providers serve each model. `GET /v1/proxy/status` includes `model_overlaps` for models served by 2+ providers.
+
 ### Rate Limiting & Quotas
 
 **Multi-layer rate limiting**
-Enforces RPS, RPM, TPM (via Token Bucket), and quotas over 5-hour, weekly, and monthly windows. A configurable safety factor keeps usage below the hard limits.
+Enforces RPS, RPM, and TPM (via Token Bucket). A configurable safety factor keeps usage below the hard limits.
 
 **TPM token lifecycle**
 TPM is enforced via a Token Bucket with reserve/reconcile/refund semantics. Tokens are reserved before sending to upstream, reconciled with real token counts after the response, and refunded on errors or client disconnects.
@@ -115,25 +129,49 @@ Five-tab dashboard with live metrics, sparkline charts, log viewer with filters,
 | Endpoint | Description |
 |---|---|
 | `POST /v1/chat/completions` | Chat completions, proxied through the rate limiter |
-| `GET /v1/models` | Local mock model catalog |
-| `GET /v1/proxy/status` | Current rate limiter metrics (RPM usage, queued requests, totals) |
+| `GET /v1/models` | Model catalog with `providers` and `provider_models` fields |
+| `GET /v1/proxy/status` | Current rate limiter metrics, includes `model_overlaps` |
 | `GET /health` | Simple health check |
 | `GET /ready` | Readiness probe (checks upstream connection) |
 
 ## Configuration
 
-Tweak `CODING_PLAN_CONFIG` in `dashscope_proxy_lib/config.py` to match your plan:
+Configure via `.env` file (see `.env.example`). Key settings:
 
 | Setting | Default | Description |
 |---|---|---|
-| `rpm_limit` | 9 | Max requests per minute (before safety factor) |
-| `tpm_limit` | 4,000,000 | Max tokens per minute |
-| `safety_factor` | 0.8 | Multiply all limits by this (0.8 = leave 20% headroom) |
-| `max_queue_size` | 500 | Max requests waiting in queue |
-| `max_retries` | 40 | Max retries on 429 responses |
-| `base_backoff` | 1.0 | Base seconds for exponential backoff |
+| `DASHSCOPE_API_KEY` | (required) | Your DashScope API key |
+| `PROXY_RPM_LIMIT` | 9 | Max requests per minute (before safety factor) |
+| `PROXY_TPM_LIMIT` | 4,000,000 | Max tokens per minute |
+| `PROXY_SAFETY_FACTOR` | 0.8 | Multiply all limits by this (0.8 = leave 20% headroom) |
+| `PROXY_MAX_QUEUE_SIZE` | 500 | Max requests waiting in queue |
+| `PROXY_MAX_RETRIES` | 40 | Max retries on 429 responses |
+| `PROXY_BASE_BACKOFF` | 1.0 | Base seconds for exponential backoff |
+| `UPSTREAM_TIMEOUT_TOTAL` | 300 | Total timeout for upstream requests (seconds) |
+| `MAX_BODY_SIZE` | 52428800 | Max request body size (50 MB) |
 
-The defaults match DashScope's Coding Plan tiers — you usually only need to adjust `safety_factor`.
+### Provider Configuration
+
+Each provider has its own environment variables for API key, base URL, and rate limits:
+
+| Provider | API Key Env Var | Base URL Env Var |
+|----------|-----------------|------------------|
+| MIMO (secondary) | `MIMO_CODING_PLAN_API_KEY` | `MIMO_CODING_PLAN_TARGET_BASE` |
+| OpenLux (tertiary) | `OPENLUX_API_KEY` | `OPENLUX_TARGET_BASE` |
+| ARK (quaternary) | `MODEL_ARK_API_KEY` | `MODEL_ARK_TARGET_BASE` |
+| Meta AI (quinary) | `META_AI_API_KEY` | `META_AI_TARGET_BASE` |
+| DeepSeek (senary) | `DEEPSEEK_API_KEY` | `DEEPSEEK_TARGET_BASE` |
+| GLM (septenary) | `GLM_API_KEY` | `GLM_TARGET_BASE` |
+
+Override rate limits per provider with `SECONDARY_RPM_LIMIT`, `TERTIARY_TPM_LIMIT`, etc.
+
+### Failover Order
+
+Customize the cross-provider failover order with `MODEL_FALLBACK_ORDER`:
+
+```bash
+MODEL_FALLBACK_ORDER=septenary,senary,quinary,quaternary,tertiary,secondary,primary
+```
 
 ## Running Tests
 
