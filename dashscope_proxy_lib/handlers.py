@@ -352,16 +352,17 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 retry_after=retry_sec,
             )
 
-        # Reserve TPM before forwarding (post-queue guard — bucket may have drained)
-        if estimated_tokens > 0 and not await limiter.reserve_tokens(estimated_tokens):
+        # Admit + reserve TPM under one lock (post-queue commit — bucket may have drained)
+        ok, reason, _wait = await limiter.try_admit(estimated_tokens)
+        if not ok:
             rate_limiter.queue_drops += 1
             rate_limiter.total_rejected += 1
-            error_reason = "tpm_reservation_failed"
+            error_reason = "tpm_reservation_failed" if "TPM" in reason else "admit_failed"
             status_code = 503
-            _log(logging.WARNING, "request rejected: TPM reservation failed after queue",
+            _log(logging.WARNING, "request rejected: admit failed after queue",
                  request_id=request_id, method=method, path=path,
                  model=model_name, provider=provider_name,
-                 estimated_tokens=estimated_tokens)
+                 estimated_tokens=estimated_tokens, reason=reason)
             retry_sec = max(1, rate_limiter.pending_requests // max(1, rate_limiter.rps_limit))
             return _make_error_response(
                 503,
@@ -724,12 +725,16 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         else:
                             tokens_from_stream = token_info["total_tokens"]
 
-                        await limiter.reconcile_tokens(estimated_tokens, tokens_from_stream)
+                        await limiter.record_completion(
+                            estimated_tokens=estimated_tokens,
+                            actual_tokens=tokens_from_stream,
+                            model=model_name or "unknown",
+                            latency_ms=duration_ms,
+                            request_bytes=request_body_bytes,
+                            response_bytes=response_body_bytes,
+                            circuit_success=True,
+                        )
                         tokens_reserved = False
-                        await limiter.record_request(tokens_from_stream)
-                        await limiter.record_circuit_success()
-                        await limiter.record_model_stats(model_name or "unknown", tokens_from_stream, duration_ms)
-                        await limiter.record_body_sizes(request_body_bytes, response_body_bytes)
                         actual_tokens = tokens_from_stream
                         prompt_tokens = token_info.get("prompt_tokens", 0)
                         completion_tokens = token_info.get("completion_tokens", 0)
@@ -888,12 +893,16 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                     if tokens_used["total_tokens"] == 0:
                         tokens_used = {**tokens_used, "total_tokens": estimated_tokens}
                     duration_ms = round((time.monotonic() - request_start) * 1000, 1)
-                    await limiter.reconcile_tokens(estimated_tokens, tokens_used["total_tokens"])
+                    await limiter.record_completion(
+                        estimated_tokens=estimated_tokens,
+                        actual_tokens=tokens_used["total_tokens"],
+                        model=model_name or "unknown",
+                        latency_ms=duration_ms,
+                        request_bytes=request_body_bytes,
+                        response_bytes=len(resp_body),
+                        circuit_success=True,
+                    )
                     tokens_reserved = False
-                    await limiter.record_request(tokens_used["total_tokens"])
-                    await limiter.record_circuit_success()
-                    await limiter.record_model_stats(model_name or "unknown", tokens_used["total_tokens"], duration_ms)
-                    await limiter.record_body_sizes(request_body_bytes, len(resp_body))
 
                     _log(logging.DEBUG, "token reconciliation",
                          request_id=request_id, estimated=estimated_tokens,

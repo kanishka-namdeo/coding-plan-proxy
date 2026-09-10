@@ -245,6 +245,49 @@ class RateLimiter:
 
             return True, "ok", 0.0
 
+    async def try_admit(self, estimated_tokens: int = 0) -> tuple[bool, str, float]:
+        """Under one lock: same checks as can_proceed; on success reserve TPM.
+
+        Does NOT charge RPM (still recorded on completion).
+        Returns (allowed, reason, wait_seconds).
+        """
+        async with self._lock:
+            now_mono = time.monotonic()
+
+            rpm_count = self.rpm_window.count(now_mono)
+            if rpm_count >= self.rpm_limit:
+                wait = 60.0 / max(1, self.rpm_limit)
+                _log(logging.DEBUG, "try_admit denied: RPM limit reached", wait_seconds=wait)
+                return False, "RPM limit reached", wait
+
+            if estimated_tokens > 0:
+                avail = self.tpm_bucket.available(now_mono)
+                if avail < estimated_tokens:
+                    wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, now_mono)
+                    wait = max(1.0, wait)
+                    _log(logging.DEBUG, "try_admit denied: TPM limit reached", wait_seconds=wait,
+                         estimated_tokens=estimated_tokens, available_tokens=int(avail),
+                         shortfall=estimated_tokens - avail)
+                    return False, "TPM limit reached", wait
+
+            min_gap = 1.0 / self.rps_limit
+            time_since_last = now_mono - self.last_request_time
+            if time_since_last < min_gap:
+                _log(logging.DEBUG, "try_admit denied: RPS spacing",
+                     wait_seconds=min_gap - time_since_last)
+                return False, "RPS spacing", min_gap - time_since_last
+
+            # Do not update last_request_time here (Wave 5 / Task 9).
+            if estimated_tokens > 0:
+                if not self.tpm_bucket.try_reserve(estimated_tokens):
+                    wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, now_mono)
+                    wait = max(1.0, wait)
+                    _log(logging.DEBUG, "try_admit denied: TPM reserve race", wait_seconds=wait,
+                         estimated_tokens=estimated_tokens)
+                    return False, "TPM limit reached", wait
+
+            return True, "ok", 0.0
+
     async def reserve_tokens(self, estimated_tokens: int) -> bool:
         """
         Reserve TPM before sending to upstream. Call this AFTER can_proceed()
@@ -290,6 +333,64 @@ class RateLimiter:
         """Record request/response body sizes. Thread-safe via locks."""
         async with self._lock:
             with self._thread_lock:  # Cross-thread safety for status() reads
+                self.total_request_bytes += request_bytes
+                self.total_response_bytes += response_bytes
+
+    async def record_completion(
+        self,
+        *,
+        estimated_tokens: int,
+        actual_tokens: int,
+        model: str | None,
+        latency_ms: float,
+        request_bytes: int,
+        response_bytes: int,
+        is_429: bool = False,
+        circuit_success: bool = True,
+    ) -> None:
+        """Under one lock: reconcile TPM, record_request metrics, circuit,
+        model stats, body sizes.
+        """
+        model_key = model or "unknown"
+        async with self._lock:
+            if estimated_tokens > 0:
+                self.tpm_bucket.reconcile(estimated_tokens, actual_tokens)
+
+            now = time.monotonic()
+            self.rpm_window.add(now)
+            self.total_forwarded += 1
+            self.total_tokens_consumed += actual_tokens
+            self.last_request_time = now
+
+            if circuit_success:
+                self.circuit_failure_count = 0
+                self.circuit_open_until = 0.0
+            else:
+                self.circuit_failure_count += 1
+                if self.circuit_failure_count >= self.circuit_threshold:
+                    self.circuit_open_until = time.monotonic() + self.circuit_cooldown
+                    _log(logging.WARNING, "circuit breaker opened after consecutive failures",
+                         failure_count=self.circuit_failure_count, threshold=self.circuit_threshold,
+                         cooldown_seconds=self.circuit_cooldown)
+
+            with self._thread_lock:  # Cross-thread safety for status() reads
+                if model_key not in self.model_usage:
+                    if len(self.model_usage) >= self.model_usage_max:
+                        oldest_keys = sorted(
+                            self.model_usage, key=lambda k: self.model_usage[k].requests
+                        )[:10]
+                        for k in oldest_keys:
+                            del self.model_usage[k]
+                    self.model_usage[model_key] = ModelStats()
+                stats = self.model_usage[model_key]
+                stats.requests += 1
+                stats.tokens += actual_tokens
+                stats.total_latency_ms += latency_ms
+                stats.recent_latencies.append(latency_ms)
+                if is_429:
+                    stats.errors_429 += 1
+                self.recent_latencies.append(latency_ms)
+
                 self.total_request_bytes += request_bytes
                 self.total_response_bytes += response_bytes
 

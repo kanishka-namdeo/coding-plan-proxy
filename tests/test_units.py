@@ -918,6 +918,33 @@ class TestMakeErrorResponse:
 
 
 # ---------------------------------------------------------------------------
+# try_admit + record_completion (Wave 3 coalesced admit/completion)
+# ---------------------------------------------------------------------------
+
+class TestTryAdmitAndRecordCompletion:
+    @pytest.mark.asyncio
+    async def test_try_admit_reserves_tpm(self, rate_limiter):
+        ok, reason, wait = await rate_limiter.try_admit(50)
+        assert ok and reason == "ok"
+        assert rate_limiter.tpm_bucket.reserved >= 50
+
+    @pytest.mark.asyncio
+    async def test_record_completion_single_path(self, rate_limiter):
+        await rate_limiter.try_admit(50)
+        await rate_limiter.record_completion(
+            estimated_tokens=50,
+            actual_tokens=40,
+            model="m",
+            latency_ms=12.0,
+            request_bytes=10,
+            response_bytes=20,
+            circuit_success=True,
+        )
+        assert rate_limiter.tpm_bucket.reserved == 0
+        assert rate_limiter.total_forwarded == 1
+
+
+# ---------------------------------------------------------------------------
 # RateLimiter token management methods
 # ---------------------------------------------------------------------------
 
