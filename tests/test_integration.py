@@ -782,6 +782,111 @@ class TestCircuitBreakerCleanup:
         finally:
             await upstream_runner.cleanup()
 
+    async def test_terminal_429_after_probe_claim_does_not_stick(self, aiohttp_client, proxy_app):
+        """Terminal 429 on a HALF_OPEN probe must clear circuit_probe_in_flight."""
+        app, rl = proxy_app
+        rl.primary.circuit_threshold = 1
+        rl.primary.circuit_cooldown = 0.01
+        await rl.primary.record_circuit_failure()
+        rl.primary.circuit_open_until = time.monotonic() - 1
+        rl.primary.circuit_state = "OPEN"
+
+        upstream_app = web.Application()
+
+        async def mock_upstream(request):
+            return web.json_response(
+                {"error": {"message": "quota exceeded", "type": "insufficient_quota"}},
+                status=429,
+            )
+
+        upstream_app.router.add_post("/v1/chat/completions", mock_upstream)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }).encode(),
+                    )
+                    assert resp.status == 429
+                    assert rl.primary.circuit_probe_in_flight is False
+                    assert rl.primary.circuit_state != "HALF_OPEN"
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
+
+    async def test_disconnect_after_probe_claim_does_not_stick(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        """Client disconnect after claiming a probe must clear circuit_probe_in_flight."""
+        app, rl = proxy_app
+        rl.primary.circuit_threshold = 1
+        rl.primary.circuit_cooldown = 0.01
+        await rl.primary.record_circuit_failure()
+        rl.primary.circuit_open_until = time.monotonic() - 1
+        rl.primary.circuit_state = "OPEN"
+
+        # Disconnect only after probe admit (second check in handler loop)
+        checks = {"n": 0}
+
+        def fake_disconnected(request):
+            checks["n"] += 1
+            return checks["n"] >= 2
+
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.handlers._client_disconnected",
+            fake_disconnected,
+        )
+
+        upstream_app = web.Application()
+
+        async def mock_upstream(request):
+            return web.json_response({"choices": [], "usage": {"total_tokens": 5}})
+
+        upstream_app.router.add_post("/v1/chat/completions", mock_upstream)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }).encode(),
+                    )
+                    assert resp.status == 499
+                    assert rl.primary.circuit_probe_in_flight is False
+                    assert rl.primary.circuit_state != "HALF_OPEN"
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
+
 
 # ---------------------------------------------------------------------------
 # Graceful shutdown

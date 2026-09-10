@@ -326,6 +326,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         limiter = rate_limiter
 
     await rate_limiter.increment_pending()
+    holding_probe = False
     try:
         wait_time = await wait_for_slot(limiter, request, estimated_tokens, queue_limiter=rate_limiter)
         if wait_time is None:
@@ -459,8 +460,13 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
             Try failover to next provider with proper TPM handling.
             Returns (success, tokens_reserved) - if success is False, request should be terminated.
             """
-            nonlocal tokens_reserved
-            
+            nonlocal tokens_reserved, holding_probe
+
+            # Release HALF_OPEN probe on the old limiter before switching providers
+            if holding_probe:
+                limiter.release_probe()
+                holding_probe = False
+
             # Refund tokens to old limiter before failover
             if tokens_reserved and estimated_tokens > 0:
                 await limiter.refund_tokens(estimated_tokens)
@@ -524,22 +530,29 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         503, b'{"error":"shutting down"}', request_id, retry_after=30
                     )
 
-                # Circuit breaker: single HALF_OPEN probe after cooldown; deny herd
-                if not limiter.can_attempt_probe():
-                    error_reason = "circuit_open"
-                    status_code = 503
-                    _log(logging.WARNING, "request rejected: circuit breaker open",
-                         request_id=request_id, failure_count=limiter.circuit_failure_count,
-                         circuit_state=limiter.circuit_state,
-                         probe_in_flight=limiter.circuit_probe_in_flight)
-                    await limiter.refund_tokens(estimated_tokens)
-                    tokens_reserved = False
-                    return _make_error_response(
-                        503,
-                        json.dumps({"error": "upstream unavailable", "retry_after": int(limiter.circuit_cooldown)}).encode(),
-                        request_id,
-                        retry_after=int(limiter.circuit_cooldown),
-                    )
+                # Circuit breaker: single HALF_OPEN probe after cooldown; deny herd.
+                # Probe holder may retry without reclaiming; if the probe was cleared
+                # mid-request (e.g. 5xx → record_circuit_failure), re-admit.
+                if holding_probe and limiter.circuit_probe_in_flight:
+                    pass
+                else:
+                    holding_probe = False
+                    if not limiter.can_attempt_probe():
+                        error_reason = "circuit_open"
+                        status_code = 503
+                        _log(logging.WARNING, "request rejected: circuit breaker open",
+                             request_id=request_id, failure_count=limiter.circuit_failure_count,
+                             circuit_state=limiter.circuit_state,
+                             probe_in_flight=limiter.circuit_probe_in_flight)
+                        await limiter.refund_tokens(estimated_tokens)
+                        tokens_reserved = False
+                        return _make_error_response(
+                            503,
+                            json.dumps({"error": "upstream unavailable", "retry_after": int(limiter.circuit_cooldown)}).encode(),
+                            request_id,
+                            retry_after=int(limiter.circuit_cooldown),
+                        )
+                    holding_probe = limiter.circuit_probe_in_flight
 
                 if _client_disconnected(request):
                     error_reason = "client_disconnected"
@@ -1001,6 +1014,9 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
             await limiter.refund_tokens(estimated_tokens)
         raise
     finally:
+        if holding_probe:
+            limiter.release_probe()
+            holding_probe = False
         await rate_limiter.decrement_pending()
         session_log: SessionLogWriter | None = request.app.get("session_log")
         if session_log is not None:

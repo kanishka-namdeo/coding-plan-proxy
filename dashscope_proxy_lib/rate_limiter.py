@@ -462,6 +462,21 @@ class RateLimiter:
             self.circuit_probe_in_flight = True
             return True
 
+    def release_probe(self) -> None:
+        """Clear an aborted HALF_OPEN probe so the circuit is not stuck forever.
+
+        No-op when no probe is in flight (e.g. success/failure already cleared it).
+        When HALF_OPEN with an in-flight probe, reopens with cooldown so another
+        probe may run after the cooldown elapses.
+        """
+        with self._thread_lock:
+            if not self.circuit_probe_in_flight:
+                return
+            self.circuit_probe_in_flight = False
+            if self.circuit_state == "HALF_OPEN":
+                self.circuit_state = "OPEN"
+                self.circuit_open_until = time.monotonic() + self.circuit_cooldown
+
     async def record_circuit_success(self) -> None:
         """Reset failure counter on a successful upstream response (TUI-visible)."""
         with self._thread_lock:

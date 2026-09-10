@@ -1070,6 +1070,32 @@ class TestCircuitBreaker:
         assert rate_limiter.circuit_state == "CLOSED"
         assert rate_limiter.circuit_probe_in_flight is False
 
+    @pytest.mark.asyncio
+    async def test_failed_probe_via_record_circuit_failure_reopens(self, rate_limiter):
+        rate_limiter.circuit_state = "OPEN"
+        rate_limiter.circuit_open_until = time.monotonic() - 1
+        assert rate_limiter.can_attempt_probe() is True
+        assert rate_limiter.circuit_state == "HALF_OPEN"
+        assert rate_limiter.circuit_probe_in_flight is True
+        opened = await rate_limiter.record_circuit_failure()
+        assert opened is True
+        assert rate_limiter.circuit_state == "OPEN"
+        assert rate_limiter.circuit_probe_in_flight is False
+        assert rate_limiter.circuit_is_open() is True
+
+    def test_release_probe_clears_half_open(self, rate_limiter):
+        rate_limiter.circuit_state = "OPEN"
+        rate_limiter.circuit_open_until = time.monotonic() - 1
+        assert rate_limiter.can_attempt_probe() is True
+        rate_limiter.release_probe()
+        assert rate_limiter.circuit_probe_in_flight is False
+        assert rate_limiter.circuit_state == "OPEN"
+        assert rate_limiter.circuit_is_open() is True
+        # After cooldown, a new probe can be claimed
+        rate_limiter.circuit_open_until = time.monotonic() - 1
+        assert rate_limiter.can_attempt_probe() is True
+
+
 # ---------------------------------------------------------------------------
 # SessionLogWriter edge cases
 # ---------------------------------------------------------------------------
