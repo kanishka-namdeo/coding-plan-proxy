@@ -47,6 +47,9 @@ class SessionLogWriter:
         self._current_date: str | None = None
         self._file: typing.TextIO | None = None
         self._lock = threading.Lock()
+        # Serializes accept/enqueue vs close so entries cannot land after the
+        # writer exits (TOCTOU between ``_closed`` check and ``put_nowait``).
+        self._accept_lock = threading.Lock()
         self._closed = False
         self._lines_since_flush = 0
 
@@ -186,35 +189,83 @@ class SessionLogWriter:
         """
         if self._sync_flush:
             assert self._executor is not None
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(self._executor, self._log_with_lock, entry)
+            with self._accept_lock:
+                if self._closed:
+                    return
+                loop = asyncio.get_running_loop()
+                fut = loop.run_in_executor(self._executor, self._log_with_lock, entry)
+            await fut
             return
 
-        if self._closed or self._queue is None:
-            return
-        try:
-            self._queue.put_nowait(entry)
-        except queue.Full:
-            _logger.error(
-                "session log queue full; dropping entry request_id=%s",
-                entry.get("request_id"),
-            )
+        with self._accept_lock:
+            if self._closed or self._queue is None:
+                return
+            try:
+                self._queue.put_nowait(entry)
+            except queue.Full:
+                _logger.error(
+                    "session log queue full; dropping entry request_id=%s",
+                    entry.get("request_id"),
+                )
 
     def log(self, entry: dict) -> None:
         """Write one JSON line synchronously. Thread-safe via threading.Lock.
 
         For async contexts, use log_async() instead to avoid blocking the event loop.
         """
-        if self._closed:
-            return
+        with self._accept_lock:
+            if self._closed:
+                return
         with self._lock:
             self._write_sync(entry)
 
+    def _enqueue_close_sentinel(self) -> list:
+        """Enqueue stop sentinel; on Full, pull items aside so drain still happens.
+
+        Returns entries removed to make room (must be written by caller so close
+        does not lose pending work).
+        """
+        assert self._queue is not None
+        aside: list = []
+        deadline = time.monotonic() + 5.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _logger.error("session log close: could not enqueue sentinel")
+                return aside
+            try:
+                self._queue.put(_SENTINEL, timeout=min(remaining, 0.25))
+                return aside
+            except queue.Full:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    continue
+                if item is _SENTINEL:
+                    # Another closer already signaled; keep room for our path.
+                    continue
+                aside.append(item)
+
+    def _drain_queue_unlocked(self) -> list:
+        """Pull remaining queue items (non-sentinel). Caller holds no queue lock."""
+        drained: list = []
+        if self._queue is None:
+            return drained
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not _SENTINEL:
+                drained.append(item)
+        return drained
+
     def close(self) -> None:
         """Stop accepting, drain queue, final flush, join writer (QueueListener shape)."""
-        if self._closed:
-            return
-        self._closed = True
+        with self._accept_lock:
+            if self._closed:
+                return
+            self._closed = True
 
         if self._sync_flush:
             if self._executor is not None:
@@ -227,16 +278,18 @@ class SessionLogWriter:
                     self._file = None
             return
 
+        aside: list = []
         if self._queue is not None:
-            # May block briefly if the queue is full; close is off the hot path.
-            try:
-                self._queue.put(_SENTINEL, timeout=5.0)
-            except queue.Full:
-                _logger.error("session log close: queue full; could not enqueue sentinel")
+            aside = self._enqueue_close_sentinel()
         if self._writer_thread is not None:
             self._writer_thread.join(timeout=30.0)
             self._writer_thread = None
+        # Post-join: write items pulled to make room for the sentinel, plus any
+        # leftovers still on the queue after the writer exited.
+        leftovers = aside + self._drain_queue_unlocked()
         with self._lock:
+            for item in leftovers:
+                self._write_sync(item)
             self._flush_unlocked()
             if self._file is not None:
                 self._file.close()

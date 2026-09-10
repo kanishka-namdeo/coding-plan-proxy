@@ -1047,6 +1047,16 @@ class TestSessionLogAsyncEnqueue:
     def test_write_sync_skips_flush_when_batching(self, dashscope_module, tmp_path, monkeypatch):
         monkeypatch.setenv("SESSION_LOG_SYNC_FLUSH", "0")
         writer = dashscope_module.SessionLogWriter(str(tmp_path / "logs"))
+
+        # Stop/join the live writer before installing FakeFile so it cannot race flushes.
+        import dashscope_proxy_lib.session_log as session_log_mod
+
+        assert writer._queue is not None and writer._writer_thread is not None
+        writer._queue.put(session_log_mod._SENTINEL)
+        writer._writer_thread.join(timeout=5.0)
+        assert not writer._writer_thread.is_alive()
+        writer._writer_thread = None
+
         flushes = []
         writer._ensure_file = lambda: None  # type: ignore
 
@@ -1073,6 +1083,27 @@ class TestSessionLogAsyncEnqueue:
             writer._flush_unlocked()
         assert len(flushes) == 1
         writer.close()
+
+    def test_close_sentinel_makes_room_when_queue_full(self, dashscope_module, tmp_path, monkeypatch):
+        """close() must not lose pending entries when the sentinel put hits Full."""
+        monkeypatch.setenv("SESSION_LOG_SYNC_FLUSH", "0")
+        monkeypatch.setenv("SESSION_LOG_QUEUE_MAX", "1")
+        writer = dashscope_module.SessionLogWriter(str(tmp_path / "logs"))
+        import dashscope_proxy_lib.session_log as session_log_mod
+
+        assert writer._queue is not None and writer._writer_thread is not None
+        # Stop the live writer so the queue stays occupied for close().
+        writer._queue.put(session_log_mod._SENTINEL)
+        writer._writer_thread.join(timeout=5.0)
+        assert not writer._writer_thread.is_alive()
+        writer._writer_thread = None
+
+        writer._queue.put_nowait({"request_id": "kept", "status_code": 200})
+        writer.close()
+
+        text = next((tmp_path / "logs").glob("*.jsonl")).read_text(encoding="utf-8")
+        assert text.count("request_id") == 1
+        assert "kept" in text
 
 
 # ---------------------------------------------------------------------------

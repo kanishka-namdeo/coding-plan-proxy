@@ -1,62 +1,54 @@
-# Task 3 Report: Remove Quota Retry Logic from Handlers
+# Task 3 Report — Wave 2 Session Log Non-blocking + Batched Flush
 
-**Status:** DONE_WITH_CONCERNS
+**Status:** DONE  
+**Branch:** `perf/measure-first-hardening`  
+**Commit:** `ca2e8e3` — perf: non-blocking session log enqueue with batched flush
 
-## Commit Hashes
+## Deliverables
 
-- `fc11027fc641eea13d08c73655d6a84a7bf24481` — refactor(handlers): remove quota retry logic, immediate terminal 429
+| Item | Path | Notes |
+| --- | --- | --- |
+| Batched writer | `dashscope_proxy_lib/session_log.py` | Bounded `queue.Queue` + one background drain thread; `put_nowait`; drop+ERROR on `Full`; flush every 32 lines / 0.25s; `close()` sentinel drain + final flush + join; `SESSION_LOG_SYNC_FLUSH=1` escape hatch |
+| Handler docs | `dashscope_proxy_lib/handlers.py` | `_maybe_flush_session_log` documents enqueue-not-disk; `finally` still `await log_async` with ERROR try/except |
+| Tests | `tests/test_units.py` | `TestSessionLogAsyncEnqueue` (timing, close-drain, batch flush spy) |
+| DOX | `AGENTS.md`, `dashscope_proxy_lib/AGENTS.md`, `tests/AGENTS.md` | Session flush / enqueue semantics |
 
-## Test Summary
+## TDD evidence
 
-### Tests Run
+1. **Failing tests first:** Added `TestSessionLogAsyncEnqueue`.  
+   `py -m pytest tests/test_units.py -k "SessionLogAsyncEnqueue or write_sync_skips" -v` → **1 failed** (`test_write_sync_skips_flush_when_batching`: 3 flushes vs 0 — current code flushed every write). Timing/drain tests passed accidentally on old path (as brief warned).
+2. **Implement:** Rewrote `SessionLogWriter` to QueueHandler/QueueListener shape; updated handler docstring; updated DOX.
+3. **Passing:** `tests/test_units.py -k SessionLog` → **9 passed**; full `tests/test_units.py` → **215 passed**; integration `-k session_log` → **1 passed**.
 
-| Test | Result |
-|------|--------|
-| `test_retries_on_429_then_succeeds` | PASSED |
-| `test_streaming_429_retries_then_succeeds` | PASSED |
-| `test_streaming_429_forwards_retry_after_header` | PASSED |
-| `test_non_streaming_429_after_max_retries` | PASSED |
-| `test_multiple_429s_then_success` | PASSED |
-| `test_non_200_non_429_non_5xx_forwarded` | PASSED |
-| `test_quota_exceeded_429_not_retried` | FAILED (expected) |
+## Self-review
 
-**Summary:** 6 passed, 1 failed. The failing test is the quota-specific test that was testing the old quota retry behavior. Per the brief, "Quota-specific tests will be updated in Task 5."
+- Full entry dicts still `json.dumps`'d unchanged (no field dropping).
+- Hot path never `await run_in_executor` per request unless `SESSION_LOG_SYNC_FLUSH=1`.
+- Sync `log()` also batches flushes (flush on count / close); existing sync tests still close then read.
+- `close()` uses sentinel with 5s put timeout and 30s join so a dead writer cannot hang forever; remaining durability risk if join times out before drain completes.
+- Queue-full drops are intentional (never block the event loop); ops should watch ERROR logs / raise `SESSION_LOG_QUEUE_MAX` if needed.
 
 ## Concerns
 
-1. **Quota-specific test failure:** `test_quota_exceeded_429_not_retried` fails because it was testing the old quota retry behavior (expecting 2 calls due to cooldown retry). The new behavior immediately returns the terminal 429 without retry, so only 1 upstream call is made. This test will be updated in Task 5 per the brief.
+- Under sustained overload, session entries can be dropped when the queue is full (logged at ERROR). Not silent, but not durable.
+- Process kill without `close()` can lose up to one flush interval / batch of unflushed lines (same class of risk as any batched logger).
 
-## Implementation Details
+## Review fix — close drain + flush-spy stability
 
-### Changes Made
+**Status:** DONE  
+**Findings addressed:**
 
-1. **Removed quota retry variables** (around line 410):
-   - Removed `quota_retries = 0`
-   - Removed `quota_max = getattr(limiter, "quota_max_retries", 0)`
-   - Removed `quota_cooldown = getattr(limiter, "quota_retry_cooldown", 1800)`
+1. **Flaky flush-spy** — `test_write_sync_skips_flush_when_batching` now stop/joins the writer thread (sentinel + join) before installing `FakeFile`, then exercises `_write_sync` under `_lock`.
+2. **`close()` on queue.Full** — `_enqueue_close_sentinel()` pulls entries aside to make room for the sentinel (entries preserved); after join, aside + leftover queue items are written under lock before final flush/close.
+3. **TOCTOU `log_async` vs `close`** — `_accept_lock` serializes accept/enqueue with stop-accept; sync-flush submits the executor future under the same lock; post-join leftover drain remains as defense in depth.
 
-2. **Streaming 429 handling** (around line 560):
-   - Replaced the quota retry logic (20+ lines of cooldown sleep and retry) with immediate return:
-     - Changed `error_reason` from `"upstream_quota_exceeded"` to `"upstream_429_terminal"`
-     - Changed log message from `"upstream quota exceeded, not retrying"` to `"upstream terminal 429, not retrying"`
-     - Removed the cooldown sleep and retry loop entirely
-     - Returns HTTP 429 immediately with the upstream body and headers
+**Test added:** `test_close_sentinel_makes_room_when_queue_full`
 
-3. **Non-streaming 429 handling** (around line 800):
-   - Same changes as streaming: immediate return for terminal 429, no cooldown retry
+**Verification:**
 
-### Unchanged Behavior
+```text
+py -m pytest tests/test_units.py -k SessionLog -v
+===================== 10 passed, 206 deselected in 0.82s ======================
+```
 
-- `should_retry_429()` function remains unchanged — it still classifies 429s as retryable or terminal
-- Generic 429 retry logic (for retryable 429s) remains unchanged — still uses backoff and max retries
-- The proxy still distinguishes between terminal 429s (immediate return) and retryable 429s (normal retry path)
-
-### Verification
-
-- No linter errors in `handlers.py`
-- No remaining references to `quota_retries`, `quota_max`, or `quota_cooldown` in the codebase
-- All generic 429 retry tests pass
-
-## Files Modified
-
-- `dashscope_proxy_lib/handlers.py` — 1 file changed, 5 insertions(+), 32 deletions(-)
+All SessionLog tests passed (including flush-spy + Full-close preserve).
