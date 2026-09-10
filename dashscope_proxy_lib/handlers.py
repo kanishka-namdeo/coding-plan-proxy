@@ -512,7 +512,8 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
             headers["Authorization"] = f"Bearer {provider.api_key}"
             headers["X-Request-ID"] = request_id
 
-        while retry <= limiter.max_retries and retry_5xx <= _cfg("MAX_5XX_RETRIES"):
+        max_5xx_retries = _cfg("MAX_5XX_RETRIES")
+        while retry <= limiter.max_retries and retry_5xx <= max_5xx_retries:
             try:
                 if app_shutting_down and app_shutting_down.is_set():
                     error_reason = "shutting_down"
@@ -626,13 +627,13 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             upstream.close()
                             retry_5xx += 1
                             await limiter.record_circuit_failure()
-                            if retry_5xx > _cfg("MAX_5XX_RETRIES"):
+                            if retry_5xx > max_5xx_retries:
                                 error_reason = "upstream_5xx"
                                 status_code = upstream.status
                                 _log(logging.WARNING, "upstream 5xx after max retries",
                                      request_id=request_id, model=model_name,
                                      status=upstream.status, retry_5xx=retry_5xx,
-                                     max_retries=_cfg("MAX_5XX_RETRIES"))
+                                     max_retries=max_5xx_retries)
                                 # Try failover to next provider with proper TPM handling
                                 success, _ = await _try_failover_with_tpm()
                                 if success:
@@ -648,7 +649,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             _log(logging.WARNING, "upstream 5xx, retrying",
                                  request_id=request_id, model=model_name,
                                  status=upstream.status, retry_5xx=retry_5xx,
-                                 max_retries=_cfg("MAX_5XX_RETRIES"),
+                                 max_retries=max_5xx_retries,
                                  backoff_seconds=round(retry_wait, 1))
                             del upstream_body  # Release error body before backoff sleep
                             if not await _sleep_interruptible(request, retry_wait):
@@ -696,13 +697,32 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         await resp.prepare(request)
                         stream_prepared = True
 
+                        chunk_idle_timeout = _cfg("STREAM_CHUNK_IDLE_TIMEOUT")
                         try:
                             async for chunk in upstream.content:
                                 total_stream_bytes += len(chunk)
                                 tail_buffer.extend(chunk)
                                 if len(tail_buffer) > tail_max:
                                     del tail_buffer[:len(tail_buffer) - tail_max]
-                                await resp.write(chunk)
+                                try:
+                                    async with asyncio.timeout(chunk_idle_timeout):
+                                        await resp.write(chunk)
+                                except asyncio.TimeoutError:
+                                    _log(
+                                        logging.WARNING,
+                                        "Stream chunk idle timeout",
+                                        request_id=request_id,
+                                        timeout=chunk_idle_timeout,
+                                    )
+                                    try:
+                                        sse_error = (
+                                            b'data: {"error": {"message": "upstream chunk timeout",'
+                                            b' "type": "proxy_error"}}\n\n'
+                                        )
+                                        await resp.write(sse_error)
+                                    except Exception:
+                                        pass
+                                    break
                         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError, ConnectionAbortedError):
                             _log(logging.INFO, "client disconnected during stream",
                                  request_id=request_id, model=model_name,
@@ -859,12 +879,12 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                     if 500 <= status_code < 600:
                         retry_5xx += 1
                         await limiter.record_circuit_failure()
-                        if retry_5xx > _cfg("MAX_5XX_RETRIES"):
+                        if retry_5xx > max_5xx_retries:
                             error_reason = "upstream_5xx"
                             _log(logging.WARNING, "upstream 5xx after max retries",
                                  request_id=request_id, model=model_name,
                                  status=status_code, retry_5xx=retry_5xx,
-                                 max_retries=_cfg("MAX_5XX_RETRIES"))
+                                 max_retries=max_5xx_retries)
                             # Try failover to next provider with proper TPM handling
                             success, _ = await _try_failover_with_tpm()
                             if success:
@@ -880,7 +900,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         _log(logging.WARNING, "upstream 5xx, retrying",
                              request_id=request_id, model=model_name,
                              status=status_code, retry_5xx=retry_5xx,
-                             max_retries=_cfg("MAX_5XX_RETRIES"),
+                             max_retries=max_5xx_retries,
                              backoff_seconds=round(retry_wait, 1))
                         del resp_body, resp_headers  # Release response body before backoff sleep
                         if not await _sleep_interruptible(request, retry_wait):

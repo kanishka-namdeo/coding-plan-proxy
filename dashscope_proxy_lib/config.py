@@ -96,6 +96,8 @@ MAX_BODY_SIZE = _safe_int("MAX_BODY_SIZE", 50 * 1024 * 1024)
 MAX_STREAM_BUFFER = _safe_int("MAX_STREAM_BUFFER", 50 * 1024 * 1024)  # 50 MB cap for streaming response buffer
 MAX_5XX_RETRIES = _safe_int("MAX_5XX_RETRIES", 3)
 DEQUE_MAX_SIZE = 100_000
+STREAM_CHUNK_IDLE_TIMEOUT = 60  # seconds between chunks before stream is considered stalled
+STREAM_TAIL_BUFFER_SIZE = 8192  # enough for the final SSE data line
 
 # ---------------------------------------------------------------------------
 # Hop-by-hop headers (must not be forwarded)
