@@ -19,6 +19,21 @@
 - Prefer `py -m pytest` on Windows
 - Keep rule: meaningful metric win (~≥5% on targeted scenario) + green tests, else revert the wave
 - Out of scope: separate TUI process, latency-based routing, replacing aiohttp, CI load suite
+- Optional accelerators (`orjson`, raising `limit_per_host`) only if Wave 0/1 measurement still shows JSON or connector wait as dominant — do not add deps by default
+
+## Research grounding
+
+Sources consulted before execution (2026-09-10). Tasks below reflect these findings.
+
+| Claim in plan | Grounding | Plan implication |
+|---------------|-----------|------------------|
+| Shared long-lived `ClientSession` + `TCPConnector` | [aiohttp client lifecycle](https://docs.aiohttp.org/en/stable/http_request_lifecycle.html), [TCPConnector](https://docs.aiohttp.org/en/stable/client_reference.html#aiohttp.TCPConnector) (v3.14.x): reuse one session; `limit` default 100, `limit_per_host` default **0** (unlimited) | Keep current single session. Our `limit_per_host=50` is stricter than aiohttp default — measure under burst; only raise if connector wait shows up (Task 10). |
+| Concurrent burst benches need warm pools | [aiohttp discussion #8170](https://github.com/aio-libs/aiohttp/discussions/8170): cold `gather()` can establish connections sequentially | Task 1: warmup must open/reuse connections before timing; document cold vs warm in results. |
+| Do not await disk/logging on the event loop | [Python asyncio-dev Logging](https://docs.python.org/3/library/asyncio-dev.html); [Logging Cookbook — handlers that block](https://docs.python.org/3/howto/logging-cookbook.html#dealing-with-handlers-that-block): use `QueueHandler`/`QueueListener`, `put`/`put_nowait`, drain on background thread; `listener.stop()` on shutdown | Task 3: prefer queue + background drain over `await run_in_executor` per request; catch `queue.Full`; flush/drain on `close()`. |
+| Nesting `threading.Lock` under async work stalls the loop | [asyncio sync docs](https://docs.python.org/3/library/asyncio-sync.html) (`asyncio.Lock` not thread-safe); [asyncio-dev](https://docs.python.org/3/library/asyncio-dev.html); real-world [weaviate#1332](https://github.com/weaviate/weaviate-python-client/issues/1332) | Task 6 confirmed: never hold `_thread_lock` while holding `asyncio.Lock` / across `await`; keep thread-lock sections short and sync-only. |
+| HALF_OPEN must admit a single probe | AWS Powertools circuit breaker docs; half-open thundering-herd reports ([circuitbreaker-lambda#7](https://github.com/gunnargrosch/circuitbreaker-lambda/issues/7)); simulator guidance (1–3 probes) | Task 8 confirmed. Stay with **one** in-flight probe (existing `can_attempt_probe`). Optional later: `success_threshold > 1` before CLOSED — **not** in this plan unless measured false closes. |
+| Skip redundant JSON before buying `orjson` | [orjson](https://github.com/ijl/orjson) is much faster, but real APIs are usually network-bound; aiohttp still evolving bytes JSON APIs ([aio-libs/aiohttp#11989](https://github.com/aio-libs/aiohttp/issues/11989)) | Wave 1 (parse once / dump once) first. Add optional `orjson` only if `nonstream_large` remains CPU-bound after Wave 1. |
+| File logging / flush every line hurts p99 | Same QueueHandler guidance; blocking `flush()` on hot path is classic tail-latency tax | Task 3: batch flush; never flush on the request await path. |
 
 ## File map
 
@@ -306,6 +321,8 @@ Document: run command, scenario list, keep rule (~≥5%), headless preferred, re
 Run: `py benchmarks/run_bench.py --out benchmarks/results/smoke.json`  
 Expected: exit 0, JSON file with four scenario keys and numeric p50/p95.
 
+**Research note:** After warmup, connections should be reused (aiohttp keep-alive). If `concurrent_burst` is much slower than sequential `nonstream_small` × N, inspect connector `limit` / `limit_per_host` saturation before blaming application locks. Record `limit` / `limit_per_host` used in the results JSON metadata.
+
 - [ ] **Step 5: Capture baseline**
 
 Run once more as `benchmarks/results/baseline.json` (local only). Note p50/p95 for later comparison (do not commit results).
@@ -468,8 +485,10 @@ git commit -m "perf: estimate tokens from dict and dump request body once"
 - Consumes: existing `SessionLogWriter.log` / `log_async` / `close`
 - Produces:
   - `log_async(entry)` returns after enqueue (does not wait for disk flush)
-  - Internal bounded queue; single writer thread/executor drains and flushes every `SESSION_LOG_FLUSH_INTERVAL` seconds or every `SESSION_LOG_FLUSH_EVERY` lines (defaults: 0.25s / 32 lines)
-  - `close()` drains queue, final flush, then shuts down executor
+  - Internal bounded `queue.Queue`; writer thread drains and flushes every `SESSION_LOG_FLUSH_INTERVAL` seconds or every `SESSION_LOG_FLUSH_EVERY` lines (defaults: 0.25s / 32 lines)
+  - Hot path uses `put_nowait` (or short timeout); on `queue.Full` log ERROR and drop — never block the event loop (mirrors stdlib `QueueHandler` guidance)
+  - Prefer **one background consumer** over `await run_in_executor(...)` per request (executor-per-record is the anti-pattern called out in asyncio logging guidance)
+  - `close()` / shutdown: stop acceptor, drain queue, final flush, then join writer (like `QueueListener.stop()`)
   - Optional env `SESSION_LOG_SYNC_FLUSH=1` restores old await+flush-every-line behavior for emergency debugging
 
 - [ ] **Step 1: Write failing tests**
@@ -847,6 +866,8 @@ if not limiter.can_attempt_probe():
 
 Do **not** call lock-free `circuit_is_open()` alone for the admit gate (it allows herd after cooldown). Keep `circuit_is_open()` for status displays if needed.
 
+**Research note:** Single in-flight HALF_OPEN probe is the standard fix for recovery stampedes. Do **not** expand to multi-success thresholds in this task unless tests later show single-success false closes under flaky upstreams.
+
 - [ ] **Step 1: Failing tests**
 
 ```python
@@ -917,17 +938,21 @@ git commit -m "perf: apply RPS spacing at admission time"
 
 ---
 
-### Task 10: Wave 5 extras — TPM wait without holding outer lock + TUI session log tail
+### Task 10: Wave 5 extras — TPM wait, TUI session log tail, connector/orjson gates
 
 **Files:**
 - Modify: `dashscope_proxy_lib/rate_limiter.py` (`can_proceed` / `try_admit` TPM wait estimate)
 - Modify: `proxy_tui.py` (`_read_session_log_entries`)
+- Optionally modify: `dashscope_proxy_lib/config.py` / `server.py` (connector limits) **only if measured**
+- Optionally add: `orjson` dependency **only if measured**
 - Test: units for wait estimate conservatism; optional TUI unit if present
 
 **Interfaces:**
 - Produces:
   - When TPM insufficient, compute `wait_seconds_for` **after** releasing `RateLimiter._lock` (or use a snapshot of bucket state copied under lock, compute outside). Wait must stay **≥** current estimate (never under-wait).
   - TUI: track file offset / inode; read only new bytes since last poll; still return last 200 parsed entries via `deque(maxlen=200)`.
+  - **Connector gate (research):** aiohttp default `limit_per_host=0` (unlimited); we use `50`. If Task 1 `concurrent_burst` shows success collapses or latency spikes with idle CPU, try raising `MAX_CONNECTIONS_PER_HOST` (or `0`) and re-bench before more lock work.
+  - **orjson gate (research):** Only if after Wave 1, `nonstream_large` profile still spends dominant CPU in `json.loads`/`dumps`. Prefer optional import with stdlib fallback; do not make it required. Remember `orjson.dumps` returns `bytes`.
 
 - [ ] **Step 1: Implement TPM wait release-before-walk**
 
@@ -975,6 +1000,14 @@ def _read_session_log_entries(self) -> list[dict]:
 git commit -m "perf: shorten TPM wait lock hold; incremental TUI session log read"
 ```
 
+If connector or orjson gates fired, commit those separately with bench numbers in the message:
+
+```bash
+git commit -m "perf: raise MAX_CONNECTIONS_PER_HOST after burst bench showed connector wait"
+# or
+git commit -m "perf: optional orjson for large-body path after Wave 1 still CPU-bound"
+```
+
 ---
 
 ### Task 11: DOX + final verification
@@ -1018,7 +1051,9 @@ git commit -m "docs: record performance optimization contracts in DOX"
 | Wave 5 circuit probe | Task 8 |
 | Wave 5 admission RPS | Task 9 |
 | Wave 5 TPM wait + TUI incremental log | Task 10 |
+| Connector `limit_per_host` / optional orjson | Task 10 gates (measurement-triggered only) |
 | Invariants / out of scope | Global Constraints |
+| Research citations | Research grounding |
 | DOX + final verify | Task 11 |
 
-No TBD placeholders. Interfaces for `try_admit` / `record_completion` / `estimate_tokens_for_body` / `configure_logging(enable_tui_handler=...)` are consistent across tasks.
+No TBD placeholders. Interfaces for `try_admit` / `record_completion` / `estimate_tokens_for_body` / `configure_logging(enable_tui_handler=...)` are consistent across tasks. Research section maps each major technique to current aiohttp / Python / circuit-breaker guidance.
