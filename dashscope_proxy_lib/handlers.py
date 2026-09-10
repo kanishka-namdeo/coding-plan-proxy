@@ -664,7 +664,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         # bytes separately to avoid accumulating the full stream
                         # in memory (which could be 50MB+ per request).
                         tail_buffer = bytearray()
-                        tail_max = 8192  # enough for the final SSE data line
+                        tail_max = _cfg("STREAM_TAIL_BUFFER_SIZE")
                         total_stream_bytes = 0
                         tokens_from_stream = 0
 

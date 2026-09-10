@@ -1,36 +1,21 @@
-# Task 7: Update Documentation Files - Report
+# Task 7 Report — Wave 4 stream idle timeout caching
 
-## Status: DONE
+**Status:** DONE  
+**Branch:** `perf/measure-first-hardening`
 
-## Summary
+## Commits
 
-Verification completed successfully. No StreamLake references were found in the documentation files (`AGENTS.md` and `README_SCRIPT.md`).
+- `a2e5055` — `perf: cache stream idle timeout outside chunk loop` (handlers + config/facade exports).
 
-## Findings
+## Tests
 
-### Files Checked
+- `py -m pytest tests/test_integration.py::TestStreamingErrors -q` — **6 passed**
 
-1. **AGENTS.md** (root DOX file)
-   - No StreamLake references found
-   - Already contains updated references to OpenLux in the Child DOX Index: "proxy routing (DashScope/MIMO/OpenLux/ARK/MetaAI/DeepSeek/GLM)"
+## Concerns
 
-2. **README_SCRIPT.md** (TUI launcher documentation)
-   - No StreamLake references found
-   - Already contains updated provider list:
-     - "Tertiary: OpenLux (optional)" in Multi-Provider Support section
+- Worktree lacked stream idle timeout before this task; behavior aligned with main proxy (timeout wraps `resp.write`, not upstream read wait).
+- `tail_max` still hardcoded 8192; `STREAM_TAIL_BUFFER_SIZE` exported for later use.
 
-### Verification Command
+## Report path
 
-```bash
-rg -n "StreamLake" AGENTS.md README_SCRIPT.md 2>&1
-```
-
-**Result:** Exit code 1 with no output (no matches found) - **PASS**
-
-## Commit
-
-No changes were needed. The documentation files already had the correct "OpenLux" references and no stale "StreamLake" references.
-
-## Conclusion
-
-The documentation files were already updated as part of the OpenLux replacement project. No additional changes were required for this task.
+`.superpowers/sdd/task-7-report.md`

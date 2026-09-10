@@ -1012,6 +1012,67 @@ class TestStreamingErrors:
         finally:
             await upstream_runner.cleanup()
 
+    async def test_streaming_chunk_idle_timeout_emits_sse_error(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        """Slow client write past STREAM_CHUNK_IDLE_TIMEOUT emits SSE proxy_error."""
+        upstream_app = web.Application()
+
+        async def mock_upstream(request):
+            return web.Response(
+                status=200,
+                body=(
+                    b'data: {"choices": [{"delta": {"content": "hi"}}]}\n\n'
+                    b'data: {"usage": {"total_tokens": 5}}\n\n'
+                    b"data: [DONE]\n\n"
+                ),
+                content_type="text/event-stream",
+            )
+
+        upstream_app.router.add_post("/v1/chat/completions", mock_upstream)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        original_write = web.StreamResponse.write
+
+        async def slow_write(self, data):
+            if b"upstream chunk timeout" in data:
+                return await original_write(self, data)
+            await asyncio.sleep(0.2)
+            return await original_write(self, data)
+
+        monkeypatch.setattr(dashscope_proxy, "STREAM_CHUNK_IDLE_TIMEOUT", 0.05)
+        monkeypatch.setattr(web.StreamResponse, "write", slow_write)
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                app, _ = proxy_app
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "qwen3-coder-plus",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": True,
+                        }).encode(),
+                    )
+                    assert resp.status == 200
+                    text = await resp.text()
+                    assert "upstream chunk timeout" in text
+                    assert "proxy_error" in text
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
+
 
 # ---------------------------------------------------------------------------
 # Client disconnect paths
