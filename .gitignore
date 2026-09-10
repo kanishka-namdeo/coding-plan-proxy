@@ -61,3 +61,6 @@ crush.json
 
 # PID file
 proxy.pid
+# Git worktrees
+.worktrees/
+
