@@ -923,6 +923,17 @@ class TestMakeErrorResponse:
 
 class TestTryAdmitAndRecordCompletion:
     @pytest.mark.asyncio
+    async def test_try_admit_updates_last_request_time(self, rate_limiter):
+        rate_limiter.rps_limit = 1.0  # 1 rps => 1s gap
+        t0 = time.monotonic()
+        ok, _, _ = await rate_limiter.try_admit(0)
+        assert ok
+        ok2, reason, wait = await rate_limiter.try_admit(0)
+        assert ok2 is False
+        assert reason == "RPS spacing"
+        assert wait > 0.5
+
+    @pytest.mark.asyncio
     async def test_try_admit_reserves_tpm(self, rate_limiter):
         ok, reason, wait = await rate_limiter.try_admit(50)
         assert ok and reason == "ok"
@@ -946,6 +957,9 @@ class TestTryAdmitAndRecordCompletion:
     @pytest.mark.asyncio
     async def test_status_during_completion(self, rate_limiter):
         """status() must stay usable while record_completion runs; never nest locks."""
+        # Admit-time RPS would serialize hammer admits at fixture rps_limit=1;
+        # raise spacing so the nest probe still stresses concurrent completion.
+        rate_limiter.rps_limit = 10_000
         nested = []
         real_thread_lock = rate_limiter._thread_lock
         async_lock = rate_limiter._lock

@@ -279,7 +279,6 @@ class RateLimiter:
                      wait_seconds=min_gap - time_since_last)
                 return False, "RPS spacing", min_gap - time_since_last
 
-            # Do not update last_request_time here (Wave 5 / Task 9).
             if estimated_tokens > 0:
                 if not self.tpm_bucket.try_reserve(estimated_tokens):
                     wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, now_mono)
@@ -288,6 +287,9 @@ class RateLimiter:
                          estimated_tokens=estimated_tokens)
                     return False, "TPM limit reached", wait
 
+            # Admission-time RPS shaping: stamp under asyncio.Lock so waiters
+            # see spacing immediately (same lock as the RPS check above).
+            self.last_request_time = time.monotonic()
             return True, "ok", 0.0
 
     async def reserve_tokens(self, estimated_tokens: int) -> bool:
@@ -312,10 +314,10 @@ class RateLimiter:
         async with self._lock:
             self.rpm_window.add(now)
             local_tokens = tokens_used
+            self.last_request_time = now
         with self._thread_lock:
             self.total_forwarded += 1
             self.total_tokens_consumed += local_tokens
-            self.last_request_time = now
 
     async def record_model_stats(self, model: str, tokens: int, latency_ms: float, is_429: bool = False) -> None:
         """Record per-model usage statistics under _thread_lock only (TUI-visible)."""
@@ -364,11 +366,11 @@ class RateLimiter:
             now = time.monotonic()
             self.rpm_window.add(now)
             local_tokens = actual_tokens
+            self.last_request_time = now
 
         with self._thread_lock:
             self.total_forwarded += 1
             self.total_tokens_consumed += local_tokens
-            self.last_request_time = now
 
             if circuit_success:
                 self.circuit_failure_count = 0
