@@ -724,6 +724,9 @@ class TestCircuitBreakerCleanup:
         app, rl = proxy_app
         rl.primary.circuit_threshold = 1
         rl.primary.circuit_cooldown = 0.01
+        # Admit-time RPS would serialize concurrent admits; raise so all five
+        # reach the HALF_OPEN probe gate together.
+        rl.primary.rps_limit = 10_000
         await rl.primary.record_circuit_failure()
         assert rl.primary.circuit_is_open()
         rl.primary.circuit_open_until = time.monotonic() - 1
