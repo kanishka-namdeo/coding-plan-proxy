@@ -1018,6 +1018,64 @@ class TestSessionLogWriterEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# SessionLogWriter async enqueue + batched flush
+# ---------------------------------------------------------------------------
+
+class TestSessionLogAsyncEnqueue:
+    @pytest.mark.asyncio
+    async def test_log_async_does_not_require_immediate_flush(self, dashscope_module, tmp_path):
+        writer = dashscope_module.SessionLogWriter(str(tmp_path / "logs"))
+        t0 = time.monotonic()
+        await writer.log_async({"request_id": "r1", "status_code": 200})
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.05
+        writer.close()
+        files = list((tmp_path / "logs").glob("*.jsonl"))
+        assert files
+        text = files[0].read_text(encoding="utf-8")
+        assert "r1" in text
+
+    @pytest.mark.asyncio
+    async def test_close_drains_pending(self, dashscope_module, tmp_path):
+        writer = dashscope_module.SessionLogWriter(str(tmp_path / "logs"))
+        for i in range(20):
+            await writer.log_async({"request_id": f"r{i}", "status_code": 200})
+        writer.close()
+        text = next((tmp_path / "logs").glob("*.jsonl")).read_text(encoding="utf-8")
+        assert text.count("request_id") == 20
+
+    def test_write_sync_skips_flush_when_batching(self, dashscope_module, tmp_path, monkeypatch):
+        monkeypatch.setenv("SESSION_LOG_SYNC_FLUSH", "0")
+        writer = dashscope_module.SessionLogWriter(str(tmp_path / "logs"))
+        flushes = []
+        writer._ensure_file = lambda: None  # type: ignore
+
+        class FakeFile:
+            def write(self, _):
+                pass
+
+            def flush(self):
+                flushes.append(1)
+
+            def close(self):
+                pass
+
+        writer._file = FakeFile()
+        writer._current_date = "2099-01-01"
+        writer._flush_every = 10
+        writer._lines_since_flush = 0
+        writer._sync_flush = False
+        with writer._lock:
+            for _ in range(3):
+                writer._write_sync({"request_id": "x"})
+        assert len(flushes) == 0
+        with writer._lock:
+            writer._flush_unlocked()
+        assert len(flushes) == 1
+        writer.close()
+
+
+# ---------------------------------------------------------------------------
 # TokenWindowCounter edge cases
 # ---------------------------------------------------------------------------
 

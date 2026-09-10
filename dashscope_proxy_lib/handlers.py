@@ -995,7 +995,11 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
 
 async def _maybe_flush_session_log(app: web.Application, entry: dict) -> None:
-    """Best-effort session log write for early-exit paths outside the main try/finally."""
+    """Best-effort session log enqueue for early-exit paths outside the main try/finally.
+
+    ``log_async`` returns after enqueue (unless ``SESSION_LOG_SYNC_FLUSH=1``); it does
+    not wait for disk flush. Errors are swallowed here to keep early-exit paths quiet.
+    """
     session_log: SessionLogWriter | None = app.get("session_log")
     if session_log is None:
         return
