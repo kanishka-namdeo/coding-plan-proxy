@@ -524,12 +524,14 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         503, b'{"error":"shutting down"}', request_id, retry_after=30
                     )
 
-                # Circuit breaker: reject immediately if circuit is open
-                if limiter.circuit_is_open():
+                # Circuit breaker: single HALF_OPEN probe after cooldown; deny herd
+                if not limiter.can_attempt_probe():
                     error_reason = "circuit_open"
                     status_code = 503
                     _log(logging.WARNING, "request rejected: circuit breaker open",
-                         request_id=request_id, failure_count=limiter.circuit_failure_count)
+                         request_id=request_id, failure_count=limiter.circuit_failure_count,
+                         circuit_state=limiter.circuit_state,
+                         probe_in_flight=limiter.circuit_probe_in_flight)
                     await limiter.refund_tokens(estimated_tokens)
                     tokens_reserved = False
                     return _make_error_response(

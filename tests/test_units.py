@@ -1054,6 +1054,22 @@ class TestCircuitBreaker:
         assert "circuit_open" in status
         assert "circuit_failure_count" in status
 
+    def test_can_attempt_probe_claims_half_open(self, rate_limiter):
+        rate_limiter.circuit_state = "OPEN"
+        rate_limiter.circuit_open_until = time.monotonic() - 1
+        assert rate_limiter.can_attempt_probe() is True
+        assert rate_limiter.circuit_state == "HALF_OPEN"
+        assert rate_limiter.circuit_probe_in_flight is True
+        assert rate_limiter.can_attempt_probe() is False
+
+    @pytest.mark.asyncio
+    async def test_probe_success_closes(self, rate_limiter):
+        rate_limiter.circuit_state = "HALF_OPEN"
+        rate_limiter.circuit_probe_in_flight = True
+        await rate_limiter.record_circuit_success()
+        assert rate_limiter.circuit_state == "CLOSED"
+        assert rate_limiter.circuit_probe_in_flight is False
+
 # ---------------------------------------------------------------------------
 # SessionLogWriter edge cases
 # ---------------------------------------------------------------------------

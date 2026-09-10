@@ -719,6 +719,69 @@ class TestCircuitBreakerCleanup:
         finally:
             await upstream_runner.cleanup()
 
+    async def test_single_probe_after_cooldown(self, aiohttp_client, proxy_app):
+        """After cooldown, only one concurrent request may reach upstream (HALF_OPEN probe)."""
+        app, rl = proxy_app
+        rl.primary.circuit_threshold = 1
+        rl.primary.circuit_cooldown = 0.01
+        await rl.primary.record_circuit_failure()
+        assert rl.primary.circuit_is_open()
+        rl.primary.circuit_open_until = time.monotonic() - 1
+        rl.primary.circuit_state = "OPEN"
+
+        hits = 0
+        probe_entered = asyncio.Event()
+        release_probe = asyncio.Event()
+
+        upstream_app = web.Application()
+
+        async def mock_upstream(request):
+            nonlocal hits
+            hits += 1
+            probe_entered.set()
+            await release_probe.wait()
+            return web.json_response({"choices": [], "usage": {"total_tokens": 5}})
+
+        upstream_app.router.add_post("/v1/chat/completions", mock_upstream)
+
+        upstream_runner = web.AppRunner(upstream_app)
+        await upstream_runner.setup()
+        upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+        await upstream_site.start()
+        upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+
+        body = json.dumps({
+            "model": "qwen3-coder-plus",
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+
+        try:
+            original_target = dashscope_proxy.TARGET_BASE
+            dashscope_proxy.TARGET_BASE = f"http://127.0.0.1:{upstream_port}"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+
+                    async def one():
+                        return await client.post("/v1/chat/completions", data=body)
+
+                    tasks = [asyncio.create_task(one()) for _ in range(5)]
+                    await asyncio.wait_for(probe_entered.wait(), timeout=2.0)
+                    # Let the other four hit the probe gate while the first is in-flight.
+                    await asyncio.sleep(0.05)
+                    release_probe.set()
+                    responses = await asyncio.gather(*tasks)
+
+                    statuses = sorted(r.status for r in responses)
+                    assert hits == 1
+                    assert statuses.count(200) == 1
+                    assert statuses.count(503) == 4
+            finally:
+                dashscope_proxy.TARGET_BASE = original_target
+        finally:
+            await upstream_runner.cleanup()
+
 
 # ---------------------------------------------------------------------------
 # Graceful shutdown

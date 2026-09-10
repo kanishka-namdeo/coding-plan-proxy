@@ -201,6 +201,8 @@ class RateLimiter:
         self.circuit_open_until = 0.0
         self.circuit_cooldown = 30.0
         self.circuit_threshold = config.get("circuit_threshold", 10)
+        self.circuit_state = "CLOSED"
+        self.circuit_probe_in_flight = False
 
         # Per-model usage tracking (capped to prevent unbounded growth)
         self.model_usage: dict[str, ModelStats] = {}
@@ -371,10 +373,17 @@ class RateLimiter:
             if circuit_success:
                 self.circuit_failure_count = 0
                 self.circuit_open_until = 0.0
+                self.circuit_state = "CLOSED"
+                self.circuit_probe_in_flight = False
             else:
+                self.circuit_probe_in_flight = False
                 self.circuit_failure_count += 1
-                if self.circuit_failure_count >= self.circuit_threshold:
+                if (
+                    self.circuit_state == "HALF_OPEN"
+                    or self.circuit_failure_count >= self.circuit_threshold
+                ):
                     self.circuit_open_until = time.monotonic() + self.circuit_cooldown
+                    self.circuit_state = "OPEN"
                     _log(logging.WARNING, "circuit breaker opened after consecutive failures",
                          failure_count=self.circuit_failure_count, threshold=self.circuit_threshold,
                          cooldown_seconds=self.circuit_cooldown)
@@ -434,22 +443,54 @@ class RateLimiter:
         """Check if the circuit breaker is open (upstream unhealthy). Read-only."""
         return self.circuit_open_until > time.monotonic()
 
+    def can_attempt_probe(self) -> bool:
+        """Admit traffic, or claim the single HALF_OPEN probe after cooldown.
+
+        CLOSED → always True. OPEN during cooldown → False. OPEN after cooldown →
+        first caller transitions to HALF_OPEN with ``circuit_probe_in_flight`` and
+        returns True; later callers return False until the probe resolves.
+        """
+        with self._thread_lock:
+            if self.circuit_state == "CLOSED":
+                return True
+            if self.circuit_state == "HALF_OPEN":
+                return False
+            # OPEN
+            if self.circuit_open_until > time.monotonic():
+                return False
+            self.circuit_state = "HALF_OPEN"
+            self.circuit_probe_in_flight = True
+            return True
+
     async def record_circuit_success(self) -> None:
         """Reset failure counter on a successful upstream response (TUI-visible)."""
         with self._thread_lock:
             self.circuit_failure_count = 0
             self.circuit_open_until = 0.0
+            self.circuit_state = "CLOSED"
+            self.circuit_probe_in_flight = False
 
     async def record_circuit_failure(self) -> bool:
         """Record an upstream failure. Returns True if circuit should open."""
         opened = False
         failure_count = 0
         with self._thread_lock:
-            self.circuit_failure_count += 1
-            failure_count = self.circuit_failure_count
-            if self.circuit_failure_count >= self.circuit_threshold:
+            if self.circuit_state == "HALF_OPEN" or self.circuit_probe_in_flight:
+                self.circuit_probe_in_flight = False
+                self.circuit_state = "OPEN"
                 self.circuit_open_until = time.monotonic() + self.circuit_cooldown
+                self.circuit_failure_count = max(
+                    self.circuit_failure_count + 1, self.circuit_threshold
+                )
+                failure_count = self.circuit_failure_count
                 opened = True
+            else:
+                self.circuit_failure_count += 1
+                failure_count = self.circuit_failure_count
+                if self.circuit_failure_count >= self.circuit_threshold:
+                    self.circuit_open_until = time.monotonic() + self.circuit_cooldown
+                    self.circuit_state = "OPEN"
+                    opened = True
         if opened:
             _log(logging.WARNING, "circuit breaker opened after consecutive failures",
                  failure_count=failure_count, threshold=self.circuit_threshold,
