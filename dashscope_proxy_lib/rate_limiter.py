@@ -301,40 +301,44 @@ class RateLimiter:
 
     async def record_request(self, tokens_used: int = 0, now: float | None = None):
         """Record a successfully completed request. Does NOT touch TPM bucket —
-        that is handled by reconcile_tokens() which releases the reservation."""
+        that is handled by reconcile_tokens() which releases the reservation.
+
+        Lock order: asyncio.Lock for RPM only, then _thread_lock for TUI counters.
+        Never hold both at once.
+        """
+        now = now or time.monotonic()
         async with self._lock:
-            now = now or time.monotonic()
             self.rpm_window.add(now)
+            local_tokens = tokens_used
+        with self._thread_lock:
             self.total_forwarded += 1
-            self.total_tokens_consumed += tokens_used
+            self.total_tokens_consumed += local_tokens
             self.last_request_time = now
 
     async def record_model_stats(self, model: str, tokens: int, latency_ms: float, is_429: bool = False) -> None:
-        """Record per-model usage statistics. Thread-safe via locks."""
-        async with self._lock:
-            with self._thread_lock:  # Cross-thread safety for status() reads
-                if model not in self.model_usage:
-                    # Evict oldest entries if at capacity
-                    if len(self.model_usage) >= self.model_usage_max:
-                        oldest_keys = sorted(self.model_usage, key=lambda k: self.model_usage[k].requests)[:10]
-                        for k in oldest_keys:
-                            del self.model_usage[k]
-                    self.model_usage[model] = ModelStats()
-                stats = self.model_usage[model]
-                stats.requests += 1
-                stats.tokens += tokens
-                stats.total_latency_ms += latency_ms
-                stats.recent_latencies.append(latency_ms)
-                if is_429:
-                    stats.errors_429 += 1
-                self.recent_latencies.append(latency_ms)
+        """Record per-model usage statistics under _thread_lock only (TUI-visible)."""
+        with self._thread_lock:
+            if model not in self.model_usage:
+                # Evict oldest entries if at capacity
+                if len(self.model_usage) >= self.model_usage_max:
+                    oldest_keys = sorted(self.model_usage, key=lambda k: self.model_usage[k].requests)[:10]
+                    for k in oldest_keys:
+                        del self.model_usage[k]
+                self.model_usage[model] = ModelStats()
+            stats = self.model_usage[model]
+            stats.requests += 1
+            stats.tokens += tokens
+            stats.total_latency_ms += latency_ms
+            stats.recent_latencies.append(latency_ms)
+            if is_429:
+                stats.errors_429 += 1
+            self.recent_latencies.append(latency_ms)
 
     async def record_body_sizes(self, request_bytes: int, response_bytes: int) -> None:
-        """Record request/response body sizes. Thread-safe via locks."""
-        async with self._lock:
-            with self._thread_lock:  # Cross-thread safety for status() reads
-                self.total_request_bytes += request_bytes
-                self.total_response_bytes += response_bytes
+        """Record request/response body sizes under _thread_lock only (TUI-visible)."""
+        with self._thread_lock:
+            self.total_request_bytes += request_bytes
+            self.total_response_bytes += response_bytes
 
     async def record_completion(
         self,
@@ -348,18 +352,20 @@ class RateLimiter:
         is_429: bool = False,
         circuit_success: bool = True,
     ) -> None:
-        """Under one lock: reconcile TPM, record_request metrics, circuit,
-        model stats, body sizes.
+        """Reconcile TPM/RPM under asyncio.Lock, then publish TUI counters under
+        _thread_lock. Never hold both locks at the same time.
         """
         model_key = model or "unknown"
         async with self._lock:
             if estimated_tokens > 0:
                 self.tpm_bucket.reconcile(estimated_tokens, actual_tokens)
-
             now = time.monotonic()
             self.rpm_window.add(now)
+            local_tokens = actual_tokens
+
+        with self._thread_lock:
             self.total_forwarded += 1
-            self.total_tokens_consumed += actual_tokens
+            self.total_tokens_consumed += local_tokens
             self.last_request_time = now
 
             if circuit_success:
@@ -373,26 +379,25 @@ class RateLimiter:
                          failure_count=self.circuit_failure_count, threshold=self.circuit_threshold,
                          cooldown_seconds=self.circuit_cooldown)
 
-            with self._thread_lock:  # Cross-thread safety for status() reads
-                if model_key not in self.model_usage:
-                    if len(self.model_usage) >= self.model_usage_max:
-                        oldest_keys = sorted(
-                            self.model_usage, key=lambda k: self.model_usage[k].requests
-                        )[:10]
-                        for k in oldest_keys:
-                            del self.model_usage[k]
-                    self.model_usage[model_key] = ModelStats()
-                stats = self.model_usage[model_key]
-                stats.requests += 1
-                stats.tokens += actual_tokens
-                stats.total_latency_ms += latency_ms
-                stats.recent_latencies.append(latency_ms)
-                if is_429:
-                    stats.errors_429 += 1
-                self.recent_latencies.append(latency_ms)
+            if model_key not in self.model_usage:
+                if len(self.model_usage) >= self.model_usage_max:
+                    oldest_keys = sorted(
+                        self.model_usage, key=lambda k: self.model_usage[k].requests
+                    )[:10]
+                    for k in oldest_keys:
+                        del self.model_usage[k]
+                self.model_usage[model_key] = ModelStats()
+            stats = self.model_usage[model_key]
+            stats.requests += 1
+            stats.tokens += actual_tokens
+            stats.total_latency_ms += latency_ms
+            stats.recent_latencies.append(latency_ms)
+            if is_429:
+                stats.errors_429 += 1
+            self.recent_latencies.append(latency_ms)
 
-                self.total_request_bytes += request_bytes
-                self.total_response_bytes += response_bytes
+            self.total_request_bytes += request_bytes
+            self.total_response_bytes += response_bytes
 
     def record_queue_wait(self, wait_ms: float) -> None:
         """Record queue wait time. Thread-safe for cross-thread status() reads."""
@@ -430,44 +435,47 @@ class RateLimiter:
         return self.circuit_open_until > time.monotonic()
 
     async def record_circuit_success(self) -> None:
-        """Reset failure counter on a successful upstream response."""
-        async with self._lock:
+        """Reset failure counter on a successful upstream response (TUI-visible)."""
+        with self._thread_lock:
             self.circuit_failure_count = 0
             self.circuit_open_until = 0.0
 
     async def record_circuit_failure(self) -> bool:
         """Record an upstream failure. Returns True if circuit should open."""
-        async with self._lock:
+        opened = False
+        failure_count = 0
+        with self._thread_lock:
             self.circuit_failure_count += 1
+            failure_count = self.circuit_failure_count
             if self.circuit_failure_count >= self.circuit_threshold:
                 self.circuit_open_until = time.monotonic() + self.circuit_cooldown
-                _log(logging.WARNING, "circuit breaker opened after consecutive failures",
-                     failure_count=self.circuit_failure_count, threshold=self.circuit_threshold,
-                     cooldown_seconds=self.circuit_cooldown)
-                return True
-            return False
+                opened = True
+        if opened:
+            _log(logging.WARNING, "circuit breaker opened after consecutive failures",
+                 failure_count=failure_count, threshold=self.circuit_threshold,
+                 cooldown_seconds=self.circuit_cooldown)
+        return opened
 
     def status(self) -> dict:
         now = time.monotonic()
         tpm_status = self.tpm_bucket.status()
 
-        # Protect cross-thread reads of all shared state
+        # Protect cross-thread reads of all shared state; compute percentiles outside
         with self._thread_lock:
-            # Snapshot queue_wait_times to avoid mutation during sort
             queue_wait_snapshot = list(self.queue_wait_times)
-            model_usage_snapshot = {k: {
-                "requests": v.requests,
-                "tokens": v.tokens,
-                "errors_429": v.errors_429,
-                "avg_latency_ms": round(v.total_latency_ms / v.requests, 1) if v.requests > 0 else 0.0,
-                "p50_latency_ms": self._compute_percentile(v.recent_latencies, 50) if v.recent_latencies else 0.0,
-                "p95_latency_ms": self._compute_percentile(v.recent_latencies, 95) if v.recent_latencies else 0.0,
-            } for k, v in self.model_usage.items()}
+            model_raw = {
+                k: (
+                    v.requests,
+                    v.tokens,
+                    v.errors_429,
+                    v.total_latency_ms,
+                    list(v.recent_latencies),
+                )
+                for k, v in self.model_usage.items()
+            }
             recent_latencies_snapshot = list(self.recent_latencies)[-100:]
-            # Snapshot circuit breaker state for consistent read
             circuit_open = self.circuit_open_until > time.monotonic()
             circuit_failure_count = self.circuit_failure_count
-            # Snapshot counters for consistency
             total_forwarded = self.total_forwarded
             queue_drops = self.queue_drops
             total_429s = self.total_429s
@@ -476,6 +484,18 @@ class RateLimiter:
             total_request_bytes = self.total_request_bytes
             total_response_bytes = self.total_response_bytes
             pending_requests = self.pending_requests
+
+        model_usage_snapshot = {
+            k: {
+                "requests": requests,
+                "tokens": tokens,
+                "errors_429": errors_429,
+                "avg_latency_ms": round(total_latency_ms / requests, 1) if requests > 0 else 0.0,
+                "p50_latency_ms": self._compute_percentile(latencies, 50) if latencies else 0.0,
+                "p95_latency_ms": self._compute_percentile(latencies, 95) if latencies else 0.0,
+            }
+            for k, (requests, tokens, errors_429, total_latency_ms, latencies) in model_raw.items()
+        }
 
         queue_p50 = 0.0
         queue_p95 = 0.0

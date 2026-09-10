@@ -943,6 +943,44 @@ class TestTryAdmitAndRecordCompletion:
         assert rate_limiter.tpm_bucket.reserved == 0
         assert rate_limiter.total_forwarded == 1
 
+    @pytest.mark.asyncio
+    async def test_status_during_completion(self, rate_limiter):
+        """status() must stay usable while record_completion runs; never nest locks."""
+        nested = []
+        real_thread_lock = rate_limiter._thread_lock
+        async_lock = rate_limiter._lock
+
+        class _ThreadLockProbe:
+            def __enter__(self_inner):
+                if async_lock.locked():
+                    nested.append(True)
+                return real_thread_lock.__enter__()
+
+            def __exit__(self_inner, *args):
+                return real_thread_lock.__exit__(*args)
+
+            def locked(self_inner):
+                return real_thread_lock.locked()
+
+        rate_limiter._thread_lock = _ThreadLockProbe()
+
+        async def hammer():
+            for _ in range(50):
+                await rate_limiter.try_admit(1)
+                await rate_limiter.record_completion(
+                    estimated_tokens=1, actual_tokens=1, model="m",
+                    latency_ms=1.0, request_bytes=1, response_bytes=1,
+                )
+                await asyncio.sleep(0)
+
+        task = asyncio.create_task(hammer())
+        for _ in range(50):
+            s = rate_limiter.status()
+            assert "total_forwarded" in s
+            await asyncio.sleep(0)
+        await task
+        assert not nested, "must not hold asyncio.Lock while taking _thread_lock"
+
 
 # ---------------------------------------------------------------------------
 # RateLimiter token management methods
