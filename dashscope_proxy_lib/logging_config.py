@@ -69,6 +69,12 @@ class TUILogHandler(logging.Handler):
             self._next_seq = 0
 
 
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+tui_handler = TUILogHandler()
+
+
 def _log(level: int, msg: str, **extra):
     """Emit a structured log with optional key-value context."""
     if not logger.isEnabledFor(level):
@@ -79,7 +85,12 @@ def _log(level: int, msg: str, **extra):
     logger.handle(record)
 
 
-logger = logging.getLogger(__name__)
-logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-tui_handler = TUILogHandler()
-logger.addHandler(tui_handler)
+def configure_logging(*, enable_tui_handler: bool = True) -> None:
+    """Configure the proxy logger; optionally attach the TUI log handler."""
+    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    logger.handlers = [
+        h for h in logger.handlers
+        if not isinstance(h, (logging.NullHandler, TUILogHandler))
+    ]
+    if enable_tui_handler:
+        logger.addHandler(tui_handler)

@@ -858,6 +858,14 @@ class TestTUILogHandler:
         assert msgs == ["msg-2", "msg-3", "msg-4"]
 
 
+class TestConfigureLogging:
+    def test_configure_logging_can_skip_tui_handler(self, dashscope_module):
+        dashscope_module.configure_logging(enable_tui_handler=False)
+        from dashscope_proxy_lib.logging_config import logger, TUILogHandler
+        assert not any(isinstance(h, TUILogHandler) for h in logger.handlers)
+        dashscope_module.configure_logging(enable_tui_handler=True)
+
+
 # ---------------------------------------------------------------------------
 # _client_disconnected
 # ---------------------------------------------------------------------------

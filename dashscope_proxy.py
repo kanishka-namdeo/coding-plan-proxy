@@ -91,6 +91,7 @@ from dashscope_proxy_lib.logging_config import (
     StructuredLogFormatter,
     TUILogHandler,
     _log,
+    configure_logging,
     logger,
     tui_handler,
 )
@@ -179,7 +180,7 @@ __all__ = [
     "_load_config", "_load_display_config",
     # logging
     "LOG_LEVEL", "LOG_BUFFER_SIZE",
-    "StructuredLogFormatter", "TUILogHandler", "_log", "logger", "tui_handler",
+    "StructuredLogFormatter", "TUILogHandler", "_log", "configure_logging", "logger", "tui_handler",
     # session log
     "SESSION_LOG_DIR", "SESSION_LOG_ENABLED", "SessionLogWriter",
     # rate limiter

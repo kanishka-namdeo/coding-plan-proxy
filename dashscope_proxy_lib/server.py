@@ -22,7 +22,7 @@ from dashscope_proxy_lib.config import (
 )
 from dashscope_proxy_lib.rate_limiter import RateLimiter, MultiProviderRateLimiter
 from dashscope_proxy_lib.session_log import SessionLogWriter, SESSION_LOG_DIR, SESSION_LOG_ENABLED
-from dashscope_proxy_lib.logging_config import _log, tui_handler
+from dashscope_proxy_lib.logging_config import _log, tui_handler, configure_logging
 from dashscope_proxy_lib.handlers import handle_request
 from dashscope_proxy_lib.config import _load_config
 import os
@@ -216,6 +216,7 @@ async def cleanup_proxy_resources(
 
 async def main(headless: bool = False):
     """Entry point: create proxy resources, then launch TUI with shared event loop."""
+    configure_logging(enable_tui_handler=not headless)
     rate_limiter, app, runner = await create_proxy_resources()
 
     tui_app = None
