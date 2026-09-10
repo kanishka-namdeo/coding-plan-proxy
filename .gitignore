@@ -64,3 +64,6 @@ proxy.pid
 # Git worktrees
 .worktrees/
 
+# Benchmark outputs
+benchmarks/results/
+
