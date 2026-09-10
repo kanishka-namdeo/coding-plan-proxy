@@ -83,18 +83,47 @@ def extract_tokens_from_stream(buffer: bytes) -> dict:
     }
 
 
+def estimate_tokens_for_body(body: dict) -> int:
+    """Rough estimate from an already-parsed request body for TPM planning."""
+    messages = body.get("messages", [])
+    if not isinstance(messages, list):
+        return 100
+
+    total_chars = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            total_chars += sum(
+                len(p.get("text", ""))
+                for p in content
+                if isinstance(p, dict)
+            )
+
+    for field in ("system", "developer"):
+        value = body.get(field)
+        if isinstance(value, str):
+            total_chars += len(value)
+
+    tools = body.get("tools", [])
+    if isinstance(tools, list):
+        try:
+            total_chars += len(json.dumps(tools))
+        except (TypeError, ValueError):
+            total_chars += len(tools) * 200
+
+    return max(100, total_chars // 4)
+
+
 def estimate_tokens_for_request(body_bytes: bytes) -> int:
     """Rough estimate of tokens in the request body for TPM planning."""
     try:
         body = json.loads(body_bytes)
-        messages = body.get("messages", [])
-        if not isinstance(messages, list):
-            return 100
-        total_chars = sum(
-            len(m.get("content", ""))
-            for m in messages
-            if isinstance(m.get("content"), str)
-        )
-        return max(100, total_chars // 4)
-    except (json.JSONDecodeError, AttributeError):
+    except (json.JSONDecodeError, AttributeError, TypeError):
         return 100
+    if not isinstance(body, dict):
+        return 100
+    return estimate_tokens_for_body(body)

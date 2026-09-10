@@ -281,6 +281,22 @@ class TestTokenExtraction:
         assert dashscope_module.estimate_tokens_for_request(body) == 100
 
 
+class TestEstimateTokensDict:
+    def test_dict_matches_bytes(self, dashscope_module):
+        payload = {
+            "messages": [{"role": "user", "content": "Hello world, this is a test"}],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+            "system": "be brief",
+        }
+        body_bytes = json.dumps(payload).encode()
+        from_bytes = dashscope_module.estimate_tokens_for_request(body_bytes)
+        from_dict = dashscope_module.estimate_tokens_for_body(payload)
+        assert from_dict == from_bytes
+
+    def test_dict_empty_messages_floor(self, dashscope_module):
+        assert dashscope_module.estimate_tokens_for_body({"messages": []}) == 100
+
+
 # ---------------------------------------------------------------------------
 # map_developer_to_system
 # ---------------------------------------------------------------------------

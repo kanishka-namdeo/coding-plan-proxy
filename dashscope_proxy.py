@@ -121,6 +121,7 @@ from dashscope_proxy_lib.provider_router import (
 from dashscope_proxy_lib.token_utils import (
     extract_tokens_from_response,
     extract_tokens_from_stream,
+    estimate_tokens_for_body,
     estimate_tokens_for_request,
 )
 
@@ -188,7 +189,7 @@ __all__ = [
     "ProviderRouter", "ProviderConfig",
     # token utils
     "extract_tokens_from_response", "extract_tokens_from_stream",
-    "estimate_tokens_for_request",
+    "estimate_tokens_for_body", "estimate_tokens_for_request",
     # request transform
     "map_developer_to_system", "normalize_model_name", "split_provider_prefix",
     "_is_chat_endpoint",

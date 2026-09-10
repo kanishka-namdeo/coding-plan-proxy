@@ -21,7 +21,7 @@ from dashscope_proxy_lib.rate_limiter import RateLimiter
 from dashscope_proxy_lib.session_log import SessionLogWriter
 from dashscope_proxy_lib.logging_config import _log
 from dashscope_proxy_lib.token_utils import (
-    estimate_tokens_for_request, extract_tokens_from_response, extract_tokens_from_stream,
+    estimate_tokens_for_body, extract_tokens_from_response, extract_tokens_from_stream,
 )
 from dashscope_proxy_lib.request_transform import (
     _is_chat_endpoint, map_developer_to_system, normalize_model_name,
@@ -219,19 +219,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         body = map_developer_to_system(body)
         if isinstance(body.get("model"), str):
             body["model"] = normalize_model_name(body["model"])
-        try:
-            body_bytes = json.dumps(body).encode()
-        except (TypeError, ValueError) as e:
-            error_reason = "unserializable"
-            status_code = 400
-            _log(logging.WARNING, "request rejected: unserializable body",
-                 request_id=request_id, method=method, path=path, reason="unserializable", error=str(e))
-            session_entry["status_code"] = status_code
-            session_entry["error_reason"] = error_reason
-            await _maybe_flush_session_log(request.app, session_entry)
-            return _make_error_response(400, json.dumps({"error": f"unserializable body: {e}"}).encode(), request_id)
 
-    estimated_tokens = estimate_tokens_for_request(body_bytes) if body_bytes else 0
     model_name = body.get("model") if isinstance(body, dict) else None
     is_stream = isinstance(body, dict) and body.get("stream") is True
 
@@ -286,7 +274,23 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         model_name = bare_name
         if isinstance(body, dict):
             body["model"] = bare_name
-        body_bytes = json.dumps(body).encode()
+
+    # Single dump after transforms + pin strip; estimate from already-parsed dict
+    if body is not None:
+        try:
+            body_bytes = json.dumps(body).encode()
+        except (TypeError, ValueError) as e:
+            error_reason = "unserializable"
+            status_code = 400
+            _log(logging.WARNING, "request rejected: unserializable body",
+                 request_id=request_id, method=method, path=path, reason="unserializable", error=str(e))
+            session_entry["status_code"] = status_code
+            session_entry["error_reason"] = error_reason
+            await _maybe_flush_session_log(request.app, session_entry)
+            return _make_error_response(400, json.dumps({"error": f"unserializable body: {e}"}).encode(), request_id)
+        estimated_tokens = estimate_tokens_for_body(body)
+    else:
+        estimated_tokens = 0
 
     # Build candidate provider list for failover
     if pinned_name is not None:
