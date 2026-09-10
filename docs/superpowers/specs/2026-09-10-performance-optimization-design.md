@@ -199,3 +199,15 @@ py -m pytest tests/
 ## Rollout
 
 Land Wave 0 first, then Waves 1→5 unless measurement reorders. Prefer small commits/PRs per wave. No production feature flag required for Waves 1/3/4; Wave 2 may expose an emergency sync-flush env escape hatch.
+
+## Research grounding
+
+Implementation plan `docs/superpowers/plans/2026-09-10-performance-optimization.md` includes a **Research grounding** table citing:
+
+- aiohttp 3.14 ClientSession / TCPConnector docs (session reuse; `limit_per_host` defaults)
+- Python asyncio-dev + Logging Cookbook (`QueueHandler`/`QueueListener` for non-blocking logs)
+- asyncio lock vs threading.Lock guidance (do not block the loop)
+- HALF_OPEN single-probe circuit-breaker practice (thundering-herd mitigation)
+- orjson as optional only after redundant-JSON removal is measured
+
+Do not add `orjson` or loosen connector limits unless Wave 0/1 benches show those bottlenecks.
