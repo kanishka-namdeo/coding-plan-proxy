@@ -995,6 +995,43 @@ class TestTryAdmitAndRecordCompletion:
         await task
         assert not nested, "must not hold asyncio.Lock while taking _thread_lock"
 
+    @pytest.mark.asyncio
+    async def test_tpm_wait_estimate_conservative_outside_admit_lock(self, rate_limiter):
+        """TPM wait stays ≥ bucket estimate and is computed after releasing RateLimiter._lock."""
+        rate_limiter.rps_limit = 10_000
+        capacity = rate_limiter.tpm_bucket.capacity
+        now = time.monotonic()
+        assert rate_limiter.tpm_bucket.try_reserve(capacity, now=now)
+        rate_limiter.tpm_bucket.reconcile(capacity, capacity, now=now)
+
+        need = max(1, capacity // 2)
+        held_during_wait: list[bool] = []
+        real_wait = rate_limiter.tpm_bucket.wait_seconds_for
+
+        def probe_wait(tokens, now=None):
+            held_during_wait.append(rate_limiter._lock.locked())
+            return real_wait(tokens, now)
+
+        rate_limiter.tpm_bucket.wait_seconds_for = probe_wait  # type: ignore[method-assign]
+        try:
+            ok, reason, wait = await rate_limiter.can_proceed(need)
+            assert ok is False
+            assert reason == "TPM limit reached"
+            assert held_during_wait and held_during_wait[0] is False
+
+            ok2, reason2, wait2 = await rate_limiter.try_admit(need)
+            assert ok2 is False
+            assert reason2 == "TPM limit reached"
+            assert held_during_wait[-1] is False
+        finally:
+            rate_limiter.tpm_bucket.wait_seconds_for = real_wait  # type: ignore[method-assign]
+
+        direct = real_wait(need)
+        assert wait >= direct
+        assert wait >= 1.0
+        assert wait2 >= direct
+        assert wait2 >= 1.0
+
 
 # ---------------------------------------------------------------------------
 # RateLimiter token management methods
@@ -2128,3 +2165,41 @@ class TestTuiStatusHelpers:
         assert stats["pending_requests"] == 7
         assert stats["max_queue_size"] == 500
         assert abs(stats["success_rate"] - 50.0) < 0.01  # 3/(3+2+1)
+
+
+# ---------------------------------------------------------------------------
+# TUI incremental session log read
+# ---------------------------------------------------------------------------
+
+class TestSessionLogIncrementalRead:
+    def test_reads_only_new_bytes_and_keeps_tail(self, tmp_path, monkeypatch):
+        from collections import deque
+        from proxy_tui import ProxyTUI
+
+        monkeypatch.chdir(tmp_path)
+        log_dir = tmp_path / "session_logs"
+        log_dir.mkdir()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = log_dir / f"{today}.jsonl"
+
+        tui = object.__new__(ProxyTUI)
+        tui._session_log_offset = 0
+        tui._session_log_inode = None
+        tui._session_log_path = None
+        tui._session_log_tail = deque(maxlen=200)
+
+        path.write_text(
+            json.dumps({"request_id": "a", "attempted_providers": ["primary"]}) + "\n",
+            encoding="utf-8",
+        )
+        first = tui._read_session_log_entries()
+        assert len(first) == 1
+        offset_after_first = tui._session_log_offset
+        assert offset_after_first > 0
+
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"request_id": "b", "attempted_providers": ["secondary", "primary"]}) + "\n")
+
+        second = tui._read_session_log_entries()
+        assert tui._session_log_offset > offset_after_first
+        assert [e["request_id"] for e in second] == ["a", "b"]

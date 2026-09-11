@@ -1,9 +1,12 @@
 """Textual TUI dashboard for the DashScope proxy server."""
 
-import time
+import json
 import math
+import os
 import statistics
 import threading
+import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -177,6 +180,12 @@ class ProxyTUI(App):
         # Poller state
         self.error_count = 0
         self._poll_error_count = 0
+
+        # Incremental session-log tail (offset/inode + last 200 parsed entries)
+        self._session_log_offset = 0
+        self._session_log_inode = None
+        self._session_log_path: str | None = None
+        self._session_log_tail: deque[dict] = deque(maxlen=200)
 
         # Keys that must be present in rate_limiter.status() for metrics updates
         self._REQUIRED_STATUS_KEYS: set[str] = {
@@ -844,25 +853,12 @@ class ProxyTUI(App):
                     warnings.append("Circuit")
 
             # Check for recent failover events (independent of other warnings)
-            import json
             from tui_status import failover_alert_should_show
             recent_failovers = False
-            log_dir = "session_logs"
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            log_file = f"{log_dir}/{today}.jsonl"
-            try:
-                with open(log_file, "r", encoding="utf-8") as f:
-                    lines = f.readlines()[-50:]  # Check last 50 entries
-                    for line in lines[-10:]:  # Only last 10 for recent failovers
-                        try:
-                            entry = json.loads(line.strip())
-                            if len(entry.get("attempted_providers", [])) > 1:
-                                recent_failovers = True
-                                break
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-            except FileNotFoundError:
-                pass
+            for entry in self._read_session_log_entries()[-10:]:
+                if len(entry.get("attempted_providers", [])) > 1:
+                    recent_failovers = True
+                    break
             if failover_alert_should_show(warnings, recent_failovers):
                 if "Failover" not in warnings:
                     warnings.append("Failover")
@@ -922,6 +918,50 @@ class ProxyTUI(App):
         
         panel.update("\n".join(lines))
 
+    def _read_session_log_entries(self) -> list[dict]:
+        """Incrementally read today's session log; return last 200 parsed entries."""
+        log_dir = "session_logs"
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = f"{log_dir}/{today}.jsonl"
+
+        if path != self._session_log_path:
+            self._session_log_path = path
+            self._session_log_offset = 0
+            self._session_log_inode = None
+            self._session_log_tail.clear()
+
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return list(self._session_log_tail)
+
+        inode = getattr(st, "st_ino", None) or st.st_mtime_ns
+        if inode != self._session_log_inode or st.st_size < self._session_log_offset:
+            self._session_log_offset = 0
+            self._session_log_tail.clear()
+            self._session_log_inode = inode
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                f.seek(self._session_log_offset)
+                data = f.read()
+                self._session_log_offset = f.tell()
+        except OSError:
+            return list(self._session_log_tail)
+
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                self._session_log_tail.append(entry)
+
+        return list(self._session_log_tail)
+
     def _update_failover_panel(self) -> None:
         """Update failover events panel from recent session logs."""
         try:
@@ -929,46 +969,29 @@ class ProxyTUI(App):
         except NoMatches:
             return
 
-        import json
-        from datetime import datetime, timezone
-        
         failovers = []
-        log_dir = "session_logs"
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        log_file = f"{log_dir}/{today}.jsonl"
-        
-        try:
-            with open(log_file, "r", encoding="utf-8") as f:
-                lines = f.readlines()[-200:]
-                for line in lines:
-                    try:
-                        entry = json.loads(line.strip())
-                        attempted = entry.get("attempted_providers", [])
-                        if len(attempted) > 1:
-                            model = entry.get("model", "unknown")
-                            request_id = entry.get("request_id", "")[:8]
-                            timestamp = entry.get("timestamp", "")
-                            if timestamp:
-                                try:
-                                    dt = datetime.fromisoformat(timestamp)
-                                    time_str = dt.strftime("%H:%M:%S")
-                                except:
-                                    time_str = timestamp
-                            else:
-                                time_str = "unknown"
-                            
-                            failovers.append({
-                                "model": model,
-                                "chain": attempted,
-                                "request_id": request_id,
-                                "time": time_str,
-                            })
-                    except (json.JSONDecodeError, KeyError):
-                        continue
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
+        for entry in self._read_session_log_entries():
+            attempted = entry.get("attempted_providers", [])
+            if len(attempted) <= 1:
+                continue
+            model = entry.get("model", "unknown")
+            request_id = entry.get("request_id", "")[:8]
+            timestamp = entry.get("timestamp", "")
+            if timestamp:
+                try:
+                    dt = datetime.fromisoformat(timestamp)
+                    time_str = dt.strftime("%H:%M:%S")
+                except Exception:
+                    time_str = timestamp
+            else:
+                time_str = "unknown"
+
+            failovers.append({
+                "model": model,
+                "chain": attempted,
+                "request_id": request_id,
+                "time": time_str,
+            })
 
         if failovers:
             failovers = failovers[-10:]

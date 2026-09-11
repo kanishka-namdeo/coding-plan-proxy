@@ -219,7 +219,13 @@ class RateLimiter:
         Check if a request can proceed. Pure read-only check — no side effects.
         When estimated_tokens > 0, both RPM and TPM must have headroom.
         Returns (allowed, reason, wait_seconds).
+
+        TPM wait estimates are computed after releasing ``_lock`` so the
+        window walk does not hold the admit lock; ``max(1.0, wait)`` keeps
+        the estimate conservative (never under-wait relative to the floor).
         """
+        tpm_denied = False
+        avail_snap = 0.0
         async with self._lock:
             now_mono = time.monotonic()
 
@@ -232,27 +238,38 @@ class RateLimiter:
             if estimated_tokens > 0:
                 avail = self.tpm_bucket.available(now_mono)
                 if avail < estimated_tokens:
-                    wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, now_mono)
-                    wait = max(1.0, wait)
-                    _log(logging.DEBUG, "can_proceed denied: TPM limit reached", wait_seconds=wait,
-                         estimated_tokens=estimated_tokens, available_tokens=int(avail), shortfall=estimated_tokens - avail)
-                    return False, "TPM limit reached", wait
+                    tpm_denied = True
+                    avail_snap = avail
 
-            min_gap = 1.0 / self.rps_limit
-            time_since_last = now_mono - self.last_request_time
-            if time_since_last < min_gap:
-                _log(logging.DEBUG, "can_proceed denied: RPS spacing",
-                     wait_seconds=min_gap - time_since_last)
-                return False, "RPS spacing", min_gap - time_since_last
+            if not tpm_denied:
+                min_gap = 1.0 / self.rps_limit
+                time_since_last = now_mono - self.last_request_time
+                if time_since_last < min_gap:
+                    _log(logging.DEBUG, "can_proceed denied: RPS spacing",
+                         wait_seconds=min_gap - time_since_last)
+                    return False, "RPS spacing", min_gap - time_since_last
 
-            return True, "ok", 0.0
+                return True, "ok", 0.0
+
+        # Release RateLimiter._lock before walking the TPM window.
+        wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, time.monotonic())
+        wait = max(1.0, wait)
+        _log(logging.DEBUG, "can_proceed denied: TPM limit reached", wait_seconds=wait,
+             estimated_tokens=estimated_tokens, available_tokens=int(avail_snap),
+             shortfall=estimated_tokens - avail_snap)
+        return False, "TPM limit reached", wait
 
     async def try_admit(self, estimated_tokens: int = 0) -> tuple[bool, str, float]:
         """Under one lock: same checks as can_proceed; on success reserve TPM.
 
         Does NOT charge RPM (still recorded on completion).
         Returns (allowed, reason, wait_seconds).
+
+        TPM wait estimates run after releasing ``_lock`` (bucket uses its own
+        lock); wait is floored at 1.0s so estimates stay conservative.
         """
+        tpm_denied = False
+        avail_snap = 0.0
         async with self._lock:
             now_mono = time.monotonic()
 
@@ -265,32 +282,36 @@ class RateLimiter:
             if estimated_tokens > 0:
                 avail = self.tpm_bucket.available(now_mono)
                 if avail < estimated_tokens:
-                    wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, now_mono)
-                    wait = max(1.0, wait)
-                    _log(logging.DEBUG, "try_admit denied: TPM limit reached", wait_seconds=wait,
-                         estimated_tokens=estimated_tokens, available_tokens=int(avail),
-                         shortfall=estimated_tokens - avail)
-                    return False, "TPM limit reached", wait
+                    tpm_denied = True
+                    avail_snap = avail
 
-            min_gap = 1.0 / self.rps_limit
-            time_since_last = now_mono - self.last_request_time
-            if time_since_last < min_gap:
-                _log(logging.DEBUG, "try_admit denied: RPS spacing",
-                     wait_seconds=min_gap - time_since_last)
-                return False, "RPS spacing", min_gap - time_since_last
+            if not tpm_denied:
+                min_gap = 1.0 / self.rps_limit
+                time_since_last = now_mono - self.last_request_time
+                if time_since_last < min_gap:
+                    _log(logging.DEBUG, "try_admit denied: RPS spacing",
+                         wait_seconds=min_gap - time_since_last)
+                    return False, "RPS spacing", min_gap - time_since_last
 
-            if estimated_tokens > 0:
-                if not self.tpm_bucket.try_reserve(estimated_tokens):
-                    wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, now_mono)
-                    wait = max(1.0, wait)
-                    _log(logging.DEBUG, "try_admit denied: TPM reserve race", wait_seconds=wait,
-                         estimated_tokens=estimated_tokens)
-                    return False, "TPM limit reached", wait
+                if estimated_tokens > 0:
+                    if not self.tpm_bucket.try_reserve(estimated_tokens):
+                        tpm_denied = True
+                        avail_snap = self.tpm_bucket.available(now_mono)
+                    else:
+                        # Admission-time RPS shaping: stamp under asyncio.Lock so waiters
+                        # see spacing immediately (same lock as the RPS check above).
+                        self.last_request_time = time.monotonic()
+                        return True, "ok", 0.0
+                else:
+                    self.last_request_time = time.monotonic()
+                    return True, "ok", 0.0
 
-            # Admission-time RPS shaping: stamp under asyncio.Lock so waiters
-            # see spacing immediately (same lock as the RPS check above).
-            self.last_request_time = time.monotonic()
-            return True, "ok", 0.0
+        wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, time.monotonic())
+        wait = max(1.0, wait)
+        _log(logging.DEBUG, "try_admit denied: TPM limit reached", wait_seconds=wait,
+             estimated_tokens=estimated_tokens, available_tokens=int(avail_snap),
+             shortfall=estimated_tokens - avail_snap)
+        return False, "TPM limit reached", wait
 
     async def reserve_tokens(self, estimated_tokens: int) -> bool:
         """
