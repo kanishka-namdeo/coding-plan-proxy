@@ -2187,6 +2187,7 @@ class TestSessionLogIncrementalRead:
         tui._session_log_inode = None
         tui._session_log_path = None
         tui._session_log_tail = deque(maxlen=200)
+        tui._session_log_partial = ""
 
         path.write_text(
             json.dumps({"request_id": "a", "attempted_providers": ["primary"]}) + "\n",
@@ -2203,3 +2204,31 @@ class TestSessionLogIncrementalRead:
         second = tui._read_session_log_entries()
         assert tui._session_log_offset > offset_after_first
         assert [e["request_id"] for e in second] == ["a", "b"]
+
+    def test_carries_partial_trailing_line(self, tmp_path, monkeypatch):
+        from collections import deque
+        from proxy_tui import ProxyTUI
+
+        monkeypatch.chdir(tmp_path)
+        log_dir = tmp_path / "session_logs"
+        log_dir.mkdir()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = log_dir / f"{today}.jsonl"
+
+        tui = object.__new__(ProxyTUI)
+        tui._session_log_offset = 0
+        tui._session_log_inode = None
+        tui._session_log_path = None
+        tui._session_log_tail = deque(maxlen=200)
+        tui._session_log_partial = ""
+
+        payload = json.dumps({"request_id": "partial", "attempted_providers": ["primary"]})
+        path.write_text(payload[:12], encoding="utf-8")
+        assert tui._read_session_log_entries() == []
+        assert tui._session_log_partial == payload[:12]
+
+        with path.open("a", encoding="utf-8") as f:
+            f.write(payload[12:] + "\n")
+        entries = tui._read_session_log_entries()
+        assert [e["request_id"] for e in entries] == ["partial"]
+        assert tui._session_log_partial == ""

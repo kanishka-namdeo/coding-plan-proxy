@@ -186,6 +186,7 @@ class ProxyTUI(App):
         self._session_log_inode = None
         self._session_log_path: str | None = None
         self._session_log_tail: deque[dict] = deque(maxlen=200)
+        self._session_log_partial = ""
 
         # Keys that must be present in rate_limiter.status() for metrics updates
         self._REQUIRED_STATUS_KEYS: set[str] = {
@@ -929,6 +930,7 @@ class ProxyTUI(App):
             self._session_log_offset = 0
             self._session_log_inode = None
             self._session_log_tail.clear()
+            self._session_log_partial = ""
 
         try:
             st = os.stat(path)
@@ -939,6 +941,7 @@ class ProxyTUI(App):
         if inode != self._session_log_inode or st.st_size < self._session_log_offset:
             self._session_log_offset = 0
             self._session_log_tail.clear()
+            self._session_log_partial = ""
             self._session_log_inode = inode
 
         try:
@@ -949,7 +952,18 @@ class ProxyTUI(App):
         except OSError:
             return list(self._session_log_tail)
 
-        for line in data.splitlines():
+        # Carry incomplete trailing line across polls so mid-chunk JSON is not lost.
+        chunk = self._session_log_partial + data
+        if chunk.endswith("\n") or chunk.endswith("\r"):
+            lines, self._session_log_partial = chunk.splitlines(), ""
+        else:
+            parts = chunk.splitlines()
+            if data == "" and not parts:
+                return list(self._session_log_tail)
+            self._session_log_partial = parts[-1] if parts else ""
+            lines = parts[:-1] if parts else []
+
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
