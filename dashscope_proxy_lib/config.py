@@ -1,5 +1,6 @@
 """Configuration, constants, and environment setup for the DashScope proxy."""
 
+import math
 import os
 from dotenv import load_dotenv
 
@@ -16,20 +17,25 @@ def _safe_int(env_name: str, default: int) -> int:
         return default
 
 def _safe_float(env_name: str, default: float) -> float:
-    """Read an env var as float, falling back to default on any parse error."""
+    """Read an env var as float, falling back to default on parse error or
+    non-finite values (``nan``/``inf`` parse cleanly via ``float()`` but would
+    poison downstream math such as ``int(rpm_limit * safety_factor)``)."""
     raw = os.environ.get(env_name)
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except (ValueError, TypeError):
         return default
+    if not math.isfinite(value):
+        return default
+    return value
 
 # ---------------------------------------------------------------------------
 # Logging configuration
 # ---------------------------------------------------------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-LOG_BUFFER_SIZE = _safe_int("LOG_BUFFER_SIZE", 2000)
+LOG_BUFFER_SIZE = max(1, _safe_int("LOG_BUFFER_SIZE", 2000))  # floor: zero-capacity deques/Log widgets are unusable
 
 # ---------------------------------------------------------------------------
 # Network configuration
@@ -86,6 +92,25 @@ SEPTENARY_API_KEY = os.environ.get("GLM_API_KEY", "").strip()
 SEPTENARY_BASE_URL = os.environ.get("GLM_TARGET_BASE", "https://api.z.ai/api/paas/v4").strip()
 
 # ---------------------------------------------------------------------------
+# Octonary/Nonary/Decenary provider configuration (optional - Agnes AI)
+# Only used if both KEY and BASE_URL are set. A single Agnes Token Plan key
+# serves all three modalities (text/image/video), so the key and base URL are
+# aliased to three ordinals and the router/limiter/server can treat them
+# uniformly.
+# ---------------------------------------------------------------------------
+AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "").strip()
+AGNES_BASE_URL = os.environ.get("AGNES_TARGET_BASE", "https://apihub.agnes-ai.com/v1").strip()
+
+OCTONARY_API_KEY = AGNES_API_KEY
+OCTONARY_BASE_URL = AGNES_BASE_URL
+
+NONARY_API_KEY = AGNES_API_KEY
+NONARY_BASE_URL = AGNES_BASE_URL
+
+DECENARY_API_KEY = AGNES_API_KEY
+DECENARY_BASE_URL = AGNES_BASE_URL
+
+# ---------------------------------------------------------------------------
 # Timeout and connection limits
 # ---------------------------------------------------------------------------
 UPSTREAM_TIMEOUT_TOTAL = _safe_int("UPSTREAM_TIMEOUT_TOTAL", 300)
@@ -94,6 +119,7 @@ MAX_CONNECTIONS = _safe_int("MAX_CONNECTIONS", 200)
 MAX_CONNECTIONS_PER_HOST = _safe_int("MAX_CONNECTIONS_PER_HOST", 50)
 MAX_BODY_SIZE = _safe_int("MAX_BODY_SIZE", 50 * 1024 * 1024)
 MAX_STREAM_BUFFER = _safe_int("MAX_STREAM_BUFFER", 50 * 1024 * 1024)  # 50 MB cap for streaming response buffer
+UPSTREAM_MAX_BODY_SIZE = _safe_int("UPSTREAM_MAX_BODY_SIZE", 50 * 1024 * 1024)  # cap for a single upstream response/error body read into memory
 MAX_5XX_RETRIES = _safe_int("MAX_5XX_RETRIES", 3)
 DEQUE_MAX_SIZE = 100_000
 STREAM_CHUNK_IDLE_TIMEOUT = 60  # seconds between chunks before stream is considered stalled
@@ -236,6 +262,69 @@ SEPTENARY_CODING_PLAN_CONFIG = {
     "base_backoff": _safe_float("SEPTENARY_BASE_BACKOFF", SEPTENARY_DEFAULTS["base_backoff"]),
 }
 
+# ---------------------------------------------------------------------------
+# Octonary provider rate limits (Agnes Text - independent defaults)
+# ---------------------------------------------------------------------------
+OCTONARY_DEFAULTS = {
+    "rpm_limit": 1000,
+    "tpm_limit": 4_000_000,
+    "safety_factor": 0.8,
+    "max_queue_size": 500,
+    "max_retries": 40,
+    "base_backoff": 1.0,
+}
+
+OCTONARY_CODING_PLAN_CONFIG = {
+    "rpm_limit": _safe_int("OCTONARY_RPM_LIMIT", OCTONARY_DEFAULTS["rpm_limit"]),
+    "tpm_limit": _safe_int("OCTONARY_TPM_LIMIT", OCTONARY_DEFAULTS["tpm_limit"]),
+    "safety_factor": _safe_float("OCTONARY_SAFETY_FACTOR", OCTONARY_DEFAULTS["safety_factor"]),
+    "max_queue_size": _safe_int("OCTONARY_MAX_QUEUE_SIZE", OCTONARY_DEFAULTS["max_queue_size"]),
+    "max_retries": _safe_int("OCTONARY_MAX_RETRIES", OCTONARY_DEFAULTS["max_retries"]),
+    "base_backoff": _safe_float("OCTONARY_BASE_BACKOFF", OCTONARY_DEFAULTS["base_backoff"]),
+}
+
+# ---------------------------------------------------------------------------
+# Nonary provider rate limits (Agnes Image - independent defaults)
+# ---------------------------------------------------------------------------
+NONARY_DEFAULTS = {
+    "rpm_limit": 120,
+    "tpm_limit": 4_000_000,
+    "safety_factor": 0.8,
+    "max_queue_size": 200,
+    "max_retries": 20,
+    "base_backoff": 1.0,
+}
+
+NONARY_CODING_PLAN_CONFIG = {
+    "rpm_limit": _safe_int("NONARY_RPM_LIMIT", NONARY_DEFAULTS["rpm_limit"]),
+    "tpm_limit": _safe_int("NONARY_TPM_LIMIT", NONARY_DEFAULTS["tpm_limit"]),
+    "safety_factor": _safe_float("NONARY_SAFETY_FACTOR", NONARY_DEFAULTS["safety_factor"]),
+    "max_queue_size": _safe_int("NONARY_MAX_QUEUE_SIZE", NONARY_DEFAULTS["max_queue_size"]),
+    "max_retries": _safe_int("NONARY_MAX_RETRIES", NONARY_DEFAULTS["max_retries"]),
+    "base_backoff": _safe_float("NONARY_BASE_BACKOFF", NONARY_DEFAULTS["base_backoff"]),
+}
+
+# ---------------------------------------------------------------------------
+# Decenary provider rate limits (Agnes Video - independent defaults)
+# ---------------------------------------------------------------------------
+DECENARY_DEFAULTS = {
+    "rpm_limit": 6,
+    "tpm_limit": 4_000_000,
+    "safety_factor": 0.8,
+    "max_queue_size": 200,
+    "max_retries": 20,
+    "base_backoff": 1.0,
+}
+
+DECENARY_CODING_PLAN_CONFIG = {
+    "rpm_limit": _safe_int("DECENARY_RPM_LIMIT", DECENARY_DEFAULTS["rpm_limit"]),
+    "tpm_limit": _safe_int("DECENARY_TPM_LIMIT", DECENARY_DEFAULTS["tpm_limit"]),
+    "safety_factor": _safe_float("DECENARY_SAFETY_FACTOR", DECENARY_DEFAULTS["safety_factor"]),
+    "max_queue_size": _safe_int("DECENARY_MAX_QUEUE_SIZE", DECENARY_DEFAULTS["max_queue_size"]),
+    "max_retries": _safe_int("DECENARY_MAX_RETRIES", DECENARY_DEFAULTS["max_retries"]),
+    "base_backoff": _safe_float("DECENARY_BASE_BACKOFF", DECENARY_DEFAULTS["base_backoff"]),
+}
+
 
 def _load_config() -> dict:
     """Load rate limiter config with environment variable overrides.
@@ -279,6 +368,7 @@ def _load_display_config() -> list[tuple[str, str, str, str]]:
     add("Connection", "max_connections_per_host", os.environ.get("MAX_CONNECTIONS_PER_HOST", MAX_CONNECTIONS_PER_HOST), ["MAX_CONNECTIONS_PER_HOST"])
     add("Buffering", "max_body_size", os.environ.get("MAX_BODY_SIZE", MAX_BODY_SIZE), ["MAX_BODY_SIZE"])
     add("Buffering", "max_stream_buffer", os.environ.get("MAX_STREAM_BUFFER", MAX_STREAM_BUFFER), ["MAX_STREAM_BUFFER"])
+    add("Buffering", "upstream_max_body_size", os.environ.get("UPSTREAM_MAX_BODY_SIZE", UPSTREAM_MAX_BODY_SIZE), ["UPSTREAM_MAX_BODY_SIZE"])
     add("Buffering", "max_5xx_retries", os.environ.get("MAX_5XX_RETRIES", MAX_5XX_RETRIES), ["MAX_5XX_RETRIES"])
     add("Logging", "log_level", os.environ.get("LOG_LEVEL", LOG_LEVEL), ["LOG_LEVEL"])
     add("Logging", "log_buffer_size", os.environ.get("LOG_BUFFER_SIZE", LOG_BUFFER_SIZE), ["LOG_BUFFER_SIZE"])
@@ -286,17 +376,20 @@ def _load_display_config() -> list[tuple[str, str, str, str]]:
     add("Logging", "session_log_dir", os.environ.get("SESSION_LOG_DIR", SESSION_LOG_DIR), ["SESSION_LOG_DIR"])
 
     provider_cfgs = [
-        ("Primary Limits", CODING_PLAN_CONFIG, "PROXY_"),
-        ("MIMO Limits", SECONDARY_CODING_PLAN_CONFIG, "SECONDARY_"),
-        ("OpenLux Limits", TERTIARY_CODING_PLAN_CONFIG, "TERTIARY_"),
-        ("ARK Limits", QUATERNARY_CODING_PLAN_CONFIG, "QUATERNARY_"),
-        ("Meta AI Limits", QUINARY_CODING_PLAN_CONFIG, "QUINARY_"),
-        ("DeepSeek Limits", SENARY_CODING_PLAN_CONFIG, "SENARY_"),
-        ("GLM Limits", SEPTENARY_CODING_PLAN_CONFIG, "SEPTENARY_"),
+        ("Primary Limits", CODING_PLAN_CONFIG, "PROXY_", None),
+        ("MIMO Limits", SECONDARY_CODING_PLAN_CONFIG, "SECONDARY_", "mimo"),
+        ("OpenLux Limits", TERTIARY_CODING_PLAN_CONFIG, "TERTIARY_", "openlux"),
+        ("ARK Limits", QUATERNARY_CODING_PLAN_CONFIG, "QUATERNARY_", "ark"),
+        ("Meta AI Limits", QUINARY_CODING_PLAN_CONFIG, "QUINARY_", "meta"),
+        ("DeepSeek Limits", SENARY_CODING_PLAN_CONFIG, "SENARY_", "deepseek"),
+        ("GLM Limits", SEPTENARY_CODING_PLAN_CONFIG, "SEPTENARY_", "glm"),
+        ("Agnes Text Limits", OCTONARY_CODING_PLAN_CONFIG, "OCTONARY_", "agnes_text"),
+        ("Agnes Image Limits", NONARY_CODING_PLAN_CONFIG, "NONARY_", "agnes_image"),
+        ("Agnes Video Limits", DECENARY_CODING_PLAN_CONFIG, "DECENARY_", "agnes_video"),
     ]
-    for group, cfg, prefix in provider_cfgs:
+    for group, cfg, prefix, key_prefix in provider_cfgs:
         for key, value in cfg.items():
-            add(group, f"{group.split()[0].lower()}.{key}" if group != "Primary Limits" else key,
+            add(group, f"{key_prefix}.{key}" if key_prefix else key,
                 value, [f"{prefix}{key.upper()}"])
 
     add("Providers", "secondary_base_url", SECONDARY_BASE_URL or "(unset)", ["MIMO_CODING_PLAN_TARGET_BASE"])
@@ -305,6 +398,9 @@ def _load_display_config() -> list[tuple[str, str, str, str]]:
     add("Providers", "quinary_base_url", QUINARY_BASE_URL or "(unset)", ["META_AI_TARGET_BASE"])
     add("Providers", "senary_base_url", SENARY_BASE_URL or "(unset)", ["DEEPSEEK_TARGET_BASE"])
     add("Providers", "septenary_base_url", SEPTENARY_BASE_URL or "(unset)", ["GLM_TARGET_BASE"])
+    add("Providers", "octonary_base_url", OCTONARY_BASE_URL or "(unset)", ["AGNES_TARGET_BASE"])
+    add("Providers", "nonary_base_url", NONARY_BASE_URL or "(unset)", ["AGNES_TARGET_BASE"])
+    add("Providers", "decenary_base_url", DECENARY_BASE_URL or "(unset)", ["AGNES_TARGET_BASE"])
     add("Providers", "model_fallback_order", ",".join(MODEL_FALLBACK_ORDER) or "(default)", ["MODEL_FALLBACK_ORDER"])
     return rows
 
@@ -350,6 +446,10 @@ TERTIARY_MODELS = {
         {"id": "MiniMax-M3", "object": "model"},
         {"id": "mimo-v2.5", "object": "model"},
         {"id": "glm-5.3-flash", "object": "model"},
+        {"id": "gpt-6-sol", "object": "model"},
+        {"id": "gpt-6-astra", "object": "model"},
+        {"id": "mimo-v2.6-flash", "object": "model"},
+        {"id": "jev-1.13.0", "object": "model"},
     ]
 }
 
@@ -381,9 +481,7 @@ QUINARY_MODELS = {
 SENARY_MODELS = {
     "object": "list",
     "data": [
-        {"id": "deepseek-v4-flash", "object": "model"},
-        {"id": "deepseek-v4-pro", "object": "model"},
-        {"id": "deepseek-v4-flash-vision-exp", "object": "model"},
+        {"id": "deepseek-flash", "object": "model"},
     ]
 }
 
@@ -407,6 +505,36 @@ SEPTENARY_MODELS = {
 }
 
 # ---------------------------------------------------------------------------
+# Octonary provider models (Agnes Text)
+# ---------------------------------------------------------------------------
+OCTONARY_MODELS = {
+    "object": "list",
+    "data": [
+        {"id": "agnes-3.0-flash", "object": "model"},
+    ]
+}
+
+# ---------------------------------------------------------------------------
+# Nonary provider models (Agnes Image)
+# ---------------------------------------------------------------------------
+NONARY_MODELS = {
+    "object": "list",
+    "data": [
+        {"id": "agnes-image-2.1-flash", "object": "model"},
+    ]
+}
+
+# ---------------------------------------------------------------------------
+# Decenary provider models (Agnes Video)
+# ---------------------------------------------------------------------------
+DECENARY_MODELS = {
+    "object": "list",
+    "data": [
+        {"id": "agnes-video-2.5-flash", "object": "model"},
+    ]
+}
+
+# ---------------------------------------------------------------------------
 # Explicit model-to-provider mapping (optional overrides)
 # Keys are model names, values are "primary", "secondary", "tertiary", "quaternary", "quinary", "senary", or "septenary".
 # When a model is listed here, this mapping takes priority over
@@ -422,10 +550,20 @@ PROVIDER_SLUGS: dict[str, str] = {
     "metaspark": "quinary",
     "deepseek": "senary",
     "glm": "septenary",
+    "zai": "septenary",
+    "agnes": "octonary",
+    "agnes-image": "nonary",
+    "agnes-video": "decenary",
 }
 
+def _normalize_fallback_entry(entry: str) -> str:
+    """Map a provider slug to its canonical provider name; pass through
+    canonical names and unknown values (the router ignores unknown entries)."""
+    slug = entry.strip().lower()
+    return PROVIDER_SLUGS.get(slug, slug)
+
 MODEL_FALLBACK_ORDER: list[str] = [
-    s.strip().lower()
+    _normalize_fallback_entry(s)
     for s in os.environ.get("MODEL_FALLBACK_ORDER", "").split(",")
     if s.strip()
 ]

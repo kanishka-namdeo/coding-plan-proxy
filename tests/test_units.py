@@ -500,6 +500,39 @@ class TestIsChatEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# requires_messages
+# ---------------------------------------------------------------------------
+
+class TestRequiresMessages:
+    @pytest.mark.parametrize("path", [
+        "/v1/chat/completions",
+        "/v1/messages",
+        "/v1/embeddings",
+        "/health",
+    ])
+    def test_chat_style_and_unknown_paths_require_messages(self, dashscope_module, path):
+        assert dashscope_module.requires_messages(path) is True
+
+    @pytest.mark.parametrize("path", [
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/videos",
+        "/v1/videos/abc123",
+    ])
+    def test_generation_paths_do_not_require_messages(self, dashscope_module, path):
+        assert dashscope_module.requires_messages(path) is False
+
+    def test_case_insensitive(self, dashscope_module):
+        assert dashscope_module.requires_messages("/V1/IMAGES/GENERATIONS") is False
+        assert dashscope_module.requires_messages("/v1/Images/Edits") is False
+        assert dashscope_module.requires_messages("/V1/VIDEOS/abc123") is False
+        assert dashscope_module.requires_messages("/V1/Chat/Completions") is True
+
+    def test_empty_path_stays_strict(self, dashscope_module):
+        assert dashscope_module.requires_messages("") is True
+
+
+# ---------------------------------------------------------------------------
 # _add_forwarded_headers
 # ---------------------------------------------------------------------------
 
@@ -656,8 +689,9 @@ class TestWaitForSlot:
         req.transport = MagicMock()
         req.transport.is_closing.return_value = False
         result = await dashscope_module.wait_for_slot(rl, req, estimated_tokens=0, deadline_seconds=5.0)
-        assert result is not None  # should succeed immediately
-        assert result == 0.0  # no wait needed
+        # Returns 3-tuple: (total_wait, reason, last_wait)
+        assert result is not None
+        assert result == (0.0, None, 0.0)  # no wait needed, no denial observed
 
     @pytest.mark.asyncio
     async def test_none_when_queue_full(self, dashscope_module):
@@ -672,7 +706,8 @@ class TestWaitForSlot:
         req.transport = MagicMock()
         req.transport.is_closing.return_value = False
         result = await dashscope_module.wait_for_slot(rl, req, estimated_tokens=0, deadline_seconds=5.0)
-        assert result is None
+        # Queue full: returns (total_wait, "queue_full", last_wait)
+        assert result[1] == "queue_full"
 
     @pytest.mark.asyncio
     async def test_none_when_client_disconnects(self, dashscope_module):
@@ -691,7 +726,8 @@ class TestWaitForSlot:
         # Client disconnects during wait
         req.transport.is_closing.return_value = True
         result = await dashscope_module.wait_for_slot(rl, req, estimated_tokens=0, deadline_seconds=5.0)
-        assert result is None
+        # Client disconnected: returns (total_wait, "client_disconnected", last_wait)
+        assert result[1] == "client_disconnected"
 
 
 # ---------------------------------------------------------------------------
@@ -861,9 +897,47 @@ class TestTUILogHandler:
 class TestConfigureLogging:
     def test_configure_logging_can_skip_tui_handler(self, dashscope_module):
         dashscope_module.configure_logging(enable_tui_handler=False)
-        from dashscope_proxy_lib.logging_config import logger, TUILogHandler
-        assert not any(isinstance(h, TUILogHandler) for h in logger.handlers)
+        from dashscope_proxy_lib import logging_config
+        assert not any(
+            isinstance(h, logging_config.TUILogHandler)
+            for h in logging_config.logger.handlers
+        )
+        assert not any(
+            isinstance(h, logging_config.TUILogHandler)
+            for h in logging_config.package_logger.handlers
+        )
         dashscope_module.configure_logging(enable_tui_handler=True)
+
+    def test_tui_handler_attaches_to_package_logger(self, dashscope_module):
+        import logging as _logging
+
+        from dashscope_proxy_lib import logging_config
+
+        dashscope_module.configure_logging(enable_tui_handler=True)
+        try:
+            assert any(
+                isinstance(h, logging_config.TUILogHandler)
+                for h in logging_config.package_logger.handlers
+            )
+            # Sibling module loggers reach the TUI feed via propagation.
+            sibling = _logging.getLogger("dashscope_proxy_lib.session_log")
+            sibling.error("tui wiring probe")
+            entries = logging_config.tui_handler.get_logs(from_seq=0)
+            assert any(e["message"] == "tui wiring probe" for e in entries)
+        finally:
+            dashscope_module.configure_logging(enable_tui_handler=False)
+
+    def test_configure_logging_is_idempotent(self, dashscope_module):
+        from dashscope_proxy_lib import logging_config
+
+        dashscope_module.configure_logging(enable_tui_handler=True)
+        dashscope_module.configure_logging(enable_tui_handler=True)
+        count = sum(
+            isinstance(h, logging_config.TUILogHandler)
+            for h in logging_config.package_logger.handlers
+        )
+        assert count == 1
+        dashscope_module.configure_logging(enable_tui_handler=False)
 
 
 # ---------------------------------------------------------------------------
@@ -915,6 +989,73 @@ class TestMakeErrorResponse:
     def test_response_without_retry_after(self, dashscope_module):
         resp = dashscope_module._make_error_response(400, b'{"error":"bad"}', "req123", retry_after=None)
         assert "Retry-After" not in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# _read_upstream_capped (capped upstream body read)
+# ---------------------------------------------------------------------------
+
+class _FakeContent:
+    """StreamReader stand-in: serves scripted chunks, honors read(n) semantics."""
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    async def read(self, n=-1):
+        if not self._chunks:
+            return b""
+        if n is None or n < 0:
+            data = b"".join(self._chunks)
+            self._chunks.clear()
+            return data
+        data = b""
+        while self._chunks and len(data) < n:
+            take = self._chunks.pop(0)
+            room = n - len(data)
+            data += take[:room]
+            if len(take) > room:
+                self._chunks.insert(0, take[room:])
+        return data or b""
+
+
+class _FakeResponse:
+    """ClientResponse stand-in exposing only .content."""
+    def __init__(self, chunks):
+        self.content = _FakeContent(chunks)
+
+
+class TestReadUpstreamCapped:
+    @pytest.mark.asyncio
+    async def test_body_smaller_than_cap(self):
+        from dashscope_proxy_lib.http_helpers import _read_upstream_capped
+        resp = _FakeResponse([b"hello", b" world"])
+        body, truncated = await _read_upstream_capped(resp, 1024)
+        assert body == b"hello world"
+        assert truncated is False
+
+    @pytest.mark.asyncio
+    async def test_body_larger_than_cap(self):
+        from dashscope_proxy_lib.http_helpers import _read_upstream_capped
+        resp = _FakeResponse([b"xxxx", b"xxxxxx"])  # 10 bytes total, split chunks
+        body, truncated = await _read_upstream_capped(resp, 6)
+        assert body == b"x" * 6
+        assert truncated is True
+
+    @pytest.mark.asyncio
+    async def test_empty_body(self):
+        from dashscope_proxy_lib.http_helpers import _read_upstream_capped
+        resp = _FakeResponse([])
+        body, truncated = await _read_upstream_capped(resp, 1024)
+        assert body == b""
+        assert truncated is False
+
+    @pytest.mark.asyncio
+    async def test_body_exactly_equal_to_cap(self):
+        from dashscope_proxy_lib.http_helpers import _read_upstream_capped
+        data = b"y" * 8
+        resp = _FakeResponse([data[:5], data[5:]])
+        body, truncated = await _read_upstream_capped(resp, 8)
+        assert body == data
+        assert truncated is False
 
 
 # ---------------------------------------------------------------------------
@@ -994,6 +1135,58 @@ class TestTryAdmitAndRecordCompletion:
             await asyncio.sleep(0)
         await task
         assert not nested, "must not hold asyncio.Lock while taking _thread_lock"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_try_admit_no_serialization(self, rate_limiter):
+        """50 concurrent admits complete promptly; denials are clean RPS spacing only."""
+        rate_limiter.rps_limit = 10_000
+        results = await asyncio.wait_for(
+            asyncio.gather(*[rate_limiter.try_admit(10) for _ in range(50)]),
+            timeout=10.0,
+        )
+        admitted = sum(1 for ok, _, _ in results if ok)
+        assert admitted >= 1, "at least one concurrent admit must succeed"
+        for ok, reason, _ in results:
+            assert reason in ("ok", "RPS spacing"), f"unexpected denial: {reason}"
+        # Phase-4 losers refund, so reservations match admissions exactly.
+        assert rate_limiter.tpm_bucket.reserved == admitted * 10
+
+    @pytest.mark.asyncio
+    async def test_pending_counter_thread_safe_without_event_loop_block(self, dashscope_module):
+        """increment/decrement_pending use a threading lock — safe from any thread."""
+        import threading
+        mpl = dashscope_module.MultiProviderRateLimiter({
+            "rpm_limit": 6000, "tpm_limit": 10_000_000, "safety_factor": 0.8,
+            "max_queue_size": 50, "max_retries": 2, "base_backoff": 0.05,
+        })
+        errors = []
+
+        async def bump():
+            try:
+                for _ in range(100):
+                    await mpl.increment_pending()
+                    await mpl.decrement_pending()
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        def bump_sync():
+            try:
+                for _ in range(100):
+                    with mpl._pending_lock:
+                        mpl._pending_requests += 1
+                    with mpl._pending_lock:
+                        mpl._pending_requests = max(0, mpl._pending_requests - 1)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=bump_sync) for _ in range(4)]
+        for t in threads:
+            t.start()
+        await bump()
+        for t in threads:
+            t.join()
+        assert not errors
+        assert mpl.pending_requests >= 0
 
     @pytest.mark.asyncio
     async def test_tpm_wait_estimate_conservative_outside_admit_lock(self, rate_limiter):
@@ -1093,11 +1286,20 @@ class TestCircuitBreaker:
         assert rate_limiter.circuit_is_open() is True  # opened
 
     async def test_circuit_closes_on_success(self, rate_limiter):
-        rate_limiter.circuit_threshold = 1
-        await rate_limiter.record_circuit_failure()
-        assert rate_limiter.circuit_is_open() is True
+        # A success from CLOSED state clears counters
+        rate_limiter.circuit_state = "CLOSED"
+        rate_limiter.circuit_failure_count = 3
         await rate_limiter.record_circuit_success()
         assert rate_limiter.circuit_is_open() is False
+        assert rate_limiter.circuit_failure_count == 0
+
+        # A success from HALF_OPEN state (probe success) closes the circuit
+        rate_limiter.circuit_state = "HALF_OPEN"
+        rate_limiter.circuit_probe_in_flight = True
+        rate_limiter.circuit_open_until = time.monotonic() + 5.0
+        await rate_limiter.record_circuit_success()
+        assert rate_limiter.circuit_state == "CLOSED"
+        assert rate_limiter.circuit_probe_in_flight is False
         assert rate_limiter.circuit_failure_count == 0
 
     async def test_status_includes_circuit_fields(self, rate_limiter):
@@ -1303,6 +1505,60 @@ class TestTokenWindowCounterEdgeCases:
         wait = counter.wait_seconds_for(500, now=now)
         assert wait > 0
 
+    def test_running_total_matches_window_sum(self, dashscope_module):
+        """_used_total stays consistent with the deque across reserve/reconcile/prune."""
+        counter = dashscope_module.TokenWindowCounter(capacity=10_000, window_seconds=60)
+        now = time.monotonic()
+        counter.try_reserve(3000, now=now)
+        counter.reconcile(estimated=3000, actual=2500, now=now)
+        counter.try_reserve(1000, now=now)
+        counter.reconcile(estimated=1000, actual=1000, now=now + 1)
+        assert counter._used_total == sum(a for _, a in counter.window) == 3500
+        # Expiry subtracts from the total instead of re-summing.
+        assert counter.available(now=now + 61) == 9000.0
+        assert counter._used_total == sum(a for _, a in counter.window) == 1000
+
+    @pytest.mark.asyncio
+    async def test_admit_paths_do_not_hold_admit_lock_into_bucket(self, dashscope_module):
+        """Bucket calls from the event loop must not run under RateLimiter._lock."""
+        rl = dashscope_module.RateLimiter({
+            "rpm_limit": 6000, "tpm_limit": 10_000_000, "safety_factor": 0.8,
+            "max_queue_size": 50, "max_retries": 2, "base_backoff": 0.05,
+        })
+        rl.rps_limit = 10_000
+        held = []
+        real_reserve = rl.tpm_bucket.try_reserve
+        real_available = rl.tpm_bucket.available
+
+        def probe_reserve(tokens, now=None):
+            held.append(rl._lock.locked())
+            return real_reserve(tokens, now)
+
+        def probe_available(now=None):
+            held.append(rl._lock.locked())
+            return real_available(now)
+
+        rl.tpm_bucket.try_reserve = probe_reserve  # type: ignore[method-assign]
+        rl.tpm_bucket.available = probe_available  # type: ignore[method-assign]
+        try:
+            ok, _, _ = await rl.can_proceed(100)
+            assert ok
+            await rl.reserve_tokens(50)
+            await rl.reconcile_tokens(50, 40)
+            await rl.refund_tokens(10)
+            await rl.remaining_tpm()
+            ok, _, _ = await rl.try_admit(100)
+            assert ok
+            await rl.record_completion(
+                estimated_tokens=100, actual_tokens=90, model="m",
+                latency_ms=1.0, request_bytes=1, response_bytes=1,
+            )
+        finally:
+            rl.tpm_bucket.try_reserve = real_reserve  # type: ignore[method-assign]
+            rl.tpm_bucket.available = real_available  # type: ignore[method-assign]
+        assert held, "expected bucket calls to be observed"
+        assert not any(held), "admit lock must not be held during bucket calls"
+
 
 # ---------------------------------------------------------------------------
 # SlidingWindowCounter thread safety
@@ -1386,6 +1642,34 @@ class TestLoadDisplayConfig:
         port_row = next(r for r in rows if r[1] == "proxy_port")
         assert port_row[2] == "9999"
         assert port_row[3] == "env"
+
+    def test_includes_agnes_limit_rows_and_base_urls(self, dashscope_module):
+        rows = dashscope_module._load_display_config()
+        keys = {r[1] for r in rows}
+        groups = {r[0] for r in rows}
+        for prefix in ("agnes_text", "agnes_image", "agnes_video"):
+            assert f"{prefix}.rpm_limit" in keys
+            assert f"{prefix}.tpm_limit" in keys
+        assert "Agnes Text Limits" in groups
+        assert "Agnes Image Limits" in groups
+        assert "Agnes Video Limits" in groups
+        for row_key in ("octonary_base_url", "nonary_base_url", "decenary_base_url"):
+            assert row_key in keys
+            row = next(r for r in rows if r[1] == row_key)
+            assert row[0] == "Providers"
+            # Sourced from AGNES_TARGET_BASE, so the env column tracks that var.
+            expected_source = "env" if "AGNES_TARGET_BASE" in os.environ else "default"
+            assert row[3] == expected_source
+
+    def test_preexisting_non_primary_prefixes_unchanged(self, dashscope_module):
+        rows = dashscope_module._load_display_config()
+        keys = {r[1] for r in rows}
+        for prefix in ("mimo", "openlux", "ark", "meta", "deepseek", "glm"):
+            assert f"{prefix}.rpm_limit" in keys, f"missing {prefix} limit rows"
+            assert f"{prefix}.tpm_limit" in keys
+        # Primary keeps its bare (unprefixed) keys.
+        assert "rpm_limit" in keys
+        assert "tpm_limit" in keys
 
 
 # ---------------------------------------------------------------------------
@@ -1509,6 +1793,7 @@ class TestProviderRouter:
         "gpt-5.6-sol", "gemini-3.7-flash", "gpt-5.6-terra", "qwen3.8-max",
         "qwen3.8-max-0902",
         "gpt-5.6-luna", "gemini-3.8-flash", "grok-4.6", "MiniMax-M3", "mimo-v2.5",
+        "gpt-6-astra",
     ])
     def test_all_tertiary_models_routed_to_tertiary(self, dashscope_module, monkeypatch, model_id):
         monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-openlux")
@@ -1570,14 +1855,14 @@ class TestProviderRouter:
         assert "mimo-v2.5" in ids
         assert "mimo-v2-5" in ids
 
-    def test_tertiary_model_list_has_ten_models(self, dashscope_module):
+    def test_tertiary_model_list_matches_expected_models(self, dashscope_module):
         from dashscope_proxy_lib.config import TERTIARY_MODELS
         model_ids = [m["id"] for m in TERTIARY_MODELS["data"]]
         assert model_ids == [
             "gpt-5.6-sol", "gemini-3.7-flash", "gpt-5.6-terra", "qwen3.8-max",
             "qwen3.8-max-0902",
             "gpt-5.6-luna", "gemini-3.8-flash", "grok-4.6", "MiniMax-M3", "mimo-v2.5",
-            "glm-5.3-flash",
+            "glm-5.3-flash", "gpt-6-sol", "gpt-6-astra", "mimo-v2.6-flash", "jev-1.13.0",
         ]
 
     def test_tertiary_unconfigured_returns_primary_for_tertiary_models(self, dashscope_module, monkeypatch):
@@ -1711,13 +1996,13 @@ class TestProviderRouter:
             "https://api.deepseek.com",
         )
         router = dashscope_module.ProviderRouter()
-        assert router.get_provider_for_model("deepseek-v4-flash").name == "senary"
+        assert router.get_provider_for_model("deepseek-flash").name == "senary"
 
     def test_senary_unconfigured_returns_primary(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_API_KEY", "")
         monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_BASE_URL", "")
         router = dashscope_module.ProviderRouter()
-        assert router.get_provider_for_model("deepseek-v4-flash").name == "primary"
+        assert router.get_provider_for_model("deepseek-flash").name == "primary"
 
     def test_get_all_models_includes_senary_when_configured(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_API_KEY", "sk-deepseek")
@@ -1728,7 +2013,7 @@ class TestProviderRouter:
         router = dashscope_module.ProviderRouter()
         models = router.get_all_models()
         model_ids = [m["id"] for m in models["data"]]
-        assert "deepseek-v4-flash" in model_ids
+        assert "deepseek-flash" in model_ids
 
     def test_get_all_models_excludes_senary_when_not_configured(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_API_KEY", "")
@@ -1736,7 +2021,7 @@ class TestProviderRouter:
         router = dashscope_module.ProviderRouter()
         models = router.get_all_models()
         model_ids = [m["id"] for m in models["data"]]
-        assert "deepseek-v4-flash" not in model_ids
+        assert "deepseek-flash" not in model_ids
 
     def test_get_provider_status_includes_senary(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.SENARY_API_KEY", "sk-deepseek")
@@ -1757,10 +2042,10 @@ class TestProviderRouter:
         )
         monkeypatch.setattr(
             "dashscope_proxy_lib.config.MODEL_PROVIDER_MAP",
-            {"deepseek-v4-pro": "senary"},
+            {"deepseek-flash": "senary"},
         )
         router = dashscope_module.ProviderRouter()
-        assert router.get_provider_for_model("deepseek-v4-pro").name == "senary"
+        assert router.get_provider_for_model("deepseek-flash").name == "senary"
 
     def test_septenary_model_routed_to_septenary(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "sk-glm")
@@ -1819,6 +2104,187 @@ class TestProviderRouter:
         )
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model("glm-5.3").name == "septenary"
+
+    # --- Agnes AI: octonary (text) / nonary (image) / decenary (video) ---
+
+    @pytest.mark.parametrize(
+        "ordinal, base_url, model_id",
+        [
+            ("OCTONARY", "https://agnes.example.com/v1", "agnes-3.0-flash"),
+            ("NONARY", "https://agnes.example.com/v1", "agnes-image-2.1-flash"),
+            ("DECENARY", "https://agnes.example.com/v1", "agnes-video-2.5-flash"),
+        ],
+    )
+    def test_agnes_model_routed_to_its_provider(
+        self, dashscope_module, monkeypatch, ordinal, base_url, model_id
+    ):
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "sk-agnes")
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", base_url)
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model(model_id)
+        assert provider.name == ordinal.lower()
+        assert provider.api_key == "sk-agnes"
+
+    @pytest.mark.parametrize(
+        "ordinal, model_id",
+        [
+            ("OCTONARY", "agnes-3.0-flash"),
+            ("NONARY", "agnes-image-2.1-flash"),
+            ("DECENARY", "agnes-video-2.5-flash"),
+        ],
+    )
+    def test_agnes_unconfigured_returns_primary(
+        self, dashscope_module, monkeypatch, ordinal, model_id
+    ):
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "")
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model(model_id).name == "primary"
+
+    @pytest.mark.parametrize(
+        "ordinal, model_id, slug",
+        [
+            ("OCTONARY", "agnes-3.0-flash", "agnes"),
+            ("NONARY", "agnes-image-2.1-flash", "agnes-image"),
+            ("DECENARY", "agnes-video-2.5-flash", "agnes-video"),
+        ],
+    )
+    def test_get_all_models_agnes_entry_and_availability(
+        self, dashscope_module, monkeypatch, ordinal, model_id, slug
+    ):
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "sk-agnes")
+        monkeypatch.setattr(
+            f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", "https://agnes.example.com/v1"
+        )
+        router = dashscope_module.ProviderRouter()
+        models = router.get_all_models()
+        entry = next(m for m in models["data"] if m["id"] == model_id)
+        assert entry["providers"] == [ordinal.lower()]
+        assert entry["provider_models"] == [f"{slug}/{model_id}"]
+
+        # Unconfigured: the model disappears from the combined list.
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "")
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", "")
+        router_off = dashscope_module.ProviderRouter()
+        ids_off = [m["id"] for m in router_off.get_all_models()["data"]]
+        assert model_id not in ids_off
+
+    @pytest.mark.parametrize(
+        "ordinal, base_url, model_id",
+        [
+            ("OCTONARY", "https://agnes.example.com/v1", "agnes-3.0-flash"),
+            ("NONARY", "https://agnes-image.example.com/v1", "agnes-image-2.1-flash"),
+            ("DECENARY", "https://agnes-video.example.com/v1", "agnes-video-2.5-flash"),
+        ],
+    )
+    def test_get_provider_status_includes_agnes(
+        self, dashscope_module, monkeypatch, ordinal, base_url, model_id
+    ):
+        key = ordinal.lower()
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "sk-agnes")
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", base_url)
+        router = dashscope_module.ProviderRouter()
+        status = router.get_provider_status()
+        assert key in status
+        assert status[key]["available"] is True
+        assert status[key]["base_url"] == base_url
+
+        # Unconfigured: available False and the base URL is masked as None.
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "")
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", "")
+        router_off = dashscope_module.ProviderRouter()
+        status_off = router_off.get_provider_status()
+        assert status_off[key]["available"] is False
+        assert status_off[key]["base_url"] is None
+
+    @pytest.mark.parametrize(
+        "ordinal, model_id, mapped_model",
+        [
+            ("OCTONARY", "agnes-3.0-flash", "custom-octonary-model"),
+            ("NONARY", "agnes-image-2.1-flash", "custom-nonary-model"),
+            ("DECENARY", "agnes-video-2.5-flash", "custom-decenary-model"),
+        ],
+    )
+    def test_model_provider_map_agnes_override(
+        self, dashscope_module, monkeypatch, ordinal, model_id, mapped_model
+    ):
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "sk-agnes")
+        monkeypatch.setattr(
+            f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", "https://agnes.example.com/v1"
+        )
+        # ProviderRouter binds MODEL_PROVIDER_MAP at import, so patch the live
+        # config dict (spec convention) plus the router's module-level binding.
+        mapping = {mapped_model: ordinal.lower()}
+        monkeypatch.setattr("dashscope_proxy_lib.config.MODEL_PROVIDER_MAP", mapping)
+        monkeypatch.setattr("dashscope_proxy_lib.provider_router.MODEL_PROVIDER_MAP", mapping)
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model(mapped_model).name == ordinal.lower()
+        # The native model still routes to the same provider without the override.
+        assert router.get_provider_for_model(model_id).name == ordinal.lower()
+
+    @pytest.mark.parametrize(
+        "ordinal, model_id",
+        [
+            ("OCTONARY", "agnes-3.0-flash"),
+            ("NONARY", "agnes-image-2.1-flash"),
+            ("DECENARY", "agnes-video-2.5-flash"),
+        ],
+    )
+    def test_agnes_models_have_no_overlap(
+        self, dashscope_module, monkeypatch, ordinal, model_id
+    ):
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "sk-agnes")
+        monkeypatch.setattr(
+            f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", "https://agnes.example.com/v1"
+        )
+        router = dashscope_module.ProviderRouter()
+        providers = router.get_providers_for_model(model_id)
+        assert [p.name for p in providers] == [ordinal.lower()]
+        assert model_id not in router.get_model_overlaps()
+
+    def test_single_agnes_key_makes_all_three_available(self, dashscope_module, monkeypatch):
+        """One shared Agnes Token Plan key serves all three modalities.
+
+        config aliases AGNES_API_KEY/AGNES_BASE_URL onto the three ordinals at
+        import time; the router reads the per-ordinal names from the live config
+        module, so all three share the same key/base and become available together.
+        """
+        for ordinal in ("OCTONARY", "NONARY", "DECENARY"):
+            monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "sk-agnes")
+            monkeypatch.setattr(
+                f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", "https://agnes.example.com/v1"
+            )
+        router = dashscope_module.ProviderRouter()
+        assert router.octonary.is_available is True
+        assert router.nonary.is_available is True
+        assert router.decenary.is_available is True
+        assert router.octonary.api_key == router.nonary.api_key == router.decenary.api_key
+
+    def test_agnes_aliases_resolve_to_same_values_at_import(self, dashscope_module):
+        """The three ordinal constants are import-time aliases of AGNES_*."""
+        import dashscope_proxy_lib.config as cfg
+
+        assert cfg.OCTONARY_API_KEY == cfg.AGNES_API_KEY
+        assert cfg.NONARY_API_KEY == cfg.AGNES_API_KEY
+        assert cfg.DECENARY_API_KEY == cfg.AGNES_API_KEY
+        assert cfg.OCTONARY_BASE_URL == cfg.NONARY_BASE_URL == cfg.DECENARY_BASE_URL
+
+    def test_mimo_v25_pro_still_routes_to_secondary_with_agnes_configured(
+        self, dashscope_module, monkeypatch
+    ):
+        """Agnes config must not capture existing provider models."""
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1"
+        )
+        for ordinal in ("OCTONARY", "NONARY", "DECENARY"):
+            monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "sk-agnes")
+            monkeypatch.setattr(
+                f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", "https://agnes.example.com/v1"
+            )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("mimo-v2.5-pro").name == "secondary"
+        assert router.get_provider_for_model("agnes-3.0-flash").name == "octonary"
 
 
 # ---------------------------------------------------------------------------
@@ -2030,6 +2496,68 @@ class TestMultiProviderRateLimiter:
         secondary = mpl.get_limiter_for_provider("secondary")
         assert secondary is mpl.secondary
 
+    # --- Agnes AI trailing configs (octonary/nonary/decenary) ---
+
+    def _make_agnes_mpl(self, dashscope_module, oct_cfg, non_cfg, dec_cfg):
+        return dashscope_module.MultiProviderRateLimiter(
+            self._make_config(), None, None, None, None, None, None, oct_cfg, non_cfg, dec_cfg
+        )
+
+    def test_creates_agnes_limiters_when_configs_provided(self, dashscope_module):
+        mpl = self._make_agnes_mpl(
+            dashscope_module, self._make_config(), self._make_config(), self._make_config()
+        )
+        assert mpl.octonary is not None
+        assert mpl.nonary is not None
+        assert mpl.decenary is not None
+        assert mpl.secondary is None
+        assert mpl.tertiary is None
+        assert mpl.septenary is None
+
+    def test_agnes_limiters_absent_when_configs_omitted(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        assert mpl.octonary is None
+        assert mpl.nonary is None
+        assert mpl.decenary is None
+
+    @pytest.mark.parametrize("provider_name", ["octonary", "nonary", "decenary"])
+    def test_get_limiter_for_provider_returns_agnes(self, dashscope_module, provider_name):
+        mpl = self._make_agnes_mpl(
+            dashscope_module, self._make_config(), self._make_config(), self._make_config()
+        )
+        assert mpl.get_limiter_for_provider(provider_name) is getattr(mpl, provider_name)
+
+    @pytest.mark.parametrize("provider_name", ["octonary", "nonary", "decenary"])
+    def test_status_includes_agnes(self, dashscope_module, provider_name):
+        mpl = self._make_agnes_mpl(
+            dashscope_module, self._make_config(), self._make_config(), self._make_config()
+        )
+        status = mpl.status()
+        assert provider_name in status
+        assert status[provider_name] is not None
+        assert "rpm_limit" in status[provider_name]
+        assert status["shared_limits"] is False
+
+    def test_max_queue_size_setter_propagates_to_agnes(self, dashscope_module):
+        mpl = self._make_agnes_mpl(
+            dashscope_module, self._make_config(), self._make_config(), self._make_config()
+        )
+        mpl.max_queue_size = 17
+        assert mpl.octonary.max_queue_size == 17
+        assert mpl.nonary.max_queue_size == 17
+        assert mpl.decenary.max_queue_size == 17
+        assert mpl.primary.max_queue_size == 17
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider_name", ["octonary", "nonary", "decenary"])
+    async def test_provider_specific_can_proceed_agnes(self, dashscope_module, provider_name):
+        mpl = self._make_agnes_mpl(
+            dashscope_module, self._make_config(), self._make_config(), self._make_config()
+        )
+        allowed, reason, _ = await mpl.can_proceed_for_provider(0, provider_name)
+        assert allowed is True
+        assert reason == "ok"
+
 
 # ---------------------------------------------------------------------------
 # SplitProviderPrefix
@@ -2055,6 +2583,30 @@ class TestSplitProviderPrefix:
     def test_positional_alias_still_works(self, dashscope_module):
         from dashscope_proxy_lib.request_transform import split_provider_prefix
         assert split_provider_prefix("tertiary/gpt-5.6-sol") == ("tertiary", "gpt-5.6-sol")
+
+    @pytest.mark.parametrize(
+        "pinned, provider, bare",
+        [
+            ("agnes/agnes-3.0-flash", "octonary", "agnes-3.0-flash"),
+            ("agnes-image/agnes-image-2.1-flash", "nonary", "agnes-image-2.1-flash"),
+            ("agnes-video/agnes-video-2.5-flash", "decenary", "agnes-video-2.5-flash"),
+        ],
+    )
+    def test_agnes_slug_prefix_splits(self, dashscope_module, pinned, provider, bare):
+        from dashscope_proxy_lib.request_transform import split_provider_prefix
+        assert split_provider_prefix(pinned) == (provider, bare)
+
+    @pytest.mark.parametrize(
+        "pinned, provider, bare",
+        [
+            ("octonary/agnes-3.0-flash", "octonary", "agnes-3.0-flash"),
+            ("nonary/agnes-image-2.1-flash", "nonary", "agnes-image-2.1-flash"),
+            ("decenary/agnes-video-2.5-flash", "decenary", "agnes-video-2.5-flash"),
+        ],
+    )
+    def test_agnes_canonical_prefix_splits(self, dashscope_module, pinned, provider, bare):
+        from dashscope_proxy_lib.request_transform import split_provider_prefix
+        assert split_provider_prefix(pinned) == (provider, bare)
 
 
 class TestOverlapRegistry:
@@ -2096,11 +2648,54 @@ class TestPinnedRouting:
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model("openlux/gemini-3.7-flash").name == "tertiary"
 
-    def test_pin_to_unconfigured_provider_falls_back(self, dashscope_module, monkeypatch):
+    def test_pin_to_unconfigured_provider_returns_pinned_provider(self, dashscope_module, monkeypatch):
+        # Pinning to a known provider returns that provider even if unconfigured.
+        # The handler checks is_available and returns 503 if the circuit is open.
         monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "")
         monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_BASE_URL", "")
         router = dashscope_module.ProviderRouter()
-        assert router.get_provider_for_model("openlux/gemini-3.7-flash").name == "primary"
+        provider = router.get_provider_for_model("openlux/gemini-3.7-flash")
+        assert provider.name == "tertiary"
+        assert provider.is_available is False
+
+    @pytest.mark.parametrize(
+        "pinned, ordinals",
+        [
+            ("agnes/agnes-3.0-flash", ("OCTONARY",)),
+            ("agnes-image/agnes-image-2.1-flash", ("NONARY",)),
+            ("agnes-video/agnes-video-2.5-flash", ("DECENARY",)),
+        ],
+    )
+    def test_agnes_slug_pin_routes_to_pinned_provider(
+        self, dashscope_module, monkeypatch, pinned, ordinals
+    ):
+        for ordinal in ordinals:
+            monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "sk-agnes")
+            monkeypatch.setattr(
+                f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", "https://agnes.example.com/v1"
+            )
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model(pinned)
+        assert provider.name == ordinals[0].lower()
+        assert provider.is_available is True
+
+    @pytest.mark.parametrize(
+        "pinned, ordinal",
+        [
+            ("octonary/agnes-3.0-flash", "OCTONARY"),
+            ("nonary/agnes-image-2.1-flash", "NONARY"),
+            ("decenary/agnes-video-2.5-flash", "DECENARY"),
+        ],
+    )
+    def test_agnes_canonical_pin_routes_to_pinned_provider(
+        self, dashscope_module, monkeypatch, pinned, ordinal
+    ):
+        monkeypatch.setattr(f"dashscope_proxy_lib.config.{ordinal}_API_KEY", "sk-agnes")
+        monkeypatch.setattr(
+            f"dashscope_proxy_lib.config.{ordinal}_BASE_URL", "https://agnes.example.com/v1"
+        )
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model(pinned).name == ordinal.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -2165,6 +2760,104 @@ class TestTuiStatusHelpers:
         assert stats["pending_requests"] == 7
         assert stats["max_queue_size"] == 500
         assert abs(stats["success_rate"] - 50.0) < 0.01  # 3/(3+2+1)
+
+
+class TestProviderGridRows:
+    """Rows for the Overview compact provider grid (tui_status.provider_grid_rows)."""
+
+    def _provider(self, **overrides):
+        base = {
+            "rps_limit": 5, "rpm_limit": 6000, "rpm_current": 0,
+            "tpm_limit": 1_000_000, "tpm_available": 1_000_000, "tpm_reserved": 0,
+            "total_forwarded": 0, "total_429s": 0, "total_rejected": 0,
+            "total_tokens_consumed": 0, "circuit_open": False, "circuit_failure_count": 0,
+        }
+        base.update(overrides)
+        return base
+
+    def test_idle_provider_row(self):
+        from tui_status import provider_grid_rows
+        status = {"primary": self._provider()}
+        rows = provider_grid_rows(status)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["key"] == "primary"
+        assert row["label"] == "DashScope"
+        assert row["idle"] is True
+        assert row["rpm"] == "idle"
+        assert row["tpm"] == "idle"
+        assert row["circuit"] == "ok"
+        assert row["forwarded"] == "0"
+        assert row["count_429s"] == "0"
+
+    def test_active_provider_row_has_bars_and_percent(self):
+        from tui_status import provider_grid_rows
+        # 3000/6000 RPM = 50%, TPM: available=100_000, limit=1_000_000 -> used=900_000 -> 90%
+        status = {
+            "secondary": self._provider(
+                rpm_current=3000,
+                tpm_available=100_000,
+                total_forwarded=2500,
+                total_429s=3,
+            ),
+        }
+        rows = provider_grid_rows(status)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["idle"] is False
+        assert row["label"] == "MIMO"
+        assert row["rpm"].startswith("█")
+        assert "50%" in row["rpm"]
+        # TPM now shows used/limit: 900_000/1_000_000 = 90%
+        assert "90%" in row["tpm"]
+        assert row["circuit"] == "ok"
+        assert row["forwarded"] == "2.5K"  # compact format for the narrow column
+        assert row["count_429s"] == "3"
+
+    def test_open_circuit_provider(self):
+        from tui_status import provider_grid_rows
+        status = {
+            "tertiary": self._provider(circuit_open=True, circuit_failure_count=10),
+        }
+        rows = provider_grid_rows(status)
+        assert rows[0]["circuit"] == "OPEN"
+
+    def test_half_open_provider_with_failures(self):
+        from tui_status import provider_grid_rows
+        status = {
+            "quaternary": self._provider(circuit_failure_count=3),
+        }
+        rows = provider_grid_rows(status)
+        assert rows[0]["circuit"] == "half"
+
+    def test_row_count_matches_providers_in_status(self):
+        from tui_status import provider_grid_rows, PROVIDER_KEYS
+        status = {key: self._provider() for key in PROVIDER_KEYS}
+        rows = provider_grid_rows(status)
+        assert len(rows) == len(PROVIDER_KEYS)
+        assert [r["key"] for r in rows] == list(PROVIDER_KEYS)
+        # Missing providers produce no rows
+        partial = {"primary": self._provider(), "septenary": self._provider()}
+        assert len(provider_grid_rows(partial)) == 2
+
+    def test_agnes_providers_are_registered_with_labels(self):
+        from tui_status import provider_grid_rows, PROVIDER_KEYS, PROVIDER_LABELS
+        assert ("octonary", "nonary", "decenary") == tuple(
+            k for k in PROVIDER_KEYS if k in ("octonary", "nonary", "decenary")
+        )
+        assert PROVIDER_LABELS["octonary"] == "Agnes Text"
+        assert PROVIDER_LABELS["nonary"] == "Agnes Image"
+        assert PROVIDER_LABELS["decenary"] == "Agnes Video"
+        status = {
+            "octonary": self._provider(total_forwarded=1),
+            "nonary": self._provider(),
+            "decenary": self._provider(),
+        }
+        rows = provider_grid_rows(status)
+        labels = {r["key"]: r["label"] for r in rows}
+        assert labels["octonary"] == "Agnes Text"
+        assert labels["nonary"] == "Agnes Image"
+        assert labels["decenary"] == "Agnes Video"
 
 
 # ---------------------------------------------------------------------------
@@ -2232,3 +2925,118 @@ class TestSessionLogIncrementalRead:
         entries = tui._read_session_log_entries()
         assert [e["request_id"] for e in entries] == ["partial"]
         assert tui._session_log_partial == ""
+
+    def test_truncated_file_resets_offset(self, tmp_path, monkeypatch):
+        from collections import deque
+        from proxy_tui import ProxyTUI
+
+        monkeypatch.chdir(tmp_path)
+        log_dir = tmp_path / "session_logs"
+        log_dir.mkdir()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = log_dir / f"{today}.jsonl"
+
+        tui = object.__new__(ProxyTUI)
+        tui._session_log_offset = 0
+        tui._session_log_inode = None
+        tui._session_log_path = None
+        tui._session_log_tail = deque(maxlen=200)
+        tui._session_log_partial = ""
+
+        path.write_text(
+            json.dumps({"request_id": "a", "attempted_providers": ["primary"]}) + "\n",
+            encoding="utf-8",
+        )
+        assert [e["request_id"] for e in tui._read_session_log_entries()] == ["a"]
+        assert tui._session_log_offset > 0
+
+        # Truncation-by-rewrite: file shrinks below the cached offset.
+        path.write_text(
+            json.dumps({"request_id": "b", "attempted_providers": []}) + "\n",
+            encoding="utf-8",
+        )
+        entries = tui._read_session_log_entries()
+        assert [e["request_id"] for e in entries] == ["b"]
+        assert tui._session_log_offset == path.stat().st_size
+
+    def test_recreated_file_resets_via_inode(self, tmp_path, monkeypatch):
+        from collections import deque
+        from proxy_tui import ProxyTUI
+
+        monkeypatch.chdir(tmp_path)
+        log_dir = tmp_path / "session_logs"
+        log_dir.mkdir()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = log_dir / f"{today}.jsonl"
+
+        tui = object.__new__(ProxyTUI)
+        tui._session_log_offset = 0
+        tui._session_log_inode = None
+        tui._session_log_path = None
+        tui._session_log_tail = deque(maxlen=200)
+        tui._session_log_partial = ""
+
+        long_entry = json.dumps(
+            {"request_id": "a" * 64, "attempted_providers": ["primary"]}
+        ) + "\n"
+        path.write_text(long_entry, encoding="utf-8")
+        assert [e["request_id"] for e in tui._read_session_log_entries()] == ["a" * 64]
+        offset_before = tui._session_log_offset
+
+        # Rotate: delete + recreate under the same name → new file identity.
+        path.unlink()
+        path.write_text(
+            json.dumps(
+                {"request_id": "b" * 64, "attempted_providers": ["primary"]}
+            ) + "\n",
+            encoding="utf-8",
+        )
+        # Same size, so only the inode change can trigger the reset.
+        assert path.stat().st_size == offset_before
+
+        entries = tui._read_session_log_entries()
+        assert [e["request_id"] for e in entries] == ["b" * 64]
+
+
+# ---------------------------------------------------------------------------
+# Latency tracker count-based snapshot merge
+# ---------------------------------------------------------------------------
+
+class TestLatencyTrackerMergeSnapshot:
+    def _tracker(self):
+        from proxy_tui import LatencyTracker
+
+        return LatencyTracker(max_length=10)
+
+    def test_first_snapshot_appends_all(self):
+        tracker = self._tracker()
+        tracker.merge_snapshot([1.0, 2.0, 3.0])
+        assert tracker.latencies == [1.0, 2.0, 3.0]
+
+    def test_overlapping_snapshot_appends_only_new(self):
+        tracker = self._tracker()
+        tracker.merge_snapshot([1.0, 2.0, 3.0])
+        tracker.merge_snapshot([2.0, 3.0, 4.0])
+        assert tracker.latencies == [1.0, 2.0, 3.0, 4.0]
+
+    def test_disjoint_snapshot_appends_all(self):
+        tracker = self._tracker()
+        tracker.merge_snapshot([1.0, 2.0])
+        tracker.merge_snapshot([9.0, 8.0])
+        assert tracker.latencies == [1.0, 2.0, 9.0, 8.0]
+
+    def test_accumulates_across_polls_up_to_max_length(self):
+        tracker = self._tracker()
+        for i in range(1, 25):
+            tracker.merge_snapshot([float(i)])
+        assert len(tracker.latencies) == 10
+        assert tracker.latencies[0] == 15.0
+        assert tracker.latencies[-1] == 24.0
+
+    def test_empty_snapshot_keeps_history(self):
+        tracker = self._tracker()
+        tracker.merge_snapshot([1.0, 2.0])
+        tracker.merge_snapshot([])
+        assert tracker.latencies == [1.0, 2.0]
+        tracker.merge_snapshot([5.0])
+        assert tracker.latencies == [1.0, 2.0, 5.0]
