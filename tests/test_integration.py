@@ -1507,7 +1507,13 @@ class TestUnserializableBody:
     async def test_unserializable_body_returns_400(self, aiohttp_client, proxy_app):
         """Body with a non-serializable type returns 400."""
         app, _ = proxy_app
-        app["client_session"] = MagicMock()
+        class _InvalidSession:
+            closed = False
+
+            def request(self, **_kwargs):
+                raise RuntimeError("mock upstream unavailable")
+
+        app["client_session"] = _InvalidSession()
 
         client = await aiohttp_client(app)
         # This is valid JSON but will fail on re-serialization if it contains
@@ -2395,6 +2401,365 @@ class TestQuaternaryProviderRouting:
                 dashscope_proxy.TARGET_BASE = original_target
         finally:
             await primary_runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Agnes AI provider routing (octonary / nonary / decenary)
+# ---------------------------------------------------------------------------
+
+class TestOctonaryProviderRouting:
+    """Integration tests for octonary (Agnes Text) provider routing."""
+
+    async def test_octonary_model_forwarded_to_octonary_upstream(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        import dashscope_proxy_lib.config as cfg
+
+        upstream_app = web.Application()
+        captured = {}
+
+        async def upstream_handler(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.json_response({
+                "id": "resp-octonary",
+                "choices": [{"message": {"role": "assistant", "content": "from agnes text"}}],
+                "usage": {"total_tokens": 15},
+            })
+
+        upstream_app.router.add_post("/v1/chat/completions", upstream_handler)
+        runner = web.AppRunner(upstream_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        monkeypatch.setattr(cfg, "OCTONARY_API_KEY", "sk-agnes-text")
+        monkeypatch.setattr(cfg, "OCTONARY_BASE_URL", f"http://127.0.0.1:{port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "agnes-3.0-flash",
+                        "messages": [{"role": "user", "content": "hello agnes text"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                assert (await resp.json())["id"] == "resp-octonary"
+                assert captured["headers"].get("Authorization") == "Bearer sk-agnes-text"
+                assert captured["body"]["model"] == "agnes-3.0-flash"
+        finally:
+            await runner.cleanup()
+
+    async def test_pinned_agnes_slug_strips_prefix_before_upstream(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        import dashscope_proxy_lib.config as cfg
+
+        upstream_app = web.Application()
+        captured = {}
+
+        async def upstream_handler(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.json_response({
+                "id": "resp-octonary-pinned",
+                "choices": [{"message": {"role": "assistant", "content": "pinned"}}],
+                "usage": {"total_tokens": 9},
+            })
+
+        upstream_app.router.add_post("/v1/chat/completions", upstream_handler)
+        runner = web.AppRunner(upstream_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        monkeypatch.setattr(cfg, "OCTONARY_API_KEY", "sk-agnes-text")
+        monkeypatch.setattr(cfg, "OCTONARY_BASE_URL", f"http://127.0.0.1:{port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "agnes/agnes-3.0-flash",
+                        "messages": [{"role": "user", "content": "hi pinned"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                assert (await resp.json())["id"] == "resp-octonary-pinned"
+                assert captured["headers"].get("Authorization") == "Bearer sk-agnes-text"
+                assert captured["body"]["model"] == "agnes-3.0-flash"
+        finally:
+            await runner.cleanup()
+
+
+class TestNonaryProviderRouting:
+    """Integration tests for nonary (Agnes Image) provider routing."""
+
+    async def test_nonary_model_forwarded_to_nonary_upstream(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        import dashscope_proxy_lib.config as cfg
+
+        upstream_app = web.Application()
+        captured = {}
+
+        async def upstream_handler(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.json_response({
+                "id": "resp-nonary",
+                "choices": [{"message": {"role": "assistant", "content": "from agnes image"}}],
+                "usage": {"total_tokens": 15},
+            })
+
+        upstream_app.router.add_post("/v1/chat/completions", upstream_handler)
+        runner = web.AppRunner(upstream_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        monkeypatch.setattr(cfg, "NONARY_API_KEY", "sk-agnes-image")
+        monkeypatch.setattr(cfg, "NONARY_BASE_URL", f"http://127.0.0.1:{port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "agnes-image-2.1-flash",
+                        "messages": [{"role": "user", "content": "hello agnes image"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                assert (await resp.json())["id"] == "resp-nonary"
+                assert captured["headers"].get("Authorization") == "Bearer sk-agnes-image"
+                assert captured["body"]["model"] == "agnes-image-2.1-flash"
+        finally:
+            await runner.cleanup()
+
+    async def test_pinned_agnes_image_slug_strips_prefix_before_upstream(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        import dashscope_proxy_lib.config as cfg
+
+        upstream_app = web.Application()
+        captured = {}
+
+        async def upstream_handler(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.json_response({
+                "id": "resp-nonary-pinned",
+                "choices": [{"message": {"role": "assistant", "content": "pinned"}}],
+                "usage": {"total_tokens": 9},
+            })
+
+        upstream_app.router.add_post("/v1/chat/completions", upstream_handler)
+        runner = web.AppRunner(upstream_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        monkeypatch.setattr(cfg, "NONARY_API_KEY", "sk-agnes-image")
+        monkeypatch.setattr(cfg, "NONARY_BASE_URL", f"http://127.0.0.1:{port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "agnes-image/agnes-image-2.1-flash",
+                        "messages": [{"role": "user", "content": "hi pinned"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                assert (await resp.json())["id"] == "resp-nonary-pinned"
+                assert captured["headers"].get("Authorization") == "Bearer sk-agnes-image"
+                assert captured["body"]["model"] == "agnes-image-2.1-flash"
+        finally:
+            await runner.cleanup()
+
+
+class TestDecenaryProviderRouting:
+    """Integration tests for decenary (Agnes Video) provider routing."""
+
+    async def test_decenary_model_forwarded_to_decenary_upstream(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        import dashscope_proxy_lib.config as cfg
+
+        upstream_app = web.Application()
+        captured = {}
+
+        async def upstream_handler(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.json_response({
+                "id": "resp-decenary",
+                "choices": [{"message": {"role": "assistant", "content": "from agnes video"}}],
+                "usage": {"total_tokens": 15},
+            })
+
+        upstream_app.router.add_post("/v1/chat/completions", upstream_handler)
+        runner = web.AppRunner(upstream_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        monkeypatch.setattr(cfg, "DECENARY_API_KEY", "sk-agnes-video")
+        monkeypatch.setattr(cfg, "DECENARY_BASE_URL", f"http://127.0.0.1:{port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "agnes-video-2.5-flash",
+                        "messages": [{"role": "user", "content": "hello agnes video"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                assert (await resp.json())["id"] == "resp-decenary"
+                assert captured["headers"].get("Authorization") == "Bearer sk-agnes-video"
+                assert captured["body"]["model"] == "agnes-video-2.5-flash"
+        finally:
+            await runner.cleanup()
+
+    async def test_pinned_agnes_video_slug_strips_prefix_before_upstream(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        import dashscope_proxy_lib.config as cfg
+
+        upstream_app = web.Application()
+        captured = {}
+
+        async def upstream_handler(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.json_response({
+                "id": "resp-decenary-pinned",
+                "choices": [{"message": {"role": "assistant", "content": "pinned"}}],
+                "usage": {"total_tokens": 9},
+            })
+
+        upstream_app.router.add_post("/v1/chat/completions", upstream_handler)
+        runner = web.AppRunner(upstream_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        monkeypatch.setattr(cfg, "DECENARY_API_KEY", "sk-agnes-video")
+        monkeypatch.setattr(cfg, "DECENARY_BASE_URL", f"http://127.0.0.1:{port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "agnes-video/agnes-video-2.5-flash",
+                        "messages": [{"role": "user", "content": "hi pinned"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                assert (await resp.json())["id"] == "resp-decenary-pinned"
+                assert captured["headers"].get("Authorization") == "Bearer sk-agnes-video"
+                assert captured["body"]["model"] == "agnes-video-2.5-flash"
+        finally:
+            await runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Generation-path ingress (no `messages`) forwarding
+# ---------------------------------------------------------------------------
+
+class TestGenerationPathForwarding:
+    async def test_image_generation_without_messages_is_forwarded(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        """POST /v1/images/generations carries a prompt payload, not `messages`.
+
+        It must reach the Agnes Image upstream instead of being rejected 400.
+        """
+        import dashscope_proxy_lib.config as cfg
+
+        upstream_app = web.Application()
+        captured = {}
+
+        async def image_handler(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.json_response({
+                "created": 1,
+                "data": [{"url": "https://img.example/x.png"}],
+            })
+
+        upstream_app.router.add_post("/v1/images/generations", image_handler)
+        runner = web.AppRunner(upstream_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        monkeypatch.setattr(cfg, "NONARY_API_KEY", "sk-agnes-image")
+        monkeypatch.setattr(cfg, "NONARY_BASE_URL", f"http://127.0.0.1:{port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/images/generations",
+                    data=json.dumps({
+                        "model": "agnes-image-2.1-flash",
+                        "prompt": "a cat",
+                        "size": "2K",
+                    }).encode(),
+                )
+                assert resp.status == 200
+                assert (await resp.json())["data"][0]["url"] == "https://img.example/x.png"
+                assert captured["body"]["model"] == "agnes-image-2.1-flash"
+                assert captured["headers"].get("Authorization") == "Bearer sk-agnes-image"
+        finally:
+            await runner.cleanup()
+
+    async def test_chat_without_messages_still_returns_400(self, aiohttp_client, proxy_app):
+        """Over-relaxation guard: chat paths keep requiring `messages`."""
+        app, _ = proxy_app
+        client = await aiohttp_client(app)
+        resp = await client.post(
+            "/v1/chat/completions",
+            data=json.dumps({"model": "qwen3-coder-plus"}).encode(),
+        )
+        assert resp.status == 400
+        assert await resp.json() == {"error": "missing required field: messages"}
 
 
 # ---------------------------------------------------------------------------

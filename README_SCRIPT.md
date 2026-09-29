@@ -106,7 +106,7 @@ DASHSCOPE_PROXY_PORT=8899
 # PROXY_RPM_LIMIT=14
 # PROXY_TPM_LIMIT=4000000
 
-# Optional - Secondary providers (MIMO, OpenLux, ARK)
+# Optional - Additional providers (MIMO, OpenLux, ARK, Meta AI, DeepSeek, GLM, Agnes AI)
 # See .env.example for full configuration
 ```
 
@@ -201,6 +201,7 @@ The proxy supports multiple upstream providers:
 - **Quinary**: Meta AI / Muse Spark (optional)
 - **Senary**: DeepSeek (optional)
 - **Septenary**: GLM (optional)
+- **Octonary / Nonary / Decenary**: Agnes AI Token Plan — Agnes Text, Agnes Image, and Agnes Video (optional)
 
 Configure additional providers in `.env` to enable automatic routing based on model name.
 

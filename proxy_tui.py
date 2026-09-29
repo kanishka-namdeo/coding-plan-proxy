@@ -20,7 +20,7 @@ from textual.worker import Worker, get_current_worker
 from textual.css.query import NoMatches
 
 # Import proxy components for shared state
-from dashscope_proxy_lib.config import _load_display_config
+from dashscope_proxy_lib.config import LOG_BUFFER_SIZE, _load_display_config
 from dashscope_proxy_lib.rate_limiter import RateLimiter
 from dashscope_proxy_lib.logging_config import TUILogHandler
 
@@ -33,7 +33,17 @@ PROVIDER_REGISTRY = [
     {"key": "quinary", "label": "Meta AI", "slug": "metaspark", "config_key": "QUINARY_BASE_URL"},
     {"key": "senary", "label": "DeepSeek", "slug": "deepseek", "config_key": "SENARY_BASE_URL"},
     {"key": "septenary", "label": "GLM", "slug": "glm", "config_key": "SEPTENARY_BASE_URL"},
+    {"key": "octonary", "label": "Agnes Text", "slug": "agnes", "config_key": "OCTONARY_BASE_URL"},
+    {"key": "nonary", "label": "Agnes Image", "slug": "agnes-image", "config_key": "NONARY_BASE_URL"},
+    {"key": "decenary", "label": "Agnes Video", "slug": "agnes-video", "config_key": "DECENARY_BASE_URL"},
 ]
+
+# Page size for the incremental log drain loop. The TUI log handler only returns
+# the LAST `limit` matching entries per call, so a backlog larger than one page
+# must be drained repeatedly; each poll advances past a full page.
+LOG_DRAIN_PAGE_SIZE = 500
+# Prevent a corrupted or incomplete session-log record from retaining arbitrary data.
+SESSION_LOG_PARTIAL_MAX_BYTES = 1_048_576
 
 
 def _fmt_number(n: int) -> str:
@@ -46,14 +56,18 @@ def _fmt_number(n: int) -> str:
 
 
 def _progress_bar(current: int, maximum: int, width: int = 20) -> str:
-    """Return a text-based progress bar."""
+    """Return a text-based progress bar.
+
+    Uses block characters — bracketed bars like '[####....]' are eaten by
+    Rich console markup when DataTable cells render.
+    """
     if maximum <= 0:
         filled = 0
     else:
         filled = int((current / maximum) * width)
     filled = min(filled, width)
     empty = width - filled
-    bar = "[" + "#" * filled + "." * empty + "]"
+    bar = "█" * filled + "░" * empty
     return f"{bar} {_fmt_number(current)}/{_fmt_number(maximum)}"
 
 
@@ -86,11 +100,30 @@ class LatencyTracker:
     """Tracks request latencies for percentile computation."""
     max_length: int = 1000
     latencies: list[float] = field(default_factory=list)
+    _last_snapshot: list[float] = field(default_factory=list)
 
     def add(self, ms: float):
         self.latencies.append(ms)
         if len(self.latencies) > self.max_length:
             self.latencies = self.latencies[-self.max_length:]
+
+    def merge_snapshot(self, snapshot: list[float]) -> None:
+        """Count-based merge of a limiter status snapshot.
+
+        status() publishes only the most recent samples, so consecutive
+        snapshots overlap. Append just the samples beyond the overlap so the
+        tracker accumulates a rolling window across polls instead of being
+        replaced with a single last-100 slice.
+        """
+        prev = self._last_snapshot
+        self._last_snapshot = list(snapshot)
+        overlap = 0
+        for m in range(min(len(prev), len(snapshot)), 0, -1):
+            if prev[-m:] == snapshot[:m]:
+                overlap = m
+                break
+        for value in snapshot[overlap:]:
+            self.add(value)
 
     def _percentile(self, p: float) -> float:
         if not self.latencies:
@@ -117,6 +150,28 @@ class LatencyTracker:
             return 0.0
         return round(statistics.mean(self.latencies), 1)
 
+    @staticmethod
+    def _stats(values: list[float]) -> dict:
+        """Percentile/avg stats over an arbitrary list of latency samples."""
+        def pct(p: float) -> float:
+            if not values:
+                return 0.0
+            sv = sorted(values)
+            k = (len(sv) - 1) * (p / 100.0)
+            f = math.floor(k)
+            c = math.ceil(k)
+            if f == c:
+                return round(sv[int(k)], 1)
+            return round(sv[f] * (c - k) + sv[c] * (k - f), 1)
+
+        return {
+            "count": len(values),
+            "avg": round(statistics.mean(values), 1) if values else 0.0,
+            "p50": pct(50),
+            "p95": pct(95),
+            "p99": pct(99),
+        }
+
 
 def _safe_update(fn: Callable) -> Callable:
     """Decorator that catches widget update errors without crashing the poller."""
@@ -135,6 +190,22 @@ class ProxyTUI(App):
     """Live dashboard for the DashScope API proxy."""
 
     CSS_PATH = "proxy_tui.tcss"
+
+    # Keys that must be present in the per-provider status entry for metrics
+    # updates. In multi-provider mode `_validate_status` is run against
+    # `status["primary"]` (the flat RateLimiter.status() sub-dict); in single
+    # mode it is run against the flat dict directly. So this set must exist in
+    # BOTH the flat RateLimiter.status() shape and the multi-provider primary
+    # entry (identical key sets). Defined at class level so it is testable
+    # without instantiating the Textual App.
+    _REQUIRED_STATUS_KEYS: frozenset[str] = frozenset({
+        "rps_limit", "rpm_limit", "rpm_current",
+        "tpm_limit", "tpm_available", "tpm_reserved",
+        "total_forwarded", "queue_drops", "total_429s", "total_rejected",
+        "total_tokens_consumed", "total_request_bytes", "total_response_bytes",
+        "pending_requests", "circuit_open", "circuit_failure_count",
+        "model_usage", "recent_latencies", "uptime_seconds",
+    })
 
     BINDINGS = [
         ("q", "quit", "Quit"),
@@ -158,6 +229,14 @@ class ProxyTUI(App):
         self.proxy_app = proxy_app
         self.history = MetricHistory()
         self.latency_tracker = LatencyTracker()
+        # Per-provider latency trackers (multi-provider mode). In multi mode the
+        # polled top-level `recent_latencies` is a CONCATENATION of per-provider
+        # time-ordered windows, so a single merge_snapshot over it double-counts.
+        # Instead each provider's own time-ordered window feeds its own tracker;
+        # display math is computed over the UNION of all trackers' values. In
+        # single-provider mode the dict holds one "primary" entry, so the code
+        # paths are uniform.
+        self._latency_trackers: dict[str, LatencyTracker] = {"primary": self.latency_tracker}
         self._config_rows: list[tuple[str, str, str, str]] = []
 
         # Logs tab state
@@ -181,25 +260,17 @@ class ProxyTUI(App):
         self.error_count = 0
         self._poll_error_count = 0
 
+        # Overview provider grid state (row order -> provider key mapping)
+        self._grid_row_keys: list[str] = []
+        self._detail_provider_key: str = "primary"
+        self._last_raw_status: dict | None = None
+
         # Incremental session-log tail (offset/inode + last 200 parsed entries)
         self._session_log_offset = 0
         self._session_log_inode = None
         self._session_log_path: str | None = None
         self._session_log_tail: deque[dict] = deque(maxlen=200)
         self._session_log_partial = ""
-
-        # Keys that must be present in rate_limiter.status() for metrics updates
-        self._REQUIRED_STATUS_KEYS: set[str] = {
-            "rps_limit", "rpm_limit", "rpm_current",
-            "tpm_limit", "tpm_available", "tpm_reserved",
-            "requests_5h", "requests_5h_limit",
-            "requests_week", "requests_week_limit",
-            "requests_month", "requests_month_limit",
-            "total_forwarded", "queue_drops", "total_429s", "total_rejected",
-            "total_tokens_consumed", "total_request_bytes", "total_response_bytes",
-            "pending_requests", "circuit_open", "circuit_failure_count",
-            "model_usage", "recent_latencies", "uptime_seconds",
-        }
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -210,26 +281,19 @@ class ProxyTUI(App):
                     with Vertical(id="metrics-panel"):
                         yield Static("Proxy: Checking...", id="status-indicator")
                         yield Static("", id="alert-badge", classes="alert-badge")
-                        yield Static("Primary Provider", classes="panel-title")
-                        yield Static("Rate Limiter", classes="panel-title")
-                        yield DataTable(id="rl-metrics")
-                        
-                        # Dynamic provider sections (secondary through senary)
-                        for provider_info in PROVIDER_REGISTRY[1:]:  # Skip primary
-                            provider_key = provider_info["key"]
-                            label = provider_info["label"]
-                            with Vertical(id=f"{provider_key}-overview", classes="provider-section"):
-                                yield Static(label, classes="panel-title")
-                                yield Static(f"{label}: Not configured", id=f"{provider_key}-status-line", classes="provider-status")
-                                yield DataTable(id=f"{provider_key}-rl-metrics", classes="provider-metrics")
-                        
+                        # Compact provider grid: one row per provider
+                        yield DataTable(id="provider-grid")
+                        # Detail pane: full breakdown for the provider under the grid cursor
+                        yield Static("", id="provider-detail-title", classes="section-title")
+                        yield DataTable(id="provider-detail")
+
                         yield Static("", classes="spacer")
-                        yield Static("Request Statistics", classes="panel-title")
+                        yield Static("Request Statistics", classes="section-title")
                         yield DataTable(id="request-stats")
                     with Vertical(id="log-panel"):
                         yield Static("Alerts & Warnings", classes="panel-title")
                         yield Static("", id="error-banner", classes="error-banner")
-                        yield Log(id="live-log")
+                        yield Log(id="live-log", max_lines=500)
 
             # Tab 2: Logs (moved from position 3 - critical for debugging)
             with TabPane("Logs", id="tab-logs"):
@@ -258,7 +322,7 @@ class ProxyTUI(App):
                         Static("", id="log-entry-count", classes="entry-count"),
                         id="log-controls-bar",
                     )
-                    yield Log(id="live-log-full")
+                    yield Log(id="live-log-full", max_lines=LOG_BUFFER_SIZE)
 
             # Tab 3: Metrics (sparklines + derived metrics + timers) - REORGANIZED layout
             with TabPane("Metrics", id="tab-metrics"):
@@ -312,11 +376,24 @@ class ProxyTUI(App):
         """Initialize data tables and start background polling."""
         self._config_rows = _load_display_config()
 
-        # Configure rate limiter metrics table
-        rl_table = self.query_one("#rl-metrics", DataTable)
-        rl_table.add_columns("Metric", "Value")
-        rl_table.show_header = False
-        rl_table.zebra_stripes = True
+        # Configure the compact provider grid
+        grid = self.query_one("#provider-grid", DataTable)
+        grid.add_column("Provider", width=11)
+        grid.add_column("Circuit", width=7)
+        grid.add_column("RPM", width=14)
+        grid.add_column("TPM", width=14)
+        grid.add_column("Fwd", width=7)
+        grid.add_column("429", width=4)
+        grid.show_header = True
+        grid.zebra_stripes = True
+        grid.cursor_type = "row"
+
+        # Configure the provider detail pane (full breakdown of selected provider)
+        detail_table = self.query_one("#provider-detail", DataTable)
+        detail_table.add_column("Metric", width=14)
+        detail_table.add_column("Value")
+        detail_table.show_header = False
+        detail_table.zebra_stripes = True
 
         # Configure request statistics table
         stats_table = self.query_one("#request-stats", DataTable)
@@ -342,17 +419,6 @@ class ProxyTUI(App):
             self._populate_config_table(config_table)
         except NoMatches:
             pass
-
-        # Configure dynamic provider metrics tables
-        for provider_info in PROVIDER_REGISTRY[1:]:  # Skip primary
-            provider_key = provider_info["key"]
-            try:
-                table = self.query_one(f"#{provider_key}-rl-metrics", DataTable)
-                table.add_columns("Metric", "Value")
-                table.show_header = False
-                table.zebra_stripes = True
-            except NoMatches:
-                pass
 
         # Start background polling in a thread
         self.run_worker(self._poll_loop, exclusive=True, thread=True, description="metrics poller")
@@ -384,7 +450,7 @@ class ProxyTUI(App):
                     queue_depth=series["queue_depth"],
                     upstream_latency_ms=avg_upstream,
                 )
-                self.latency_tracker.latencies = list(series["recent_latencies"])
+                self._feed_latency_trackers(raw_status)
 
                 # Update all UI components
                 self.call_from_thread(self._update_metrics, raw_status)
@@ -395,11 +461,18 @@ class ProxyTUI(App):
                 self.call_from_thread(self._update_latency_histogram)
                 self.call_from_thread(self._update_model_table, raw_status)
                 self.call_from_thread(self._update_config_table_filtered)
-                # Update all non-primary providers via registry
-                for provider_info in PROVIDER_REGISTRY[1:]:
-                    self.call_from_thread(self._update_provider_metrics, provider_info["key"], raw_status)
+                # Compact provider grid + detail pane (all providers, one pass)
+                self.call_from_thread(self._update_provider_grid, raw_status)
 
                 consecutive_errors = 0
+                # Polling recovered: clear any stale poll-error banner so the
+                # tcss `.poll-error:empty` hide rule applies again.
+                if self._poll_error_count > 0:
+                    self._poll_error_count = 0
+                    try:
+                        self.call_from_thread(self._clear_poll_error)
+                    except Exception:
+                        pass
 
                 # Adaptive: poll faster when activity detected
                 if series["queue_depth"] > 0:
@@ -429,6 +502,55 @@ class ProxyTUI(App):
             banner.update(f"Poll error ({self._poll_error_count} errors) -- reconnecting...")
         except NoMatches:
             pass
+
+    def _clear_poll_error(self) -> None:
+        """Clear the poll-error banner once polling recovers.
+
+        The tcss rule `.poll-error:empty { display: none }` hides the widget
+        when its text is empty, so resetting the text to "" is enough.
+        """
+        try:
+            banner = self.query_one("#poll-error-banner", Static)
+            banner.update("")
+        except NoMatches:
+            pass
+
+    def _feed_latency_trackers(self, raw_status: dict) -> None:
+        """Feed the per-provider latency trackers from the polled status.
+
+        In multi-provider mode `raw_status` maps each provider key to its own
+        time-ordered `recent_latencies` window, so each window feeds a
+        dedicated tracker (merge_snapshot is correct on a single time-ordered
+        window). In single-provider (flat) mode the dict holds one "primary"
+        tracker fed from the flat `recent_latencies`.
+        """
+        from tui_status import is_multi_provider, PROVIDER_KEYS
+
+        if is_multi_provider(raw_status):
+            for key in PROVIDER_KEYS:
+                p = raw_status.get(key)
+                if not isinstance(p, dict):
+                    continue
+                tracker = self._latency_trackers.setdefault(key, LatencyTracker())
+                tracker.merge_snapshot(p.get("recent_latencies") or [])
+        else:
+            tracker = self._latency_trackers.setdefault("primary", self.latency_tracker)
+            tracker.merge_snapshot(raw_status.get("recent_latencies") or [])
+
+    def _latency_union_values(self) -> list[float]:
+        """Union of all per-provider tracker values (fresh, display-only).
+
+        No persistent concatenated deque is kept — the union is computed on
+        demand for the histogram/percentile display math.
+        """
+        union: list[float] = []
+        for tracker in self._latency_trackers.values():
+            union.extend(tracker.latencies)
+        return union
+
+    def _latency_union_stats(self) -> dict:
+        """Display percentiles/avg/histogram over the union of all trackers."""
+        return LatencyTracker._stats(self._latency_union_values())
 
     @_safe_update
     def _update_metrics(self, status: dict) -> None:
@@ -463,44 +585,9 @@ class ProxyTUI(App):
         # Update alert badge (checks all providers in multi-provider mode)
         self._update_alert_badge(status)
 
-        # Primary provider rate limiter metrics
-        rl_table = self.query_one("#rl-metrics", DataTable)
-        rl_table.clear()
-        rl_table.add_row("RPS Limit", str(primary.get("rps_limit", 0)))
-
-        rpm_current = primary.get("rpm_current", 0)
-        rpm_limit = primary.get("rpm_limit", 1)
-        rl_table.add_row(
-            "RPM",
-            _progress_bar(rpm_current, rpm_limit),
-        )
-
-        rl_table.add_row(
-            "TPM Available",
-            _progress_bar(primary.get("tpm_available", 0), primary.get("tpm_limit", 1)),
-        )
-
-        # Circuit breaker status (primary)
-        if primary.get("circuit_open"):
-            rl_table.add_row("Circuit", "OPEN (failures: {})".format(primary.get("circuit_failure_count", 0)))
-        elif primary.get("circuit_failure_count", 0) > 0:
-            rl_table.add_row("Circuit", "closed ({} failures)".format(primary.get("circuit_failure_count", 0)))
-
-        # Token summary (primary)
-        rl_table.add_row(
-            "Tokens",
-            f"{_fmt_number(primary.get('total_tokens_consumed', 0))} consumed | "
-            f"{_fmt_number(primary.get('tpm_reserved', 0))} reserved | "
-            f"{_fmt_number(primary.get('tpm_limit', 0))} capacity",
-        )
-
-        # Quota warning row (primary only)
-        warning = self._quota_warning(primary)
-        if warning:
-            rl_table.add_row("Warning", warning)
-
-        # Request statistics — use AGGREGATED totals across all providers
-        from tui_status import overview_request_stats
+        # Request statistics — use AGGREGATED totals across all providers.
+        # Per-provider forwarded/429 counts live in the compact provider grid.
+        from tui_status import overview_request_stats, success_rate_display
         stats = overview_request_stats(status)
         stats_table = self.query_one("#request-stats", DataTable)
         stats_table.clear()
@@ -512,42 +599,16 @@ class ProxyTUI(App):
         avg_req_size = _fmt_number(total_request_bytes // total_fwd) if total_fwd > 0 else "0"
         avg_resp_size = _fmt_number(total_response_bytes // total_fwd) if total_fwd > 0 else "0"
 
-        # Show per-provider breakdown using registry
-        if "primary" in status:
-            total_fwd_all = 0
-            has_fallback = False
-            
-            for provider_info in PROVIDER_REGISTRY:
-                provider_key = provider_info["key"]
-                provider_label = provider_info["label"]
-                provider_status = status.get(provider_key)
-                
-                if not provider_status:
-                    continue
-                
-                provider_fwd = provider_status.get("total_forwarded", 0)
-                if provider_fwd == 0:
-                    continue
-                
-                # Determine label prefix: "Primary" for primary, otherwise use label
-                label_prefix = "Primary" if provider_key == "primary" else provider_label
-                stats_table.add_row(f"Forwarded ({label_prefix})", _fmt_number(provider_fwd))
-                stats_table.add_row(f"429s ({label_prefix})", str(provider_status.get("total_429s", 0)))
-                
-                total_fwd_all += provider_fwd
-                if provider_key != "primary":
-                    has_fallback = True
-            
-            # Show aggregate totals when multiple providers are active
-            if has_fallback:
-                stats_table.add_row("Total 429s", str(total_429s))
-                stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
-        else:
-            stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
-
+        stats_table.add_row("Total Forwarded", _fmt_number(total_fwd))
+        stats_table.add_row("Total 429s", str(total_429s))
         stats_table.add_row("Rejected", str(stats["total_rejected"]))
         stats_table.add_row("Pending", f"{stats['pending_requests']}/{stats['max_queue_size']}")
-        stats_table.add_row("Success Rate", f"{stats['success_rate']:.1f}%")
+        # Display-side guard: "n/a" when there are no attempts yet, so an idle
+        # proxy does not read as a 0.0% success rate.
+        stats_table.add_row(
+            "Success Rate",
+            success_rate_display(total_fwd, total_429s, stats["total_rejected"]),
+        )
         stats_table.add_row("Queue Drops", str(primary.get("queue_drops", 0)))
         queue_p50 = primary.get("queue_p50_ms", 0)
         queue_p95 = primary.get("queue_p95_ms", 0)
@@ -557,8 +618,7 @@ class ProxyTUI(App):
             "Tokens Consumed",
             _fmt_number(multi.get("total_tokens_consumed", 0)),
         )
-        stats_table.add_row("Avg Req Size", avg_req_size)
-        stats_table.add_row("Avg Resp Size", avg_resp_size)
+        stats_table.add_row("Avg Req/Resp Size", f"{avg_req_size} / {avg_resp_size}")
 
         # Update error banner
         error_banner = self.query_one("#error-banner", Static)
@@ -568,113 +628,133 @@ class ProxyTUI(App):
             error_banner.update("")
 
     @_safe_update
-    def _update_provider_metrics(self, provider_key: str, status: dict) -> None:
-        """Update metrics for a single provider.
-        
-        Args:
-            provider_key: Provider key from registry (e.g., "secondary", "senary")
-            status: Raw status dict from MultiProviderRateLimiter.status()
+    def _update_provider_grid(self, status: dict) -> None:
+        """Populate the compact provider grid (one row per provider).
+
+        Uses the pure `provider_grid_rows` helper from tui_status, then keeps
+        a row-index -> provider-key mapping for the detail pane cursor follow.
+        The currently-highlighted provider key is remembered before `clear()`
+        (which resets the cursor to row 0) and restored afterwards so the
+        cursor-following detail pane does not snap back to the first provider
+        on every poll.
         """
-        # Query UI elements using provider_key
-        try:
-            overview = self.query_one(f"#{provider_key}-overview", Vertical)
-            status_line = self.query_one(f"#{provider_key}-status-line", Static)
-            metrics_table = self.query_one(f"#{provider_key}-rl-metrics", DataTable)
-        except NoMatches:
+        from tui_status import provider_grid_rows
+
+        self._last_raw_status = status
+        rows = provider_grid_rows(status)
+        if not rows and "rpm_limit" in status:
+            # Single-provider (flat) status: synthesize the primary row.
+            rows = provider_grid_rows({"primary": status})
+
+        # Remember the provider the detail pane is currently showing.
+        remembered_key = self._detail_provider_key
+
+        grid = self.query_one("#provider-grid", DataTable)
+        grid.clear()
+        self._grid_row_keys = []
+        for row in rows:
+            grid.add_row(
+                row["label"],
+                row["circuit"],
+                row["rpm"],
+                row["tpm"],
+                row["forwarded"],
+                row["count_429s"],
+            )
+            self._grid_row_keys.append(row["key"])
+
+        if rows and remembered_key not in self._grid_row_keys:
+            # The provider the user was viewing is gone this poll; fall back
+            # to the first provider.
+            remembered_key = rows[0]["key"]
+        self._detail_provider_key = remembered_key
+        self._update_provider_detail(status)
+
+        # Restore the cursor to the remembered provider so the detail pane
+        # stays on the user's provider. `clear()` above reset the cursor to
+        # row 0; move it back to the remembered row (column 0).
+        if self._grid_row_keys:
+            try:
+                restore_index = (
+                    self._grid_row_keys.index(remembered_key)
+                    if remembered_key in self._grid_row_keys
+                    else 0
+                )
+                grid.move_cursor(row=restore_index, column=0)
+            except (ValueError, NoMatches):
+                pass
+
+    @_safe_update
+    def _update_provider_detail(self, status: dict) -> None:
+        """Render the detail pane for the provider under the grid cursor."""
+        key = self._detail_provider_key
+        title = self.query_one("#provider-detail-title", Static)
+        detail_table = self.query_one("#provider-detail", DataTable)
+        detail_table.clear()
+
+        provider_status = status.get(key) if isinstance(status, dict) else None
+        if not isinstance(provider_status, dict):
+            title.update("Provider Detail")
             return
 
-        # Check visibility conditions
-        if provider_key not in status:
-            overview.set_class(False, "visible")
-            return
-
-        provider_status = status.get(provider_key)
-        
-        if not provider_status:
-            overview.set_class(False, "visible")
-            return
-
-        from tui_status import provider_section_visible
-        if not provider_section_visible(provider_status):
-            overview.set_class(False, "visible")
-            return
-
-        # Provider is configured - show the section even at zero traffic
-        overview.set_class(True, "visible")
-
-        # Update status line with base URL from config
-        # Find provider info from registry
-        provider_info = None
-        for entry in PROVIDER_REGISTRY:
-            if entry["key"] == provider_key:
-                provider_info = entry
-                break
-        
-        if provider_info:
-            config_key = provider_info["config_key"]
-            # Import the config value dynamically
-            from dashscope_proxy_lib import config as proxy_config
-            base_url = getattr(proxy_config, config_key, None)
-            base_url_display = base_url or "N/A"
-            forwarded = provider_status.get("total_forwarded", 0)
-            if provider_status.get("circuit_open"):
-                status_prefix = "Status: Circuit OPEN"
-            elif forwarded > 0:
-                status_prefix = "Status: Active"
-            else:
-                status_prefix = "Status: Configured (idle)"
-            status_line.update(f"{status_prefix} | Target: {base_url_display}")
-            status_line.set_class(forwarded > 0, "status-running")
-            status_line.set_class(forwarded == 0, "status-stopped")
-
-        # Populate metrics table
-        metrics_table.clear()
-
-        metrics_table.add_row("RPS Limit", str(provider_status.get("rps_limit", 0)))
-
-        rpm_current = provider_status.get("rpm_current", 0)
-        rpm_limit = provider_status.get("rpm_limit", 1)
-        metrics_table.add_row(
-            "RPM",
-            _progress_bar(rpm_current, rpm_limit),
+        label = next((p["label"] for p in PROVIDER_REGISTRY if p["key"] == key), key)
+        circuit = "OPEN" if provider_status.get("circuit_open") else (
+            "half" if provider_status.get("circuit_failure_count", 0) > 0 else "ok"
         )
+        title.update(f"{label} — {circuit}")
 
-        metrics_table.add_row(
+        detail_table.add_row("RPS Limit", str(provider_status.get("rps_limit", 0)))
+        detail_table.add_row(
+            "RPM",
+            _progress_bar(provider_status.get("rpm_current", 0), provider_status.get("rpm_limit", 1)),
+        )
+        detail_table.add_row(
             "TPM Available",
             _progress_bar(
                 provider_status.get("tpm_available", 0),
-                provider_status.get("tpm_limit", 1)
+                provider_status.get("tpm_limit", 1),
             ),
         )
 
-        # Circuit breaker status
+        # Circuit breaker status (conditional, like the old per-provider tables)
         if provider_status.get("circuit_open"):
-            metrics_table.add_row("Circuit", "OPEN (failures: {})".format(
-                provider_status.get("circuit_failure_count", 0)))
+            detail_table.add_row(
+                "Circuit",
+                "OPEN (failures: {})".format(provider_status.get("circuit_failure_count", 0)),
+            )
         elif provider_status.get("circuit_failure_count", 0) > 0:
-            metrics_table.add_row("Circuit", "closed ({} failures)".format(
-                provider_status.get("circuit_failure_count", 0)))
+            detail_table.add_row(
+                "Circuit",
+                "closed ({} failures)".format(provider_status.get("circuit_failure_count", 0)),
+            )
 
-        # Token summary
-        metrics_table.add_row(
+        detail_table.add_row(
             "Tokens",
             f"{_fmt_number(provider_status.get('total_tokens_consumed', 0))} consumed | "
             f"{_fmt_number(provider_status.get('tpm_reserved', 0))} reserved | "
             f"{_fmt_number(provider_status.get('tpm_limit', 0))} capacity",
         )
-
-        # Request stats
-        metrics_table.add_row(
+        detail_table.add_row(
             "Forwarded",
             f"{_fmt_number(provider_status.get('total_forwarded', 0))} | "
             f"429s: {provider_status.get('total_429s', 0)} | "
             f"Rejected: {provider_status.get('total_rejected', 0)}",
         )
 
-        # Quota warning
         warning = self._quota_warning(provider_status)
         if warning:
-            metrics_table.add_row("Warning", warning)
+            detail_table.add_row("Warning", warning)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Follow the provider-grid cursor: re-render the detail pane."""
+        if event.data_table.id != "provider-grid":
+            return
+        row = event.cursor_row
+        if 0 <= row < len(self._grid_row_keys):
+            self._detail_provider_key = self._grid_row_keys[row]
+            status = self._last_raw_status
+            if status:
+                self._update_provider_detail(status)
 
     @_safe_update
     def _update_sparklines(self) -> None:
@@ -758,13 +838,92 @@ class ProxyTUI(App):
             self._displayed_log_count += written
             self._update_log_entry_count()
 
+    def _log_entry_passes_user_filters(self, entry: dict, level: str, msg: str) -> bool:
+        """Return True if the entry passes the Logs-tab user filters."""
+        try:
+            level_filter = self.query_one("#log-level-filter", Select).value
+            if level_filter != "ALL" and level != level_filter:
+                return False
+            text_filter = self.query_one("#log-filter", Input).value
+            if text_filter and text_filter.lower() not in msg.lower():
+                return False
+            time_range = self.query_one("#log-time-range", Select).value
+            if time_range != "ALL":
+                entry_ts = entry.get("timestamp", "")
+                if entry_ts:
+                    try:
+                        dt = datetime.fromisoformat(entry_ts)
+                        cutoff_map = {"5m": 300, "1h": 3600, "24h": 86400}
+                        if time_range in cutoff_map:
+                            if time.time() - dt.timestamp() > cutoff_map[time_range]:
+                                return False
+                    except Exception:
+                        pass
+        except NoMatches:
+            pass
+        return True
+
+    def _write_log_entry(self, log_widget, entry: dict, apply_filter: bool) -> None:
+        """Format and write a single log entry line to the widget."""
+        level = entry.get("level", "INFO")
+        ts = entry.get("timestamp", "")
+        if isinstance(ts, str) and " " in ts:
+            ts = ts.split(" ")[1] if len(ts.split(" ")) > 1 else ts
+        log_widget.write_line(f"[{level}] {ts} -- {entry.get('message', '')}")
+        if level == "ERROR" and not apply_filter:
+            self.error_count += 1
+
+    def _drain_log_buffer(self, start_seq: int, cap: int, write_entry) -> tuple[int, int]:
+        """Drain new log entries from the TUI handler into the target widget.
+
+        Repeatedly calls `self.log_handler.get_logs(limit=LOG_DRAIN_PAGE_SIZE,
+        from_seq=seq)` until a short page (fewer than a full page -> reached the
+        newest) or an empty page is returned, or the display `cap` of newly
+        written entries has been hit. `write_entry(entry)` is called for each
+        candidate entry and returns True if it was displayed.
+
+        Returns `(new_seq, written)` where `new_seq` is one past the highest
+        entry consumed this drain (the value to store in `_log_seqs` for the
+        next incremental poll) and `written` is how many entries were actually
+        displayed. This bounds the fetch to one page per poll and never skips
+        entries older than the current page.
+        """
+        seq = start_seq
+        written = 0
+        while True:
+            page = self.log_handler.get_logs(limit=LOG_DRAIN_PAGE_SIZE, from_seq=seq)
+            if not page:
+                break
+            last_consumed = 0
+            cap_hit = False
+            for entry in page:
+                last_consumed = max(last_consumed, entry.get("seq", 0))
+                if write_entry(entry):
+                    written += 1
+                    if cap and written >= cap:
+                        cap_hit = True
+                        break
+            seq = last_consumed + 1
+            if cap_hit or len(page) < LOG_DRAIN_PAGE_SIZE:
+                break
+        return seq, written
+
+    def _log_display_cap(self, log_widget) -> int:
+        """Return the widget's line cap (0 => unbounded) for a re-population drain."""
+        cap = getattr(log_widget, "max_lines", None)
+        return cap if isinstance(cap, int) else 0
+
     def _append_logs_to_widget(self, widget_id: str, apply_filter: bool = False, severity_filter: str | None = None) -> int:
-        """Append new log entries to a specific Log widget.
+        """Drain new log entries into a specific Log widget.
 
         Args:
             widget_id: The CSS selector for the Log widget.
             apply_filter: If True, apply user-level text/level/time filters (Logs tab).
             severity_filter: If set to "warnings_and_above", only show WARNING and ERROR.
+
+        Uses a paged drain loop (see `_drain_log_buffer`) so a backlog larger
+        than one page is not silently dropped, and caps new appends at the
+        widget's max_lines so bounded Log widgets stay bounded on re-population.
         """
         try:
             log_widget = self.query_one(widget_id, Log)
@@ -774,54 +933,24 @@ class ProxyTUI(App):
         if widget_id == "#live-log-full":
             log_widget.auto_scroll = self._autoscroll_enabled
 
-        seq = self._log_seqs.get(widget_id, 0)
-        new_entries = self.log_handler.get_logs(limit=50, from_seq=seq)
-        written_count = 0
-        for entry in new_entries:
+        start_seq = self._log_seqs.get(widget_id, 0)
+        cap = self._log_display_cap(log_widget)
+
+        def write_entry(entry: dict) -> bool:
             level = entry.get("level", "INFO")
             msg = entry.get("message", "")
-
-            # Apply severity filter for the overview alert feed
+            # Overview alert feed: only WARNING/ERROR.
             if severity_filter == "warnings_and_above" and level not in ("WARNING", "ERROR"):
-                continue
+                return False
+            # Full log tab: apply user filters.
+            if apply_filter and not self._log_entry_passes_user_filters(entry, level, msg):
+                return False
+            self._write_log_entry(log_widget, entry, apply_filter)
+            return True
 
-            # Apply user filters for the full log tab
-            if apply_filter:
-                try:
-                    level_filter = self.query_one("#log-level-filter", Select).value
-                    if level_filter != "ALL" and level != level_filter:
-                        continue
-                    text_filter = self.query_one("#log-filter", Input).value
-                    if text_filter and text_filter.lower() not in msg.lower():
-                        continue
-                    time_range = self.query_one("#log-time-range", Select).value
-                    if time_range != "ALL":
-                        entry_ts = entry.get("timestamp", "")
-                        if entry_ts:
-                            try:
-                                dt = datetime.fromisoformat(entry_ts)
-                                cutoff_map = {"5m": 300, "1h": 3600, "24h": 86400}
-                                if time_range in cutoff_map:
-                                    if time.time() - dt.timestamp() > cutoff_map[time_range]:
-                                        continue
-                            except Exception:
-                                pass
-                except NoMatches:
-                    pass
-
-            ts = entry.get("timestamp", "")
-            if isinstance(ts, str) and " " in ts:
-                ts = ts.split(" ")[1] if len(ts.split(" ")) > 1 else ts
-            line = f"[{level}] {ts} -- {msg}"
-            log_widget.write_line(line)
-            written_count += 1
-            if level == "ERROR" and not apply_filter:
-                self.error_count += 1
-
-        if new_entries:
-            self._log_seqs[widget_id] = max(e.get("seq", 0) for e in new_entries) + 1
-
-        return written_count
+        new_seq, written = self._drain_log_buffer(start_seq, cap, write_entry)
+        self._log_seqs[widget_id] = new_seq
+        return written
 
     def _update_alert_badge(self, status: dict) -> None:
         """Update alert badge based on quota usage and circuit status.
@@ -853,13 +982,17 @@ class ProxyTUI(App):
                 if status.get("circuit_open"):
                     warnings.append("Circuit")
 
-            # Check for recent failover events (independent of other warnings)
-            from tui_status import failover_alert_should_show
+            # Check for recent failover events (independent of other warnings).
+            # Time-gate on the entry's timestamp_utc (last 5 minutes) so a
+            # single old failover does not linger on the badge until 200 newer
+            # requests scroll it out.
+            from tui_status import failover_alert_should_show, is_failover_recent
             recent_failovers = False
             for entry in self._read_session_log_entries()[-10:]:
                 if len(entry.get("attempted_providers", [])) > 1:
-                    recent_failovers = True
-                    break
+                    if is_failover_recent(entry.get("timestamp_utc")):
+                        recent_failovers = True
+                        break
             if failover_alert_should_show(warnings, recent_failovers):
                 if "Failover" not in warnings:
                     warnings.append("Failover")
@@ -874,18 +1007,22 @@ class ProxyTUI(App):
             pass
 
     def _update_latency_histogram(self) -> None:
-        """Update latency histogram visualization in Metrics tab."""
+        """Update latency histogram visualization in Metrics tab.
+
+        Computes over the UNION of all per-provider tracker values so the
+        Metrics tab reflects every provider's latencies (not just "primary").
+        """
         try:
             panel = self.query_one("#latency-histogram-panel", Static)
         except NoMatches:
             return
 
-        latencies = self.latency_tracker.latencies
+        stats = self._latency_union_stats()
+        latencies = self._latency_union_values()
         if not latencies:
             panel.update("")
             return
 
-        # Define buckets
         buckets = [
             ("0-100ms", 0, 100),
             ("100-250ms", 100, 250),
@@ -893,15 +1030,15 @@ class ProxyTUI(App):
             ("500-1s", 500, 1000),
             ("1s+", 1000, float("inf")),
         ]
-        
+
         counts = []
         for _, low, high in buckets:
             count = sum(1 for l in latencies if low <= l < high)
             counts.append(count)
-        
+
         max_count = max(counts) if counts else 1
         max_bar_width = 40
-        
+
         lines = []
         for i, (label, _, _) in enumerate(buckets):
             if max_count > 0:
@@ -910,13 +1047,12 @@ class ProxyTUI(App):
                 bar_len = 0
             bar = "#" * bar_len
             lines.append(f"  {label:>10} | {bar} {counts[i]}")
-        
-        p50 = self.latency_tracker.p50()
-        p95 = self.latency_tracker.p95()
-        p99 = self.latency_tracker.p99()
-        avg = self.latency_tracker.avg()
-        lines.append(f"  avg: {avg}ms | p50: {p50}ms | p95: {p95}ms | p99: {p99}ms")
-        
+
+        lines.append(
+            f"  avg: {stats['avg']}ms | p50: {stats['p50']}ms | "
+            f"p95: {stats['p95']}ms | p99: {stats['p99']}ms"
+        )
+
         panel.update("\n".join(lines))
 
     def _read_session_log_entries(self) -> list[dict]:
@@ -945,7 +1081,11 @@ class ProxyTUI(App):
             self._session_log_inode = inode
 
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            # errors="replace" so a single undecodable byte can never raise and
+            # freeze the reader (offset would stop advancing and the same bytes
+            # would be re-read every poll). Malformed JSON lines are already
+            # skipped by the JSON-parse step below.
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 f.seek(self._session_log_offset)
                 data = f.read()
                 self._session_log_offset = f.tell()
@@ -962,6 +1102,8 @@ class ProxyTUI(App):
                 return list(self._session_log_tail)
             self._session_log_partial = parts[-1] if parts else ""
             lines = parts[:-1] if parts else []
+            if len(self._session_log_partial.encode("utf-8", errors="replace")) > SESSION_LOG_PARTIAL_MAX_BYTES:
+                self._session_log_partial = ""
 
         for line in lines:
             line = line.strip()
@@ -990,13 +1132,11 @@ class ProxyTUI(App):
                 continue
             model = entry.get("model", "unknown")
             request_id = entry.get("request_id", "")[:8]
-            timestamp = entry.get("timestamp", "")
+            timestamp = entry.get("timestamp_utc", "")
             if timestamp:
-                try:
-                    dt = datetime.fromisoformat(timestamp)
-                    time_str = dt.strftime("%H:%M:%S")
-                except Exception:
-                    time_str = timestamp
+                from tui_status import parse_timestamp_utc
+                dt = parse_timestamp_utc(timestamp)
+                time_str = dt.strftime("%H:%M:%S") if dt else timestamp
             else:
                 time_str = "unknown"
 
@@ -1205,13 +1345,21 @@ class ProxyTUI(App):
         import json
         
         log_dir = "session_logs"
-        os.makedirs(log_dir, exist_ok=True)
-        
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except OSError as exc:
+            try:
+                count_widget = self.query_one("#log-entry-count", Static)
+                count_widget.update(f"Export failed: {exc}")
+            except NoMatches:
+                pass
+            return
+
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         filepath = os.path.join(log_dir, f"tui_export_{timestamp}.log")
         
-        # Get all logs from buffer
-        all_logs = list(self.log_handler.buffer)
+        # Snapshot under the handler lock so background emitters cannot mutate it.
+        all_logs = self.log_handler.snapshot()
         
         # Apply current filters
         try:
@@ -1257,14 +1405,24 @@ class ProxyTUI(App):
             
             filtered.append(entry)
         
-        # Write to file
-        with open(filepath, "w", encoding="utf-8") as f:
-            for entry in filtered:
-                ts = entry.get("timestamp", "")
-                level = entry.get("level", "INFO")
-                msg = entry.get("message", "")
-                f.write(f"[{level}] {ts} -- {msg}\n")
-        
+        # Write to file. Blocking I/O on the UI thread — guard against OSError
+        # (disk full, permissions, read-only FS, ...) so a failed export
+        # surfaces a message instead of a traceback.
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                for entry in filtered:
+                    ts = entry.get("timestamp", "")
+                    level = entry.get("level", "INFO")
+                    msg = entry.get("message", "")
+                    f.write(f"[{level}] {ts} -- {msg}\n")
+        except OSError as exc:
+            try:
+                count_widget = self.query_one("#log-entry-count", Static)
+                count_widget.update(f"Export failed: {exc}")
+            except NoMatches:
+                pass
+            return
+
         # Show confirmation in entry count
         try:
             count_widget = self.query_one("#log-entry-count", Static)
@@ -1345,11 +1503,12 @@ class ProxyTUI(App):
                 pass
         elif event.input.id == "model-filter":
             self._model_filter = event.value
-            try:
-                status = self.rate_limiter.status()
+            # Reuse the raw status already cached by the poller (a fresh
+            # status() per keystroke builds the dict 7x under the limiter
+            # lock in multi-provider mode) rather than re-querying.
+            status = self._last_raw_status
+            if status:
                 self._update_model_table(status)
-            except NoMatches:
-                pass
         elif event.input.id == "config-filter":
             self._config_filter = event.value
             self._update_config_table_filtered()
@@ -1378,11 +1537,10 @@ class ProxyTUI(App):
                 pass
         elif event.select.id == "model-sort":
             self._model_sort_key = event.value
-            try:
-                status = self.rate_limiter.status()
+            # Reuse the poller's cached status rather than a fresh status() call.
+            status = self._last_raw_status
+            if status:
                 self._update_model_table(status)
-            except NoMatches:
-                pass
 
 
     def _signal_proxy_shutdown(self) -> None:

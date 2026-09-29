@@ -57,6 +57,10 @@ class TokenWindowCounter:
     the actual TPM window — tokens remain 'used' until they age out of
     the window.
 
+    A running ``_used_total`` keeps ``available``/``try_reserve`` O(pruned)
+    instead of O(window): ``_prune`` subtracts expired amounts as it evicts,
+    so the hot path never sums the whole deque while holding the lock.
+
     Pattern: reserve before send, reconcile after response, refund on error.
     """
 
@@ -66,21 +70,25 @@ class TokenWindowCounter:
         self.max_size = max_size
         self.window: deque[tuple[float, int]] = deque()
         self.reserved = 0  # tokens reserved for in-flight requests
+        self._used_total = 0  # sum of amounts currently in window
+        self._last_ts = 0.0  # newest recorded stamp (keeps the deque sorted)
         self._lock = threading.Lock()
 
     def _prune(self, now: float) -> None:
         """Must be called with self._lock held."""
         cutoff = now - self.window_seconds
         while self.window and self.window[0][0] < cutoff:
-            self.window.popleft()
+            _, amount = self.window.popleft()
+            self._used_total -= amount
         # Enforce max_size to prevent unbounded growth
         while len(self.window) > self.max_size:
-            self.window.popleft()
+            _, amount = self.window.popleft()
+            self._used_total -= amount
 
     def _tokens_used(self, now: float) -> int:
         """Must be called with self._lock held."""
         self._prune(now)
-        return sum(amount for _, amount in self.window)
+        return self._used_total
 
     def available(self, now: float | None = None) -> float:
         """Return currently available tokens (capacity minus tokens used in window, minus reservations)."""
@@ -104,11 +112,19 @@ class TokenWindowCounter:
         Release the reservation and record actual token usage in the window.
         The reservation covers `estimated`; actual consumption is recorded
         so the window accurately reflects real usage.
+
+        The timestamp is clamped to the newest recorded stamp so a stale or
+        out-of-order `now` cannot append an out-of-order entry — front-only
+        pruning assumes the deque stays sorted, and `_used_total` is kept
+        consistent by `_prune` subtracting evicted amounts.
         """
         with self._lock:
             self.reserved = max(0, self.reserved - estimated)
             ts = now if now is not None else time.monotonic()
+            ts = max(ts, self._last_ts)
+            self._last_ts = ts
             self.window.append((ts, actual))
+            self._used_total += actual
             self._prune(ts)
 
     def refund(self, tokens: int) -> None:
@@ -168,11 +184,16 @@ class RateLimiter:
     Thread-safe via asyncio.Lock for concurrent request handling.
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, probe_max_hold_s: float = 300.0):
         sf = config["safety_factor"]
         self.rpm_limit = int(config["rpm_limit"] * sf)
         self.tpm_limit = int(config["tpm_limit"] * sf)
         self.rps_limit = max(1, int(self.rpm_limit / 60))
+
+        if self.rpm_limit <= 0 or self.tpm_limit <= 0:
+            _log(logging.WARNING, "provider rate limit is zero: all admitted traffic will be "
+                 "denied (0 is treated as deny-all, not unlimited)",
+                 rpm_limit=self.rpm_limit, tpm_limit=self.tpm_limit)
 
         self.rpm_window = SlidingWindowCounter(60)
         self.tpm_bucket = TokenWindowCounter(self.tpm_limit)
@@ -203,6 +224,11 @@ class RateLimiter:
         self.circuit_threshold = config.get("circuit_threshold", 10)
         self.circuit_state = "CLOSED"
         self.circuit_probe_in_flight = False
+        # Probe-claim watchdog: monotonic timestamp of the current probe claim.
+        # A HALF_OPEN probe held for longer than probe_max_hold_s without a
+        # result or release_probe() is reclaimed by can_attempt_probe().
+        self.circuit_probe_claimed_at = 0.0
+        self.probe_max_hold_s = float(probe_max_hold_s)
 
         # Per-model usage tracking (capped to prevent unbounded growth)
         self.model_usage: dict[str, ModelStats] = {}
@@ -220,38 +246,43 @@ class RateLimiter:
         When estimated_tokens > 0, both RPM and TPM must have headroom.
         Returns (allowed, reason, wait_seconds).
 
-        TPM wait estimates are computed after releasing ``_lock`` so the
-        window walk does not hold the admit lock; ``max(1.0, wait)`` keeps
-        the estimate conservative (never under-wait relative to the floor).
+        Lock discipline: never hold ``_lock`` (``last_request_time`` RPS stamp)
+        while calling into ``rpm_window`` or ``tpm_bucket`` — both are
+        thread-safe with their own locks. Holding the admit lock across them
+        blocks the event loop for every concurrent request, which surfaces
+        as lock acquisition timeouts under load.
         """
+        now_mono = time.monotonic()
+        # RPM check — SlidingWindowCounter has its own lock; no admit lock held.
+        rpm_count = self.rpm_window.count(now_mono)
+        if rpm_count >= self.rpm_limit:
+            wait = 60.0 / max(1, self.rpm_limit)
+            _log(logging.DEBUG, "can_proceed denied: RPM limit reached", wait_seconds=wait)
+            return False, "RPM limit reached", wait
+
+        # TPM check — uses tpm_bucket's own lock, not RateLimiter._lock
         tpm_denied = False
         avail_snap = 0.0
-        async with self._lock:
-            now_mono = time.monotonic()
+        if estimated_tokens > 0:
+            avail = self.tpm_bucket.available(now_mono)
+            if avail < estimated_tokens:
+                tpm_denied = True
+                avail_snap = avail
 
-            rpm_count = self.rpm_window.count(now_mono)
-            if rpm_count >= self.rpm_limit:
-                wait = 60.0 / max(1, self.rpm_limit)
-                _log(logging.DEBUG, "can_proceed denied: RPM limit reached", wait_seconds=wait)
-                return False, "RPM limit reached", wait
+        if not tpm_denied:
+            # RPS snapshot under admit lock: single float read, released immediately.
+            async with self._lock:
+                last_req = self.last_request_time
+            min_gap = 1.0 / self.rps_limit
+            time_since_last = now_mono - last_req
+            if time_since_last < min_gap:
+                _log(logging.DEBUG, "can_proceed denied: RPS spacing",
+                     wait_seconds=min_gap - time_since_last)
+                return False, "RPS spacing", min_gap - time_since_last
 
-            if estimated_tokens > 0:
-                avail = self.tpm_bucket.available(now_mono)
-                if avail < estimated_tokens:
-                    tpm_denied = True
-                    avail_snap = avail
+            return True, "ok", 0.0
 
-            if not tpm_denied:
-                min_gap = 1.0 / self.rps_limit
-                time_since_last = now_mono - self.last_request_time
-                if time_since_last < min_gap:
-                    _log(logging.DEBUG, "can_proceed denied: RPS spacing",
-                         wait_seconds=min_gap - time_since_last)
-                    return False, "RPS spacing", min_gap - time_since_last
-
-                return True, "ok", 0.0
-
-        # Release RateLimiter._lock before walking the TPM window.
+        # TPM window walk runs with no admit lock held.
         wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, time.monotonic())
         wait = max(1.0, wait)
         _log(logging.DEBUG, "can_proceed denied: TPM limit reached", wait_seconds=wait,
@@ -260,85 +291,96 @@ class RateLimiter:
         return False, "TPM limit reached", wait
 
     async def try_admit(self, estimated_tokens: int = 0) -> tuple[bool, str, float]:
-        """Under one lock: same checks as can_proceed; on success reserve TPM.
+        """Check rate limits and reserve TPM if allowed.
 
         Does NOT charge RPM (still recorded on completion).
         Returns (allowed, reason, wait_seconds).
 
-        TPM wait estimates run after releasing ``_lock`` (bucket uses its own
-        lock); wait is floored at 1.0s so estimates stay conservative.
+        Lock discipline: ``rpm_window`` and ``tpm_bucket`` are thread-safe —
+        call them with no admit lock held. Hold ``_lock`` only for the
+        ``last_request_time`` read-modify-write (single float, no other
+        locks, no I/O). This keeps admit-lock hold time in microseconds and
+        avoids the asyncio→threading nesting that stalls the event loop.
         """
-        tpm_denied = False
-        avail_snap = 0.0
+        now_mono = time.monotonic()
+
+        # Phase 1: RPM check — no admit lock (SlidingWindowCounter has its own).
+        if self.rpm_window.count(now_mono) >= self.rpm_limit:
+            wait = 60.0 / max(1, self.rpm_limit)
+            _log(logging.DEBUG, "try_admit denied: RPM limit reached", wait_seconds=wait)
+            return False, "RPM limit reached", wait
+
+        # Phase 2: RPS spacing pre-check — single float read, lock released at once.
+        min_gap = 1.0 / self.rps_limit
+        async with self._lock:
+            last_req = self.last_request_time
+        if now_mono - last_req < min_gap:
+            _log(logging.DEBUG, "try_admit denied: RPS spacing",
+                 wait_seconds=min_gap - (now_mono - last_req))
+            return False, "RPS spacing", min_gap - (now_mono - last_req)
+
+        # Phase 3: TPM reservation — bucket's own lock only, no admit lock held.
+        if estimated_tokens > 0:
+            if not self.tpm_bucket.try_reserve(estimated_tokens):
+                avail_snap = self.tpm_bucket.available(now_mono)
+                wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, time.monotonic())
+                wait = max(1.0, wait)
+                _log(logging.DEBUG, "try_admit denied: TPM limit reached", wait_seconds=wait,
+                     estimated_tokens=estimated_tokens, available_tokens=int(avail_snap),
+                     shortfall=estimated_tokens - avail_snap)
+                return False, "TPM limit reached", wait
+
+        # Phase 4: Stamp last_request_time and re-check RPS (another request may
+        # have stamped while we were doing TPM work). The lock is held only for
+        # the single-float read-modify-write; the refund and log below run
+        # after it is released (no other locks, no I/O inside the lock).
+        denied = False
         async with self._lock:
             now_mono = time.monotonic()
+            time_since_last = now_mono - self.last_request_time
+            denied = time_since_last < min_gap
+            if not denied:
+                self.last_request_time = now_mono
 
-            rpm_count = self.rpm_window.count(now_mono)
-            if rpm_count >= self.rpm_limit:
-                wait = 60.0 / max(1, self.rpm_limit)
-                _log(logging.DEBUG, "try_admit denied: RPM limit reached", wait_seconds=wait)
-                return False, "RPM limit reached", wait
-
+        if denied:
+            # Another request beat us; refund TPM and deny (outside the lock).
             if estimated_tokens > 0:
-                avail = self.tpm_bucket.available(now_mono)
-                if avail < estimated_tokens:
-                    tpm_denied = True
-                    avail_snap = avail
+                self.tpm_bucket.refund(estimated_tokens)
+            _log(logging.DEBUG, "try_admit denied: RPS spacing (post-TPM)",
+                 wait_seconds=min_gap - time_since_last)
+            return False, "RPS spacing", min_gap - time_since_last
 
-            if not tpm_denied:
-                min_gap = 1.0 / self.rps_limit
-                time_since_last = now_mono - self.last_request_time
-                if time_since_last < min_gap:
-                    _log(logging.DEBUG, "try_admit denied: RPS spacing",
-                         wait_seconds=min_gap - time_since_last)
-                    return False, "RPS spacing", min_gap - time_since_last
-
-                if estimated_tokens > 0:
-                    if not self.tpm_bucket.try_reserve(estimated_tokens):
-                        tpm_denied = True
-                        avail_snap = self.tpm_bucket.available(now_mono)
-                    else:
-                        # Admission-time RPS shaping: stamp under asyncio.Lock so waiters
-                        # see spacing immediately (same lock as the RPS check above).
-                        self.last_request_time = time.monotonic()
-                        return True, "ok", 0.0
-                else:
-                    self.last_request_time = time.monotonic()
-                    return True, "ok", 0.0
-
-        wait = self.tpm_bucket.wait_seconds_for(estimated_tokens, time.monotonic())
-        wait = max(1.0, wait)
-        _log(logging.DEBUG, "try_admit denied: TPM limit reached", wait_seconds=wait,
-             estimated_tokens=estimated_tokens, available_tokens=int(avail_snap),
-             shortfall=estimated_tokens - avail_snap)
-        return False, "TPM limit reached", wait
+        return True, "ok", 0.0
 
     async def reserve_tokens(self, estimated_tokens: int) -> bool:
         """
         Reserve TPM before sending to upstream. Call this AFTER can_proceed()
         returns True but BEFORE forwarding the request. Returns False if the
         bucket no longer has sufficient tokens (race condition guard).
+
+        Lock-free w.r.t. the admit lock: the bucket is thread-safe on its own,
+        so taking ``_lock`` here would only serialize failover retries.
         """
-        async with self._lock:
-            if estimated_tokens <= 0:
-                return True
-            return self.tpm_bucket.try_reserve(estimated_tokens)
+        if estimated_tokens <= 0:
+            return True
+        return self.tpm_bucket.try_reserve(estimated_tokens)
 
     async def record_request(self, tokens_used: int = 0, now: float | None = None):
         """Record a successfully completed request. Does NOT touch TPM bucket —
         that is handled by reconcile_tokens() which releases the reservation.
 
-        Lock order: asyncio.Lock for RPM only, then _thread_lock for TUI counters.
-        Never hold both at once.
+        Lock-free w.r.t. the admit lock except for the ``last_request_time``
+        stamp: ``rpm_window`` has its own lock and counters publish under
+        ``_thread_lock``. The stamp is a single float write — no other locks,
+        no I/O — so hold time stays in microseconds. Never hold both at once.
         """
         now = now or time.monotonic()
+        self.rpm_window.add(now)
         async with self._lock:
-            self.rpm_window.add(now)
-            local_tokens = tokens_used
             self.last_request_time = now
         with self._thread_lock:
             self.total_forwarded += 1
-            self.total_tokens_consumed += local_tokens
+            self.total_tokens_consumed += tokens_used
 
     async def record_model_stats(self, model: str, tokens: int, latency_ms: float, is_429: bool = False) -> None:
         """Record per-model usage statistics under _thread_lock only (TUI-visible)."""
@@ -375,29 +417,51 @@ class RateLimiter:
         request_bytes: int,
         response_bytes: int,
         is_429: bool = False,
-        circuit_success: bool = True,
+        circuit_success: bool | None = True,
     ) -> None:
-        """Reconcile TPM/RPM under asyncio.Lock, then publish TUI counters under
-        _thread_lock. Never hold both locks at the same time.
+        """Reconcile TPM/RPM without holding the admit lock across bucket work.
+
+        ``tpm_bucket`` and ``rpm_window`` are thread-safe on their own; the
+        admit lock is held only for the single-float ``last_request_time``
+        stamp. TUI counters publish under ``_thread_lock``. Never hold both
+        locks at the same time.
+
+        ``circuit_success``: True/False records the outcome against the
+        circuit breaker; None (e.g. an aborted stream) leaves circuit state
+        and the failure count untouched while still reconciling TPM/RPM and
+        recording model stats and latency.
         """
         model_key = model or "unknown"
+
+        # Phase 1: TPM/RPM reconciliation — no admit lock across bucket calls.
+        if estimated_tokens > 0:
+            self.tpm_bucket.reconcile(estimated_tokens, actual_tokens)
+        now = time.monotonic()
+        self.rpm_window.add(now)
         async with self._lock:
-            if estimated_tokens > 0:
-                self.tpm_bucket.reconcile(estimated_tokens, actual_tokens)
-            now = time.monotonic()
-            self.rpm_window.add(now)
-            local_tokens = actual_tokens
             self.last_request_time = now
 
+        # Phase 2: Publish TUI-visible counters under _thread_lock (no asyncio lock held)
         with self._thread_lock:
             self.total_forwarded += 1
-            self.total_tokens_consumed += local_tokens
+            self.total_tokens_consumed += actual_tokens
 
-            if circuit_success:
-                self.circuit_failure_count = 0
-                self.circuit_open_until = 0.0
-                self.circuit_state = "CLOSED"
-                self.circuit_probe_in_flight = False
+            if circuit_success is None:
+                # Do not touch circuit state or the failure count
+                # (e.g. aborted streams carry no usable upstream outcome).
+                pass
+            elif circuit_success:
+                # Only force CLOSED from CLOSED (clearing stale counters) or
+                # HALF_OPEN (a probe success closing is the intended
+                # HALF_OPEN path). A stale success that arrives after a
+                # concurrent failure opened the circuit must not defeat the
+                # fresh OPEN: the cooldown deadline, failure count, and the
+                # probe flag (already cleared by that failure) all stay.
+                if self.circuit_state in ("CLOSED", "HALF_OPEN"):
+                    self.circuit_failure_count = 0
+                    self.circuit_open_until = 0.0
+                    self.circuit_state = "CLOSED"
+                    self.circuit_probe_in_flight = False
             else:
                 self.circuit_probe_in_flight = False
                 self.circuit_failure_count += 1
@@ -441,22 +505,25 @@ class RateLimiter:
         Release the reservation and adjust the bucket after receiving the real
         token count. The reservation is always for `estimated`; actual usage
         is reconciled by draining or refunding the difference.
+
+        Direct bucket call — no admit lock, so failover retries never queue
+        behind admits.
         """
-        async with self._lock:
-            if estimated <= 0:
-                return
-            self.tpm_bucket.reconcile(estimated, actual, now=now)
+        if estimated <= 0:
+            return
+        self.tpm_bucket.reconcile(estimated, actual, now=now)
 
     async def refund_tokens(self, estimated_tokens: int) -> None:
-        """Refund reserved tokens when an upstream request fails permanently."""
-        async with self._lock:
-            if estimated_tokens > 0:
-                self.tpm_bucket.refund(estimated_tokens)
+        """Refund reserved tokens when an upstream request fails permanently.
+
+        Direct bucket call — no admit lock.
+        """
+        if estimated_tokens > 0:
+            self.tpm_bucket.refund(estimated_tokens)
 
     async def remaining_tpm(self) -> int:
-        """Return available TPM in the current minute window."""
-        async with self._lock:
-            return int(self.tpm_bucket.available())
+        """Return available TPM in the current minute window (lock-free read)."""
+        return int(self.tpm_bucket.available())
 
     def is_queue_full(self) -> bool:
         """Check if the queue is full. Thread-safe read without lock."""
@@ -469,20 +536,36 @@ class RateLimiter:
     def can_attempt_probe(self) -> bool:
         """Admit traffic, or claim the single HALF_OPEN probe after cooldown.
 
-        CLOSED → always True. OPEN during cooldown → False. OPEN after cooldown →
-        first caller transitions to HALF_OPEN with ``circuit_probe_in_flight`` and
-        returns True; later callers return False until the probe resolves.
+        CLOSED -> always True. OPEN during cooldown -> False. OPEN after
+        cooldown -> the first caller transitions to HALF_OPEN with
+        ``circuit_probe_in_flight`` and returns True; later callers return
+        False until the probe resolves. A HALF_OPEN probe held longer than
+        ``probe_max_hold_s`` without a recorded result or ``release_probe()``
+        is reclaimed by the watchdog (timestamp reset, probe stays in
+        flight) so the provider is not denied forever while
+        ``circuit_is_open()`` still reports the cooldown as elapsed.
         """
         with self._thread_lock:
             if self.circuit_state == "CLOSED":
                 return True
             if self.circuit_state == "HALF_OPEN":
+                if self.circuit_probe_in_flight:
+                    now_mono = time.monotonic()
+                    held = now_mono - self.circuit_probe_claimed_at
+                    if held > self.probe_max_hold_s:
+                        # Watchdog: the holder never recorded a result and
+                        # never released the claim. Reclaim the probe.
+                        self.circuit_probe_claimed_at = now_mono
+                        _log(logging.WARNING, "probe-claim watchdog: reclaiming stuck HALF_OPEN probe",
+                             held_seconds=round(held, 1), limit_seconds=self.probe_max_hold_s)
+                        return True
                 return False
             # OPEN
             if self.circuit_open_until > time.monotonic():
                 return False
             self.circuit_state = "HALF_OPEN"
             self.circuit_probe_in_flight = True
+            self.circuit_probe_claimed_at = time.monotonic()
             return True
 
     def release_probe(self) -> None:
@@ -501,12 +584,20 @@ class RateLimiter:
                 self.circuit_open_until = time.monotonic() + self.circuit_cooldown
 
     async def record_circuit_success(self) -> None:
-        """Reset failure counter on a successful upstream response (TUI-visible)."""
+        """Reset failure counter on a successful upstream response (TUI-visible).
+
+        Only closes the breaker from CLOSED (clearing counters) or HALF_OPEN
+        (probe success closing is the intended HALF_OPEN path). A stale
+        success that arrives after a concurrent failure opened the circuit
+        leaves the fresh OPEN state, its cooldown deadline, and the failure
+        count untouched.
+        """
         with self._thread_lock:
-            self.circuit_failure_count = 0
-            self.circuit_open_until = 0.0
-            self.circuit_state = "CLOSED"
-            self.circuit_probe_in_flight = False
+            if self.circuit_state in ("CLOSED", "HALF_OPEN"):
+                self.circuit_failure_count = 0
+                self.circuit_open_until = 0.0
+                self.circuit_state = "CLOSED"
+                self.circuit_probe_in_flight = False
 
     async def record_circuit_failure(self) -> bool:
         """Record an upstream failure. Returns True if circuit should open."""
@@ -648,6 +739,9 @@ class MultiProviderRateLimiter:
         quinary_config: dict | None = None,
         senary_config: dict | None = None,
         septenary_config: dict | None = None,
+        octonary_config: dict | None = None,
+        nonary_config: dict | None = None,
+        decenary_config: dict | None = None,
     ):
         self.primary = RateLimiter(primary_config)
         self.primary_config = primary_config
@@ -669,6 +763,15 @@ class MultiProviderRateLimiter:
 
         self.septenary: RateLimiter | None = None
         self.septenary_config = septenary_config
+
+        self.octonary: RateLimiter | None = None
+        self.octonary_config = octonary_config
+
+        self.nonary: RateLimiter | None = None
+        self.nonary_config = nonary_config
+
+        self.decenary: RateLimiter | None = None
+        self.decenary_config = decenary_config
 
         if secondary_config:
             self.secondary = RateLimiter(secondary_config)
@@ -736,12 +839,55 @@ class MultiProviderRateLimiter:
             else:
                 _log(logging.INFO, "septenary rate limiter created with shared limits")
 
-        # Global pending request counter (shared across providers for queue management)
+        if octonary_config:
+            self.octonary = RateLimiter(octonary_config)
+            limits_differ = any(
+                primary_config.get(k) != octonary_config.get(k)
+                for k in ["rpm_limit", "tpm_limit"]
+            )
+            if limits_differ:
+                _log(logging.INFO, "octonary rate limiter created with independent limits")
+            else:
+                _log(logging.INFO, "octonary rate limiter created with shared limits")
+
+        if nonary_config:
+            self.nonary = RateLimiter(nonary_config)
+            limits_differ = any(
+                primary_config.get(k) != nonary_config.get(k)
+                for k in ["rpm_limit", "tpm_limit"]
+            )
+            if limits_differ:
+                _log(logging.INFO, "nonary rate limiter created with independent limits")
+            else:
+                _log(logging.INFO, "nonary rate limiter created with shared limits")
+
+        if decenary_config:
+            self.decenary = RateLimiter(decenary_config)
+            limits_differ = any(
+                primary_config.get(k) != decenary_config.get(k)
+                for k in ["rpm_limit", "tpm_limit"]
+            )
+            if limits_differ:
+                _log(logging.INFO, "decenary rate limiter created with independent limits")
+            else:
+                _log(logging.INFO, "decenary rate limiter created with shared limits")
+
+        # Global pending request counter (shared across providers for queue management).
+        # Guarded by a threading.Lock (never an asyncio.Lock): increments run on
+        # the event loop but reads come from the TUI thread, and an asyncio.Lock
+        # here would serialize every admit/decrement against each other while
+        # adding nothing — the critical section is a single integer op.
         self._pending_requests = 0
-        self._pending_lock = asyncio.Lock()  # Protects _pending_requests from concurrent modification
+        self._pending_lock = threading.Lock()
 
     def get_limiter_for_provider(self, provider_name: str) -> RateLimiter:
         """Get the appropriate rate limiter for a provider."""
+        if provider_name == "decenary" and self.decenary:
+            return self.decenary
+        if provider_name == "nonary" and self.nonary:
+            return self.nonary
+        if provider_name == "octonary" and self.octonary:
+            return self.octonary
         if provider_name == "septenary" and self.septenary:
             return self.septenary
         if provider_name == "senary" and self.senary:
@@ -767,13 +913,13 @@ class MultiProviderRateLimiter:
         self._pending_requests = max(0, value)
 
     async def increment_pending(self) -> None:
-        """Atomically increment pending_requests counter."""
-        async with self._pending_lock:
+        """Atomically increment pending_requests counter (thread-safe, non-blocking)."""
+        with self._pending_lock:
             self._pending_requests += 1
 
     async def decrement_pending(self) -> None:
-        """Atomically decrement pending_requests counter."""
-        async with self._pending_lock:
+        """Atomically decrement pending_requests counter (thread-safe, non-blocking)."""
+        with self._pending_lock:
             self._pending_requests = max(0, self._pending_requests - 1)
 
     @property
@@ -795,6 +941,12 @@ class MultiProviderRateLimiter:
             self.senary.max_queue_size = value
         if self.septenary:
             self.septenary.max_queue_size = value
+        if self.octonary:
+            self.octonary.max_queue_size = value
+        if self.nonary:
+            self.nonary.max_queue_size = value
+        if self.decenary:
+            self.decenary.max_queue_size = value
 
     def is_queue_full(self) -> bool:
         return self._pending_requests > self.primary.max_queue_size
@@ -880,7 +1032,7 @@ class MultiProviderRateLimiter:
         primary_status = self.primary.status()
         result = {
             "primary": primary_status,
-            "shared_limits": self.secondary is None and self.tertiary is None and self.quaternary is None and self.quinary is None and self.senary is None and self.septenary is None,
+            "shared_limits": self.secondary is None and self.tertiary is None and self.quaternary is None and self.quinary is None and self.senary is None and self.septenary is None and self.octonary is None and self.nonary is None and self.decenary is None,
         }
 
         secondary_status = self.secondary.status() if self.secondary else None
@@ -889,6 +1041,9 @@ class MultiProviderRateLimiter:
         quinary_status = self.quinary.status() if self.quinary else None
         senary_status = self.senary.status() if self.senary else None
         septenary_status = self.septenary.status() if self.septenary else None
+        octonary_status = self.octonary.status() if self.octonary else None
+        nonary_status = self.nonary.status() if self.nonary else None
+        decenary_status = self.decenary.status() if self.decenary else None
 
         if self.secondary:
             result["secondary"] = secondary_status
@@ -920,6 +1075,21 @@ class MultiProviderRateLimiter:
         else:
             result["septenary"] = None
 
+        if self.octonary:
+            result["octonary"] = octonary_status
+        else:
+            result["octonary"] = None
+
+        if self.nonary:
+            result["nonary"] = nonary_status
+        else:
+            result["nonary"] = None
+
+        if self.decenary:
+            result["decenary"] = decenary_status
+        else:
+            result["decenary"] = None
+
         # Aggregate stats across all providers (using thread-safe status dicts)
         all_statuses = [primary_status]
         if secondary_status:
@@ -934,6 +1104,12 @@ class MultiProviderRateLimiter:
             all_statuses.append(senary_status)
         if septenary_status:
             all_statuses.append(septenary_status)
+        if octonary_status:
+            all_statuses.append(octonary_status)
+        if nonary_status:
+            all_statuses.append(nonary_status)
+        if decenary_status:
+            all_statuses.append(decenary_status)
 
         # Sum counters across all providers
         total_forwarded = sum(s.get("total_forwarded", 0) for s in all_statuses)

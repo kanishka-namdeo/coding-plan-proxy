@@ -65,11 +65,11 @@ Grouped network, timeout, connection, buffering, logging, and per-provider limit
 
 ### Multi-Provider Routing
 
-**Seven providers supported**
-Route requests to DashScope (primary), MIMO (secondary), OpenLux (tertiary), ARK/BytePlus (quaternary), Meta AI/Muse Spark (quinary), DeepSeek (senary), or GLM/Z.ai (septenary).
+**Ten provider entries supported**
+Route requests to DashScope (primary), MIMO (secondary), OpenLux (tertiary), ARK/BytePlus (quaternary), Meta AI/Muse Spark (quinary), DeepSeek (senary), GLM/Z.ai (septenary), or Agnes AI (octonary/nonary/decenary). Agnes AI is a single vendor with a single Token Plan key, but it contributes three entries — `Agnes Text`, `Agnes Image`, and `Agnes Video` — so each modality's distinct upstream RPM cap gets its own rate limiter. Only the create-task `POST /v1/videos` is proxyable for Agnes Video; poll the result directly against Agnes (see `.env.example`).
 
 **Provider pinning**
-Force a specific provider by prefixing the model name: `openlux/gpt-5.6-sol`, `deepseek/deepseek-v4-flash`, `glm/glm-5.3`. Available slugs: `dashscope`, `mimo`, `openlux`, `ark`, `metaspark`, `deepseek`, `glm`, `zai`.
+Force a specific provider by prefixing the model name: `openlux/gpt-5.6-sol`, `deepseek/deepseek-flash`, `glm/glm-5.3`, `agnes/agnes-3.0-flash`, `agnes-image/agnes-image-2.1-flash`, `agnes-video/agnes-video-2.5-flash`. Available slugs: `dashscope`, `mimo`, `openlux`, `ark`, `metaspark`, `deepseek`, `glm`, `zai`, `agnes`, `agnes-image`, `agnes-video`. Agnes model IDs are unique across all providers, so a bare model name routes to Agnes without a pin; the pinnable ordinal names (`octonary`, `nonary`, `decenary`) also work.
 
 **Cross-provider failover**
 Overlapping models (present in multiple provider lists) support automatic failover on 429/5xx/timeout. After per-provider retries are exhausted, the handler advances to the next available provider with a closed circuit.
@@ -162,16 +162,23 @@ Each provider has its own environment variables for API key, base URL, and rate 
 | Meta AI (quinary) | `META_AI_API_KEY` | `META_AI_TARGET_BASE` |
 | DeepSeek (senary) | `DEEPSEEK_API_KEY` | `DEEPSEEK_TARGET_BASE` |
 | GLM (septenary) | `GLM_API_KEY` | `GLM_TARGET_BASE` |
+| Agnes Text (octonary) | `AGNES_API_KEY` | `AGNES_TARGET_BASE` |
+| Agnes Image (nonary) | `AGNES_API_KEY` | `AGNES_TARGET_BASE` |
+| Agnes Video (decenary) | `AGNES_API_KEY` | `AGNES_TARGET_BASE` |
 
-Override rate limits per provider with `SECONDARY_RPM_LIMIT`, `TERTIARY_TPM_LIMIT`, etc.
+All three Agnes entries share one Token Plan key and base URL (`AGNES_API_KEY`, `AGNES_TARGET_BASE`, default `https://apihub.agnes-ai.com/v1`); they exist as separate entries only so each modality keeps its own rate limiter.
+
+Override rate limits per provider with `SECONDARY_RPM_LIMIT`, `TERTIARY_TPM_LIMIT`, `OCTONARY_RPM_LIMIT`, `NONARY_MAX_RETRIES`, `DECENARY_BASE_BACKOFF`, etc.
 
 ### Failover Order
 
 Customize the cross-provider failover order with `MODEL_FALLBACK_ORDER`:
 
 ```bash
-MODEL_FALLBACK_ORDER=septenary,senary,quinary,quaternary,tertiary,secondary,primary
+MODEL_FALLBACK_ORDER=decenary,nonary,octonary,septenary,senary,quinary,quaternary,tertiary,secondary,primary
 ```
+
+The default order is `decenary` → `nonary` → `octonary` → `septenary` → `senary` → `quinary` → `quaternary` → `tertiary` → `secondary` → `primary` (descending ordinal, newest provider first).
 
 ## Running Tests
 

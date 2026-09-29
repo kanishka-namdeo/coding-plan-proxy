@@ -28,10 +28,18 @@ def normalize_model_name(model_name: str) -> str:
     Cursor and other clients often send MIMO v2.5 models with hyphens
     (e.g. ``mimo-v2-5-pro``) while the upstream API expects dots
     (``mimo-v2.5-pro``).
+
+    The input is stripped and the MIMO alias prefix is matched
+    case-insensitively; the suffix after the alias prefix is preserved
+    as-is.
     """
-    if model_name.startswith("mimo-v2-5"):
-        return "mimo-v2.5" + model_name[len("mimo-v2-5"):]
-    return model_name
+    if not isinstance(model_name, str):
+        return model_name
+    stripped = model_name.strip()
+    _alias = "mimo-v2-5"
+    if stripped.lower().startswith(_alias):
+        return "mimo-v2.5" + stripped[len(_alias):]
+    return stripped
 
 
 PROVIDER_SLUG_MAP = {
@@ -42,6 +50,9 @@ PROVIDER_SLUG_MAP = {
     "metaspark": "quinary", "quinary": "quinary",
     "deepseek": "senary", "senary": "senary",
     "glm": "septenary", "zai": "septenary", "septenary": "septenary",
+    "agnes": "octonary", "octonary": "octonary",
+    "agnes-image": "nonary", "nonary": "nonary",
+    "agnes-video": "decenary", "decenary": "decenary",
 }
 
 
@@ -59,3 +70,15 @@ def split_provider_prefix(model: str) -> tuple:
 def _is_chat_endpoint(path: str) -> bool:
     """Check if path is a chat completion endpoint."""
     return "chat/completions" in path.lower()
+
+
+# Generation endpoints (image/video) carry a prompt/size payload instead of a
+# chat `messages` array and must not be rejected by the chat-style validation.
+GENERATION_PATH_MARKERS = ("images/generations", "images/edits", "videos")
+
+
+def requires_messages(path: str) -> bool:
+    """Chat-style endpoints require a non-empty `messages` array; generation
+    endpoints carry a prompt/size payload instead. Unknown paths stay strict."""
+    lowered = (path or "").lower()
+    return not any(marker in lowered for marker in GENERATION_PATH_MARKERS)

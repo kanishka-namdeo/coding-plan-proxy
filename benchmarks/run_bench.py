@@ -107,11 +107,18 @@ async def start_proxy(mock_base: str) -> tuple[web.AppRunner, str, object]:
     connector = TCPConnector(limit=CONNECTOR_LIMIT, ttl_dns_cache=300)
     app["client_session"] = ClientSession(timeout=timeout, connector=connector)
     runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
-    await site.start()
-    port = site._server.sockets[0].getsockname()[1]
-    return runner, f"http://127.0.0.1:{port}", app
+    try:
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        return runner, f"http://127.0.0.1:{port}", app
+    except Exception:
+        session = app["client_session"]
+        if not session.closed:
+            await session.close()
+        await runner.cleanup()
+        raise
 
 
 def small_body() -> dict:
@@ -200,19 +207,23 @@ async def run_burst(session: ClientSession, proxy: str, n: int = 50) -> dict:
 
 async def main(out: Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
-    mock_runner, mock_base = await start_mock_upstream()
-    proxy_runner, proxy_base, app = await start_proxy(mock_base)
-    upstream_conn = app["client_session"].connector
-    results = {
-        "mock_base": mock_base,
-        "proxy_base": proxy_base,
-        "connector": {
-            "limit": upstream_conn.limit,
-            "limit_per_host": upstream_conn.limit_per_host,
-        },
-        "scenarios": {},
-    }
+    mock_runner = None
+    proxy_runner = None
+    app = None
+    results = None
     try:
+        mock_runner, mock_base = await start_mock_upstream()
+        proxy_runner, proxy_base, app = await start_proxy(mock_base)
+        upstream_conn = app["client_session"].connector
+        results = {
+            "mock_base": mock_base,
+            "proxy_base": proxy_base,
+            "connector": {
+                "limit": upstream_conn.limit,
+                "limit_per_host": upstream_conn.limit_per_host,
+            },
+            "scenarios": {},
+        }
         async with ClientSession() as session:
             results["scenarios"]["nonstream_small"] = await run_scenario(
                 session, proxy_base, "nonstream_small", small_body(), 50, 5
@@ -227,9 +238,14 @@ async def main(out: Path) -> None:
                 session, proxy_base, 50
             )
     finally:
-        await app["client_session"].close()
-        await proxy_runner.cleanup()
-        await mock_runner.cleanup()
+        if app is not None:
+            session = app.get("client_session")
+            if session is not None and not session.closed:
+                await session.close()
+        if proxy_runner is not None:
+            await proxy_runner.cleanup()
+        if mock_runner is not None:
+            await mock_runner.cleanup()
     out.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(json.dumps(results["scenarios"], indent=2))
     print(f"wrote {out}")

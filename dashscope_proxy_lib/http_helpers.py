@@ -39,6 +39,16 @@ def parse_retry_after(header_value: str) -> float | None:
         return None
 
 
+def parse_retry_after_capped(header_value: str, cap_seconds: float = 300.0) -> float | None:
+    """Parse Retry-After and clamp the wait so a hostile/buggy upstream cannot
+    stall the proxy for hours. Returns None when the header is unparseable
+    (callers fall back to computed backoff)."""
+    parsed = parse_retry_after(header_value)
+    if parsed is None:
+        return None
+    return min(parsed, cap_seconds)
+
+
 def _make_error_response(status: int, body: bytes, request_id: str, retry_after: int | None = None) -> web.Response:
     """Create an error response with standard headers."""
     headers = {"X-Request-ID": request_id}
@@ -55,6 +65,21 @@ def _add_ratelimit_headers(response: web.Response, rate_limiter: RateLimiter) ->
     response.headers["X-RateLimit-Remaining"] = str(max(0, rate_limiter.rpm_limit - rpm_current))
     tpm_avail = rate_limiter.tpm_bucket.available(now)
     response.headers["X-RateLimit-Tokens-Remaining"] = str(int(tpm_avail))
+
+
+# Client-identifying security headers that must not reach upstream providers:
+# spoofed forwarding/origin hints and client credentials (case-insensitive names).
+SECURITY_HEADERS_TO_STRIP = frozenset({
+    "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "cookie",
+})
+
+
+def strip_client_security_headers(headers: dict) -> dict:
+    """Remove client security headers (case-insensitive), preserving everything else."""
+    return {
+        k: v for k, v in headers.items()
+        if k.lower() not in SECURITY_HEADERS_TO_STRIP
+    }
 
 
 def _strip_hop_by_hop(headers: dict) -> dict:
@@ -129,6 +154,27 @@ def _upstream_error_response(
     resp.headers["X-Request-ID"] = request_id
     _add_forwarded_headers(resp, upstream_headers)
     return resp
+
+
+async def _read_upstream_capped(
+    resp: aiohttp.ClientResponse, cap: int
+) -> tuple[bytes, bool]:
+    """Read at most *cap* decoded body bytes from an upstream response.
+
+    Returns ``(body, truncated)``. When the body exceeds *cap*, the remainder
+    of the stream is discarded so a misbehaving upstream cannot buffer without
+    bound; callers decide whether a truncated body is still usable.
+    A non-positive cap is treated as UNLIMITED (misconfiguration guard): the
+    full body is read and ``truncated`` is False.
+    """
+    if cap <= 0:
+        body = await resp.read()
+        return body, False
+    body = await resp.content.read(cap)
+    if not body:
+        return b"", False
+    extra = await resp.content.read(1)
+    return body, bool(extra)
 
 
 def _add_forwarded_headers(response: web.Response, upstream_headers: dict | aiohttp.ClientResponse) -> None:

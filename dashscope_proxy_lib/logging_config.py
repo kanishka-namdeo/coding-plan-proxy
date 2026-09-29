@@ -59,9 +59,15 @@ class TUILogHandler(logging.Handler):
             return datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
 
     def get_logs(self, limit: int = 100, from_seq: int = 0) -> list[dict]:
-        """Return the most recent log entries with seq >= from_seq."""
+        """Return the earliest log entries with seq >= from_seq."""
         with self._lock:
-            return [e for e in self.buffer if e.get("seq", 0) >= from_seq][-limit:]
+            matches = [e for e in self.buffer if e.get("seq", 0) >= from_seq]
+            return matches[:limit]
+
+    def snapshot(self) -> list[dict]:
+        """Return a stable, lock-protected copy of the buffered entries."""
+        with self._lock:
+            return list(self.buffer)
 
     def clear(self) -> None:
         with self._lock:
@@ -72,7 +78,19 @@ class TUILogHandler(logging.Handler):
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
+# Package-level logger. The TUI handler attaches here so records from every
+# dashscope_proxy_lib module logger (handlers, session_log, ...) reach the TUI
+# feed via propagation, not just _log() callers in this module.
+package_logger = logging.getLogger("dashscope_proxy_lib")
+
 tui_handler = TUILogHandler()
+
+# Kill the ``logging.lastResort`` fall-through: with no handler on the root
+# logger, every WARNING+ record that propagates up would be re-emitted
+# unstructured to stderr (duplicating the TUI/structured handlers). Idempotent.
+_root_logger = logging.getLogger()
+if not any(isinstance(h, logging.NullHandler) for h in _root_logger.handlers):
+    _root_logger.addHandler(logging.NullHandler())
 
 
 def _log(level: int, msg: str, **extra):
@@ -85,12 +103,38 @@ def _log(level: int, msg: str, **extra):
     logger.handle(record)
 
 
+def _headless_stream_handler() -> logging.StreamHandler:
+    """Structured stderr handler used by ``configure_logging`` in headless mode.
+
+    Marked ``audit_headless`` so ``configure_logging`` can detect and replace
+    it on reconfiguration (idempotent, no duplicate handlers).
+    """
+    handler = logging.StreamHandler()
+    handler.audit_headless = True  # type: ignore[attr-defined]
+    handler.setFormatter(StructuredLogFormatter())
+    return handler
+
+
 def configure_logging(*, enable_tui_handler: bool = True) -> None:
-    """Configure the proxy logger; optionally attach the TUI log handler."""
+    """Configure proxy logging; optionally attach the TUI log handler.
+
+    Headless (``enable_tui_handler=False``) attaches exactly one structured
+    ``StreamHandler`` to the package logger so INFO/DEBUG records still reach
+    stderr as JSON. Re-calls are idempotent: previously attached headless
+    handlers are removed, and enabling the TUI handler removes the headless
+    stream handler so records are not duplicated.
+    """
     logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    package_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     logger.handlers = [
         h for h in logger.handlers
         if not isinstance(h, (logging.NullHandler, TUILogHandler))
     ]
+    package_logger.handlers = [
+        h for h in package_logger.handlers
+        if not isinstance(h, TUILogHandler) and not getattr(h, "audit_headless", False)
+    ]
     if enable_tui_handler:
-        logger.addHandler(tui_handler)
+        package_logger.addHandler(tui_handler)
+    else:
+        package_logger.addHandler(_headless_stream_handler())

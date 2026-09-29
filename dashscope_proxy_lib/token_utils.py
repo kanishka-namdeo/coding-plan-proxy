@@ -2,6 +2,36 @@
 
 import json
 
+# Media parts contribute a fixed char allowance to the token estimate.
+_MEDIA_PART_TYPES = frozenset({"image_url", "image", "input_audio", "audio"})
+_MEDIA_PART_CHARS = 4096
+
+
+def _count_content_chars(content) -> int:
+    """Count char allowance for a message/system content value.
+
+    - str: its length
+    - list: str parts count their length; dict parts count their ``text``
+      field when it is a string; media parts (``type`` in
+      {_MEDIA_PART_TYPES} or an ``image_url`` key) add a fixed allowance.
+    - anything else: 0
+    """
+    if isinstance(content, str):
+        return len(content)
+    if not isinstance(content, list):
+        return 0
+    total = 0
+    for part in content:
+        if isinstance(part, str):
+            total += len(part)
+        elif isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                total += len(text)
+            if part.get("type") in _MEDIA_PART_TYPES or "image_url" in part:
+                total += _MEDIA_PART_CHARS
+    return total
+
 
 def extract_tokens_from_response(body: bytes) -> dict:
     """Parse token usage from a JSON response body.
@@ -53,8 +83,8 @@ def extract_tokens_from_stream(buffer: bytes) -> dict:
         lines = buffer.decode("utf-8", errors="replace").split("\n")
         for line in reversed(lines):
             line = line.strip()
-            if line.startswith("data: ") and line != "data: [DONE]":
-                data = json.loads(line[6:])
+            if line.startswith("data:") and line[5:].lstrip() != "[DONE]":
+                data = json.loads(line[5:].lstrip())
                 usage = data.get("usage", {})
                 if usage and "total_tokens" in usage:
                     result = {
@@ -93,20 +123,11 @@ def estimate_tokens_for_body(body: dict) -> int:
     for m in messages:
         if not isinstance(m, dict):
             continue
-        content = m.get("content")
-        if isinstance(content, str):
-            total_chars += len(content)
-        elif isinstance(content, list):
-            total_chars += sum(
-                len(p.get("text", ""))
-                for p in content
-                if isinstance(p, dict)
-            )
+        total_chars += _count_content_chars(m.get("content"))
 
+    # system / developer may be a plain string or a list of content parts
     for field in ("system", "developer"):
-        value = body.get(field)
-        if isinstance(value, str):
-            total_chars += len(value)
+        total_chars += _count_content_chars(body.get(field))
 
     tools = body.get("tools", [])
     if isinstance(tools, list):

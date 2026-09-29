@@ -1,8 +1,11 @@
-"""Real end-to-end tests against the actual DashScope API.
+"""Real end-to-end tests against the actual upstream APIs.
 
-These tests start a real proxy server locally and forward requests to
-the real DashScope upstream. They consume API quota and are skipped by
-default. Run with: pytest tests/test_e2e_real.py -v --run-real
+These tests start a real proxy server locally and forward requests to the
+real upstream. They consume API quota and are skipped by default: each gated
+class skips when its .env key is missing. Run the Agnes AI checks with:
+    AGNES_RUN_VIDEO=1 py -m pytest tests/test_e2e_real.py -k TestAgnesRealApi
+(the -k isolates the Agnes class so no DashScope quota is consumed; the
+AGNES_RUN_VIDEO flag opts into the expensive live video test).
 """
 import json
 import os
@@ -45,6 +48,16 @@ def real_api_key():
 
 
 @pytest.fixture(scope="module")
+def agnes_api_key():
+    """Load the real Agnes Token Plan key from .env; skip when absent."""
+    env = _load_env()
+    key = env.get("AGNES_API_KEY", "").strip()
+    if not key:
+        pytest.skip("AGNES_API_KEY not found in .env")
+    return key
+
+
+@pytest.fixture(scope="module")
 def e2e_config():
     """Config with high limits so we don't hit rate limits during tests."""
     return {
@@ -72,22 +85,21 @@ async def proxy_server(real_api_key, e2e_config):
     app["shutting_down"] = asyncio.Event()
 
     runner = web.AppRunner(app)
-    await runner.setup()
-    # Bind to port 0 to get a random available port
-    site = web.TCPSite(runner, "127.0.0.1", 0)
-    await site.start()
+    try:
+        await runner.setup()
+        # Bind to port 0 to get a random available port
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
 
-    # Get the actual port
-    sock = site._server.sockets[0]
-    port = sock.getsockname()[1]
-
-    yield port, rate_limiter
-
-    # Cleanup
-    session = app.get("client_session")
-    if session and not session.closed:
-        await session.close()
-    await runner.cleanup()
+        # Get the actual port
+        sock = site._server.sockets[0]
+        port = sock.getsockname()[1]
+        yield port, rate_limiter
+    finally:
+        session = app.get("client_session")
+        if session and not session.closed:
+            await session.close()
+        await runner.cleanup()
 
 
 def _make_request(port, payload):
@@ -100,6 +112,62 @@ def _make_request(port, payload):
             ) as resp:
                 body = await resp.read()
                 return resp.status, body, dict(resp.headers)
+    return asyncio.get_event_loop().run_until_complete(_do())
+
+
+def _make_request_path(port, path, payload, timeout=30):
+    """POST a JSON payload to an arbitrary proxy path (image/video generation)."""
+    async def _do():
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://127.0.0.1:{port}{path}",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                body = await resp.read()
+                return resp.status, body, dict(resp.headers)
+    return asyncio.get_event_loop().run_until_complete(_do())
+
+
+def _poll_video_direct(agnes_base, key, video_id, model="agnes-video-2.5-flash",
+                       max_wait=150, interval=2.0):
+    """Poll the Agnes video result DIRECTLY against the vendor.
+
+    The proxy cannot route the retrieval call: GET has no body, so the proxy's
+    model-name routing would send it to the wrong provider, and the URL builder
+    always re-inserts the API version, turning /agnesapi into /v1/agnesapi.
+    So the create call goes through the proxy, but polling hits the vendor root.
+
+    Returns (status, result_url, raw). A missing metadata.url is tolerated while
+    the task is in progress; a status containing 'fail' or reaching max_wait is
+    a failure.
+    """
+    import time
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(agnes_base)
+    root = f"{parts.scheme}://{parts.netloc}"
+    url = f"{root}/agnesapi?video_id={video_id}&model_name={model}"
+
+    async def _do():
+        deadline = time.monotonic() + max_wait
+        async with aiohttp.ClientSession() as session:
+            while time.monotonic() < deadline:
+                async with session.get(
+                    url,
+                    headers={"Authorization": f"Bearer {key}"},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    data = json.loads(await resp.read())
+                status = str(data.get("status", "")).lower()
+                meta = data.get("metadata")
+                result_url = meta.get("url") if isinstance(meta, dict) else None
+                if result_url or "completed" in status:
+                    return status, result_url, data
+                if "fail" in status:
+                    return status, None, data
+                await asyncio.sleep(interval)
+        return "timeout", None, {}
     return asyncio.get_event_loop().run_until_complete(_do())
 
 

@@ -1,8 +1,3 @@
-#dashboard {
-    layout: vertical;
-    height: 1fr;
-}
-
 #metrics-panel {
     width: 50%;
     border: tall green;
@@ -11,35 +6,29 @@
     overflow-y: auto;
 }
 
-/* Dynamic provider sections */
-.provider-section {
-    display: none;
-    margin: 1 0 0 0;
-    border-top: heavy $primary 30%;
-    padding-top: 1;
-}
-
-.provider-section.visible {
-    display: block;
-}
-
-/* Provider status lines */
-.provider-status {
-    padding: 0 1;
+/* Section titles flow in order (no dock) so they sit directly above their content */
+.section-title {
     text-style: bold;
+    color: $primary;
+    padding: 0 1;
     height: 1;
 }
 
-.provider-status.status-running {
-    color: $success;
+/* Compact provider grid: one row per provider */
+#provider-grid {
+    height: auto;
+    margin: 0 0 1 0;
 }
 
-.provider-status.status-stopped {
-    color: $error;
+/* Provider detail pane below the grid */
+#provider-detail-title {
+    height: 1;
+    padding: 0 1;
+    text-style: bold;
+    color: $primary;
 }
 
-/* Provider metrics tables */
-.provider-metrics {
+#provider-detail {
     height: auto;
 }
 

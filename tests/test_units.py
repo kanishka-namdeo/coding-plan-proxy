@@ -866,6 +866,26 @@ class TestTUILogHandler:
         assert len(logs) == 2
         assert all(e["seq"] >= 3 for e in logs)
 
+    def test_get_logs_returns_forward_page(self, dashscope_module):
+        handler = dashscope_module.TUILogHandler(max_size=20)
+        for i in range(10):
+            handler.emit(logging.LogRecord(
+                name="test", level=logging.INFO, pathname="", lineno=1,
+                msg=f"msg-{i}", args=(), exc_info=None,
+            ))
+        assert [e["seq"] for e in handler.get_logs(limit=3)] == [0, 1, 2]
+        assert [e["seq"] for e in handler.get_logs(limit=3, from_seq=3)] == [3, 4, 5]
+
+    def test_snapshot_returns_copy(self, dashscope_module):
+        handler = dashscope_module.TUILogHandler(max_size=20)
+        handler.emit(logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=1,
+            msg="hello", args=(), exc_info=None,
+        ))
+        snapshot = handler.snapshot()
+        snapshot.clear()
+        assert len(handler.snapshot()) == 1
+
     def test_clear_resets_seq(self, dashscope_module):
         handler = dashscope_module.TUILogHandler(max_size=100)
         record = logging.LogRecord(
@@ -2924,6 +2944,25 @@ class TestSessionLogIncrementalRead:
             f.write(payload[12:] + "\n")
         entries = tui._read_session_log_entries()
         assert [e["request_id"] for e in entries] == ["partial"]
+        assert tui._session_log_partial == ""
+
+    def test_oversized_partial_line_is_discarded(self, tmp_path, monkeypatch):
+        from collections import deque
+        from proxy_tui import ProxyTUI, SESSION_LOG_PARTIAL_MAX_BYTES
+
+        monkeypatch.chdir(tmp_path)
+        log_dir = tmp_path / "session_logs"
+        log_dir.mkdir()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = log_dir / f"{today}.jsonl"
+        tui = object.__new__(ProxyTUI)
+        tui._session_log_offset = 0
+        tui._session_log_inode = None
+        tui._session_log_path = None
+        tui._session_log_tail = deque(maxlen=200)
+        tui._session_log_partial = ""
+        path.write_text("x" * (SESSION_LOG_PARTIAL_MAX_BYTES + 1), encoding="utf-8")
+        assert tui._read_session_log_entries() == []
         assert tui._session_log_partial == ""
 
     def test_truncated_file_resets_offset(self, tmp_path, monkeypatch):

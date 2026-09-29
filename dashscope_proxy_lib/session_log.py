@@ -12,22 +12,26 @@ import time
 import typing
 from concurrent.futures import ThreadPoolExecutor
 
+from dashscope_proxy_lib.config import _safe_float, _safe_int
+
 # These are resolved via the facade module at runtime so that tests can
 # patch ``dashscope_proxy.datetime`` / ``dashscope_proxy.timezone``.
 # No top-level ``from datetime import …`` — the late import inside
 # ``_ensure_file`` avoids circular imports because ``dashscope_proxy`` is
 # fully loaded by the time any method is called.
 
-# Session log file configuration
+# Session log file configuration. Numeric env vars are parsed with the shared
+# safe helpers so a .env typo (e.g. SESSION_LOG_QUEUE_MAX=abc) falls back to
+# the default instead of crashing the proxy at import time.
 SESSION_LOG_DIR = os.environ.get(
     "SESSION_LOG_DIR",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "session_logs"),
 )
 SESSION_LOG_ENABLED = os.environ.get("SESSION_LOG_ENABLED", "1") == "1"
-SESSION_LOG_FLUSH_EVERY = int(os.environ.get("SESSION_LOG_FLUSH_EVERY", "32"))
-SESSION_LOG_FLUSH_INTERVAL = float(os.environ.get("SESSION_LOG_FLUSH_INTERVAL", "0.25"))
+SESSION_LOG_FLUSH_EVERY = _safe_int("SESSION_LOG_FLUSH_EVERY", 32)
+SESSION_LOG_FLUSH_INTERVAL = _safe_float("SESSION_LOG_FLUSH_INTERVAL", 0.25)
 SESSION_LOG_SYNC_FLUSH = os.environ.get("SESSION_LOG_SYNC_FLUSH", "0") == "1"
-SESSION_LOG_QUEUE_MAX = int(os.environ.get("SESSION_LOG_QUEUE_MAX", "10000"))
+SESSION_LOG_QUEUE_MAX = _safe_int("SESSION_LOG_QUEUE_MAX", 10000)
 
 _logger = logging.getLogger(__name__)
 _SENTINEL = object()
@@ -42,7 +46,15 @@ class SessionLogWriter:
     seconds. Set ``SESSION_LOG_SYNC_FLUSH=1`` to restore await+flush-every-line.
     """
 
-    def __init__(self, log_dir: str):
+    def __init__(
+        self,
+        log_dir: str,
+        *,
+        sync_flush: bool | None = None,
+        flush_every: int | None = None,
+        flush_interval: float | None = None,
+        queue_max: int | None = None,
+    ):
         self.log_dir = log_dir
         self._current_date: str | None = None
         self._file: typing.TextIO | None = None
@@ -51,15 +63,18 @@ class SessionLogWriter:
         # writer exits (TOCTOU between ``_closed`` check and ``put_nowait``).
         self._accept_lock = threading.Lock()
         self._closed = False
+        # Raised under ``_lock`` in ``close()`` when the writer join times
+        # out; the writer loop and ``_ensure_file`` check it so the still-live
+        # writer stops and can never re-open/rotate the file after close.
+        self._close_requested = False
         self._lines_since_flush = 0
 
-        # Re-read env at construct so tests can monkeypatch before init.
-        self._sync_flush = os.environ.get("SESSION_LOG_SYNC_FLUSH", "0") == "1"
-        self._flush_every = int(os.environ.get("SESSION_LOG_FLUSH_EVERY", str(SESSION_LOG_FLUSH_EVERY)))
-        self._flush_interval = float(
-            os.environ.get("SESSION_LOG_FLUSH_INTERVAL", str(SESSION_LOG_FLUSH_INTERVAL))
-        )
-        queue_max = int(os.environ.get("SESSION_LOG_QUEUE_MAX", str(SESSION_LOG_QUEUE_MAX)))
+        # Reuse the module-level constants (safely parsed at import time);
+        # optional keyword overrides exist for tests and special callers.
+        self._sync_flush = SESSION_LOG_SYNC_FLUSH if sync_flush is None else sync_flush
+        self._flush_every = SESSION_LOG_FLUSH_EVERY if flush_every is None else flush_every
+        self._flush_interval = SESSION_LOG_FLUSH_INTERVAL if flush_interval is None else flush_interval
+        queue_max = SESSION_LOG_QUEUE_MAX if queue_max is None else queue_max
 
         self._executor: ThreadPoolExecutor | None = None
         self._queue: queue.Queue | None = None
@@ -78,6 +93,13 @@ class SessionLogWriter:
 
     def _ensure_file(self) -> None:
         """Must be called with self._lock held."""
+        if self._close_requested:
+            # close() timed out while the writer was still alive and kept the
+            # file open. Never re-open or rotate mid-shutdown: writes keep
+            # going into the existing handle (if any), otherwise they are
+            # skipped — a re-opened file would outlive close() and escape
+            # shutdown with a ValueError.
+            return
         import sys
 
         _ds = sys.modules.get("dashscope_proxy")
@@ -147,8 +169,13 @@ class SessionLogWriter:
                 item = self._queue.get(timeout=self._flush_interval)
             except queue.Empty:
                 with self._lock:
+                    close_requested = self._close_requested
                     self._flush_unlocked()
                 last_flush = time.monotonic()
+                if close_requested:
+                    # close() is done waiting for us: stop instead of idling.
+                    _logger.info("session log writer exiting (close requested, queue idle)")
+                    return
                 continue
 
             try:
@@ -213,11 +240,13 @@ class SessionLogWriter:
 
         For async contexts, use log_async() instead to avoid blocking the event loop.
         """
+        # Hold _accept_lock through the write so close() cannot slip between
+        # the closed check and the write and re-open the file after shutdown.
         with self._accept_lock:
             if self._closed:
                 return
-        with self._lock:
-            self._write_sync(entry)
+            with self._lock:
+                self._write_sync(entry)
 
     def _enqueue_close_sentinel(self) -> list:
         """Enqueue stop sentinel; on Full, pull items aside so drain still happens.
@@ -260,8 +289,16 @@ class SessionLogWriter:
                 drained.append(item)
         return drained
 
-    def close(self) -> None:
-        """Stop accepting, drain queue, final flush, join writer (QueueListener shape)."""
+    def close(self, join_timeout: float = 30.0) -> None:
+        """Stop accepting, drain queue, final flush, join writer (QueueListener shape).
+
+        ``join_timeout`` bounds how long we wait for the background writer to
+        exit. On a successful join the leftovers are drained and the file is
+        closed. On a join timeout the writer is still alive and owns the open
+        file handle, so the file is deliberately left open: ``_close_requested``
+        keeps the writer from re-opening it, and ``log()`` remains a no-op
+        (``_closed`` is set before the join).
+        """
         with self._accept_lock:
             if self._closed:
                 return
@@ -282,7 +319,31 @@ class SessionLogWriter:
         if self._queue is not None:
             aside = self._enqueue_close_sentinel()
         if self._writer_thread is not None:
-            self._writer_thread.join(timeout=30.0)
+            self._writer_thread.join(timeout=join_timeout)
+            if self._writer_thread.is_alive():
+                # Writer is stuck (e.g. hung filesystem flush holding
+                # ``_lock``). It still owns the open file handle, so do NOT
+                # close it: a later _ensure_file would re-open a new file
+                # and write into a closed handle (ValueError escaping
+                # shutdown). Raise the stop flag — under ``_lock`` when the
+                # writer is not holding it, with a bounded fallback, since a
+                # stuck writer may hold it indefinitely. After this point the
+                # writer never re-opens/rotates the file, and it exits as
+                # soon as it can; entries left on the queue are dropped.
+                if self._lock.acquire(timeout=0.1):
+                    try:
+                        self._close_requested = True
+                    finally:
+                        self._lock.release()
+                else:
+                    self._close_requested = True
+                _logger.error(
+                    "session log close: writer join timed out after %.1fs; "
+                    "%d entries still queued and will be dropped",
+                    join_timeout,
+                    self._queue.qsize() if self._queue is not None else 0,
+                )
+                return
             self._writer_thread = None
         # Post-join: write items pulled to make room for the sentinel, plus any
         # leftovers still on the queue after the writer exited.

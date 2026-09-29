@@ -24,12 +24,13 @@ from dashscope_proxy_lib.token_utils import (
     estimate_tokens_for_body, extract_tokens_from_response, extract_tokens_from_stream,
 )
 from dashscope_proxy_lib.request_transform import (
-    _is_chat_endpoint, map_developer_to_system, normalize_model_name,
+    _is_chat_endpoint, map_developer_to_system, normalize_model_name, requires_messages,
 )
 from dashscope_proxy_lib.http_helpers import (
     _add_forwarded_headers, _add_ratelimit_headers, _client_disconnected, _compute_backoff,
-    _make_error_response, _sleep_interruptible, _strip_hop_by_hop, parse_retry_after,
-    should_retry_429, _upstream_error_response, _sse_response_headers, _finalize_stream_response,
+    _make_error_response, _sleep_interruptible, _strip_hop_by_hop,
+    parse_retry_after_capped, should_retry_429, _upstream_error_response, _sse_response_headers,
+    _finalize_stream_response, _read_upstream_capped, strip_client_security_headers,
 )
 from dashscope_proxy_lib.queue import wait_for_slot
 from dashscope_proxy_lib.provider_router import ProviderRouter, ProviderConfig
@@ -205,16 +206,19 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
             await _maybe_flush_session_log(request.app, session_entry)
             return _make_error_response(400, b'{"error":"missing required field: model"}', request_id)
 
-        messages = body.get("messages")
-        if messages is None or (isinstance(messages, list) and len(messages) == 0):
-            error_reason = "missing_messages"
-            status_code = 400
-            _log(logging.WARNING, "request rejected: missing messages field",
-                 request_id=request_id, method=method, path=path, reason="missing_messages")
-            session_entry["status_code"] = status_code
-            session_entry["error_reason"] = error_reason
-            await _maybe_flush_session_log(request.app, session_entry)
-            return _make_error_response(400, b'{"error":"missing required field: messages"}', request_id)
+        # Chat-style endpoints require `messages`; generation endpoints
+        # (images/videos) carry a prompt payload instead.
+        if requires_messages(path):
+            messages = body.get("messages")
+            if messages is None or (isinstance(messages, list) and len(messages) == 0):
+                error_reason = "missing_messages"
+                status_code = 400
+                _log(logging.WARNING, "request rejected: missing messages field",
+                     request_id=request_id, method=method, path=path, reason="missing_messages")
+                session_entry["status_code"] = status_code
+                session_entry["error_reason"] = error_reason
+                await _maybe_flush_session_log(request.app, session_entry)
+                return _make_error_response(400, b'{"error":"missing required field: messages"}', request_id)
 
         body = map_developer_to_system(body)
         if isinstance(body.get("model"), str):
@@ -246,6 +250,24 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 "model": model_name,
                 "available_providers": provider_slugs,
             }).encode(),
+            request_id,
+        )
+    if pinned_name is not None and "/" in (bare_name or ""):
+        # Known provider slug but the remainder still contains a provider
+        # prefix (e.g. "openlux/ark/somemodel"). Forwarding the bare name
+        # would be rejected upstream as a terminal 4xx — reject at ingress.
+        error_reason = "invalid_model_pin"
+        status_code = 400
+        _log(logging.WARNING, "request rejected: invalid model pin",
+             request_id=request_id, method=method, path=path,
+             reason="invalid_model_pin", model=model_name)
+        session_entry["model"] = model_name
+        session_entry["status_code"] = status_code
+        session_entry["error_reason"] = error_reason
+        await _maybe_flush_session_log(request.app, session_entry)
+        return _make_error_response(
+            400,
+            json.dumps({"error": f"invalid model pin: {model_name}"}).encode(),
             request_id,
         )
     if pinned_name is not None:
@@ -328,14 +350,16 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     await rate_limiter.increment_pending()
     holding_probe = False
     try:
-        wait_time = await wait_for_slot(limiter, request, estimated_tokens, queue_limiter=rate_limiter)
-        if wait_time is None:
-            if _client_disconnected(request):
-                error_reason = "client_disconnected"
-                status_code = 499
-                _log(logging.INFO, "client disconnected while queued",
-                     request_id=request_id, method=method, path=path)
-                return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
+        wait_time, wait_reason, last_wait = await wait_for_slot(
+            limiter, request, estimated_tokens, queue_limiter=rate_limiter
+        )
+        if wait_reason == "client_disconnected":
+            error_reason = "client_disconnected"
+            status_code = 499
+            _log(logging.INFO, "client disconnected while queued",
+                 request_id=request_id, method=method, path=path)
+            return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
+        if wait_reason == "queue_full":
             rate_limiter.queue_drops += 1
             rate_limiter.total_rejected += 1
             error_reason = "queue_full"
@@ -352,22 +376,48 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 request_id,
                 retry_after=retry_sec,
             )
+        if wait_reason == "deadline_exceeded":
+            rate_limiter.total_rejected += 1
+            error_reason = "deadline_exceeded"
+            status_code = 503
+            _log(logging.WARNING, "request rejected: queue wait deadline exceeded",
+                 request_id=request_id, method=method, path=path,
+                 model=model_name, provider=provider_name,
+                 total_wait=round(wait_time, 1), last_wait=round(last_wait, 1))
+            retry_sec = max(1, int(last_wait))
+            return _make_error_response(
+                503,
+                json.dumps({"error": "rate limit backoff pending, retry later",
+                            "retry_after": retry_sec}).encode(),
+                request_id,
+                retry_after=retry_sec,
+            )
 
         # Admit + reserve TPM under one lock (post-queue commit — bucket may have drained)
-        ok, reason, _wait = await limiter.try_admit(estimated_tokens)
+        ok, reason, admit_wait = await limiter.try_admit(estimated_tokens)
         if not ok:
             rate_limiter.queue_drops += 1
             rate_limiter.total_rejected += 1
-            error_reason = "tpm_reservation_failed" if "TPM" in reason else "admit_failed"
+            if "TPM" in reason:
+                error_reason = "tpm_reservation_failed"
+                deny_message = "TPM quota exceeded while queued"
+                retry_sec = max(1, rate_limiter.pending_requests // max(1, rate_limiter.rps_limit))
+            elif "RPM" in reason:
+                error_reason = "admit_failed_rpm"
+                deny_message = "RPM limit reached while queued"
+                retry_sec = max(1, int(admit_wait))
+            else:
+                error_reason = "admit_failed_rps"
+                deny_message = "request spacing exceeded while queued"
+                retry_sec = max(1, int(admit_wait))
             status_code = 503
             _log(logging.WARNING, "request rejected: admit failed after queue",
                  request_id=request_id, method=method, path=path,
                  model=model_name, provider=provider_name,
                  estimated_tokens=estimated_tokens, reason=reason)
-            retry_sec = max(1, rate_limiter.pending_requests // max(1, rate_limiter.rps_limit))
             return _make_error_response(
                 503,
-                json.dumps({"error": "TPM quota exceeded while queued", "retry_after": retry_sec}).encode(),
+                json.dumps({"error": deny_message, "retry_after": retry_sec}).encode(),
                 request_id,
                 retry_after=retry_sec,
             )
@@ -403,6 +453,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
             k: v for k, v in request.headers.items()
             if k.lower() not in ("host", "transfer-encoding", "content-length", "authorization")
         }
+        headers = strip_client_security_headers(headers)
         headers["Content-Type"] = "application/json"
         headers["Authorization"] = f"Bearer {provider.api_key}"
         headers["X-Request-ID"] = request_id
@@ -514,6 +565,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 k: v for k, v in request.headers.items()
                 if k.lower() not in ("host", "transfer-encoding", "content-length", "authorization")
             }
+            headers = strip_client_security_headers(headers)
             headers["Content-Type"] = "application/json"
             headers["Authorization"] = f"Bearer {provider.api_key}"
             headers["X-Request-ID"] = request_id
@@ -538,6 +590,17 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 else:
                     holding_probe = False
                     if not limiter.can_attempt_probe():
+                        # A circuit-open / probe-blocked current candidate must
+                        # not block failover: when a later candidate has a
+                        # closed circuit, advance to it (mirroring the
+                        # open-circuit skip inside _advance_candidate) and
+                        # continue the retry loop with the next provider.
+                        # Pinned requests never fail over — keep the 503.
+                        if pinned_name is None:
+                            success, _ = await _try_failover_with_tpm()
+                            if success:
+                                _rebuild_request_for_provider()
+                                continue
                         error_reason = "circuit_open"
                         status_code = 503
                         _log(logging.WARNING, "request rejected: circuit breaker open",
@@ -575,7 +638,10 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         if upstream.status == 429:
                             limiter.total_429s += 1
                             await limiter.record_model_stats(model_name or "unknown", 0, 0.0, is_429=True)
-                            error_body = await upstream.read()
+                            error_body, body_truncated = await _read_upstream_capped(upstream, _cfg("UPSTREAM_MAX_BODY_SIZE"))
+                            if body_truncated:
+                                _log(logging.WARNING, "upstream 429 body exceeded cap, truncated",
+                                     request_id=request_id, model=model_name, cap=_cfg("UPSTREAM_MAX_BODY_SIZE"))
                             # Capture headers before closing
                             upstream_headers = dict(upstream.headers)
                             upstream.close()
@@ -621,7 +687,11 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             continue
 
                         if 400 <= upstream.status < 500:
-                            error_body = await upstream.read()
+                            error_body, body_truncated = await _read_upstream_capped(upstream, _cfg("UPSTREAM_MAX_BODY_SIZE"))
+                            if body_truncated:
+                                _log(logging.WARNING, "upstream 4xx body exceeded cap, truncated",
+                                     request_id=request_id, model=model_name, status=upstream.status,
+                                     cap=_cfg("UPSTREAM_MAX_BODY_SIZE"))
                             upstream_headers = dict(upstream.headers)
                             upstream.close()
                             error_reason = "upstream_4xx"
@@ -636,7 +706,11 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             )
 
                         if 500 <= upstream.status < 600:
-                            upstream_body = await upstream.read()
+                            upstream_body, body_truncated = await _read_upstream_capped(upstream, _cfg("UPSTREAM_MAX_BODY_SIZE"))
+                            if body_truncated:
+                                _log(logging.WARNING, "upstream 5xx body exceeded cap, truncated",
+                                     request_id=request_id, model=model_name, status=upstream.status,
+                                     cap=_cfg("UPSTREAM_MAX_BODY_SIZE"))
                             # Capture headers before closing
                             upstream_headers = dict(upstream.headers)
                             upstream.close()
@@ -684,7 +758,11 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         tokens_from_stream = 0
 
                         if not (200 <= upstream.status < 400):
-                            error_body = await upstream.read()
+                            error_body, body_truncated = await _read_upstream_capped(upstream, _cfg("UPSTREAM_MAX_BODY_SIZE"))
+                            if body_truncated:
+                                _log(logging.WARNING, "upstream unexpected-status body exceeded cap, truncated",
+                                     request_id=request_id, model=model_name, status=upstream.status,
+                                     cap=_cfg("UPSTREAM_MAX_BODY_SIZE"))
                             upstream_headers = dict(upstream.headers)
                             upstream.close()
                             error_reason = "upstream_unexpected_status"
@@ -713,6 +791,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         stream_prepared = True
 
                         chunk_idle_timeout = _cfg("STREAM_CHUNK_IDLE_TIMEOUT")
+                        stream_clean = True
                         try:
                             async for chunk in upstream.content:
                                 total_stream_bytes += len(chunk)
@@ -737,14 +816,21 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                                         await resp.write(sse_error)
                                     except Exception:
                                         pass
+                                    # Aborted stream: no usable upstream outcome.
+                                    stream_clean = False
                                     break
-                        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError, ConnectionAbortedError):
+                        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
                             _log(logging.INFO, "client disconnected during stream",
                                  request_id=request_id, model=model_name,
                                  total_bytes=total_stream_bytes)
                             upstream.close()
                             await limiter.refund_tokens(estimated_tokens)
                             return await _finalize_stream_response(resp)
+                        except asyncio.CancelledError:
+                            # Task cancellation is not a client disconnect:
+                            # propagate to the outer handler-level handling
+                            # (refund, close, re-raise; finally releases probe).
+                            raise
 
                         await resp.write_eof()
                         stream_prepared = False
@@ -767,7 +853,10 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             latency_ms=duration_ms,
                             request_bytes=request_body_bytes,
                             response_bytes=response_body_bytes,
-                            circuit_success=True,
+                            # Aborted stream (idle-timeout break) carries no usable
+                            # upstream outcome: record TPM/RPM/model stats but leave
+                            # circuit state untouched.
+                            circuit_success=True if stream_clean else None,
                         )
                         tokens_reserved = False
                         actual_tokens = tokens_from_stream
@@ -790,7 +879,19 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                              upstream_latency_ms=upstream_latency_ms,
                              response_body_bytes=response_body_bytes)
                         return resp
-                    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError, ConnectionAbortedError):
+                    except asyncio.CancelledError:
+                        # Task cancellation must not be converted into a normal
+                        # return (which would look like a 499 disconnect). Refund,
+                        # close the upstream response, and re-raise so the caller
+                        # sees the cancellation; the outer finally releases the
+                        # probe claim. A single await completes even in a
+                        # cancelled task unless re-cancelled.
+                        await limiter.refund_tokens(estimated_tokens)
+                        tokens_reserved = False
+                        if not upstream.closed:
+                            upstream.close()
+                        raise
+                    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
                         await limiter.refund_tokens(estimated_tokens)
                         if not upstream.closed:
                             upstream.close()
@@ -826,7 +927,9 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         headers=headers,
                         data=body_bytes,
                     ) as resp_up:
-                        resp_body = await resp_up.read()
+                        resp_body, body_truncated = await _read_upstream_capped(resp_up, _cfg("UPSTREAM_MAX_BODY_SIZE"))
+                        if body_truncated:
+                            resp_up.close()
                         resp_headers = dict(resp_up.headers)
                         status_code = resp_up.status
 
@@ -836,6 +939,26 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         _log(logging.INFO, "client disconnected after upstream response",
                              request_id=request_id, model=model_name)
                         return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
+
+                    if body_truncated:
+                        if 200 <= status_code < 300:
+                            # Truncated non-stream SUCCESS body: discard with 502 + TPM refund
+                            error_reason = "upstream_body_too_large"
+                            status_code = 502
+                            _log(logging.ERROR, "upstream response body exceeded cap, discarding",
+                                 request_id=request_id, model=model_name, status=resp_up.status,
+                                 cap=_cfg("UPSTREAM_MAX_BODY_SIZE"))
+                            await limiter.refund_tokens(estimated_tokens)
+                            tokens_reserved = False
+                            return _make_error_response(
+                                502, json.dumps({"error": "upstream response body too large"}).encode(), request_id
+                            )
+                        # Truncated 4xx/429/5xx body: log and proxy the capped
+                        # body as-is, falling through to the status branches
+                        # (429 accounting, 5xx retries/failover still apply).
+                        _log(logging.WARNING, "upstream error body exceeded cap, truncated body proxied as-is",
+                             request_id=request_id, model=model_name, status=resp_up.status,
+                             cap=_cfg("UPSTREAM_MAX_BODY_SIZE"))
 
                     if status_code == 429:
                         limiter.total_429s += 1
@@ -872,7 +995,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                                 out.headers["Retry-After"] = retry_after_raw
                             return out
                         if retry_after_raw:
-                            parsed = parse_retry_after(retry_after_raw)
+                            parsed = parse_retry_after_capped(retry_after_raw)
                             if parsed is not None:
                                 wait = parsed
                             else:
