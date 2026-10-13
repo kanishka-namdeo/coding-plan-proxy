@@ -25,6 +25,9 @@ from dashscope_proxy_lib.token_utils import (
 )
 from dashscope_proxy_lib.request_transform import (
     _is_chat_endpoint, map_developer_to_system, normalize_model_name, requires_messages,
+    inject_agnes_thinking, inject_qwen_thinking, inject_glm53_thinking,
+    inject_kimi_thinking, inject_mimo_thinking, inject_deepseek_thinking,
+    inject_glm5_thinking, inject_minimax_thinking,
 )
 from dashscope_proxy_lib.http_helpers import (
     _add_forwarded_headers, _add_ratelimit_headers, _client_disconnected, _compute_backoff,
@@ -296,6 +299,27 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         model_name = bare_name
         if isinstance(body, dict):
             body["model"] = bare_name
+
+    # Determine provider name early to inject provider-specific parameters
+    if pinned_name is not None:
+        provider_name_early = pinned_name
+    else:
+        overlap = router.get_providers_for_model(model_name or "")
+        if overlap:
+            provider_name_early = overlap[0].name
+        else:
+            provider_name_early = router.get_provider_for_model(model_name or "").name
+    
+    # Inject thinking parameters before serialization
+    if isinstance(body, dict):
+        body = inject_agnes_thinking(body, provider_name_early)
+        body = inject_qwen_thinking(body, model_name or "")
+        body = inject_glm53_thinking(body, model_name or "")
+        body = inject_glm5_thinking(body, model_name or "")
+        body = inject_kimi_thinking(body, model_name or "")
+        body = inject_mimo_thinking(body, model_name or "")
+        body = inject_deepseek_thinking(body, model_name or "")
+        body = inject_minimax_thinking(body, model_name or "")
 
     # Single dump after transforms + pin strip; estimate from already-parsed dict
     if body is not None:

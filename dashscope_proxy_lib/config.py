@@ -450,10 +450,11 @@ def _load_display_config() -> list[tuple[str, str, str, str]]:
 MOCK_MODELS = {
     "object": "list",
     "data": [
+        {"id": "qwen3.5-plus", "object": "model"},
         {"id": "qwen3.6-plus", "object": "model"},
         {"id": "qwen3.7-plus", "object": "model"},
-        {"id": "kimi-k2-5", "object": "model"},
-        {"id": "glm-5-0", "object": "model"},
+        {"id": "kimi-k2.5", "object": "model"},
+        {"id": "glm-5", "object": "model"},
         {"id": "MiniMax-M2.5", "object": "model"},
     ]
 }

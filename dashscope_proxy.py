@@ -154,6 +154,14 @@ from dashscope_proxy_lib.request_transform import (
     split_provider_prefix,
     _is_chat_endpoint,
     requires_messages,
+    inject_agnes_thinking,
+    inject_qwen_thinking,
+    inject_glm53_thinking,
+    inject_glm5_thinking,
+    inject_kimi_thinking,
+    inject_mimo_thinking,
+    inject_deepseek_thinking,
+    inject_minimax_thinking,
     GENERATION_PATH_MARKERS,
 )
 
@@ -221,7 +229,10 @@ __all__ = [
     "estimate_tokens_for_body", "estimate_tokens_for_request",
     # request transform
     "map_developer_to_system", "normalize_model_name", "split_provider_prefix",
-    "_is_chat_endpoint", "requires_messages", "GENERATION_PATH_MARKERS",
+    "_is_chat_endpoint", "requires_messages", "inject_agnes_thinking",
+    "inject_qwen_thinking", "inject_glm53_thinking", "inject_glm5_thinking",
+    "inject_kimi_thinking", "inject_mimo_thinking", "inject_deepseek_thinking",
+    "inject_minimax_thinking", "GENERATION_PATH_MARKERS",
     # http helpers
     "parse_retry_after", "should_retry_429", "_make_error_response", "_add_ratelimit_headers",
     "_strip_hop_by_hop", "_client_disconnected", "_compute_backoff",

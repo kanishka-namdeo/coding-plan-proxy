@@ -533,6 +533,292 @@ class TestRequiresMessages:
 
 
 # ---------------------------------------------------------------------------
+# inject_agnes_thinking
+# ---------------------------------------------------------------------------
+
+class TestInjectAgnesThinking:
+    def test_octonary_injects_thinking_parameters(self, dashscope_module):
+        body = {"model": "agnes-3.0-flash", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_agnes_thinking(body, "octonary")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+        assert result["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+
+    def test_octonary_preserves_existing_kwargs(self, dashscope_module):
+        body = {
+            "model": "agnes-3.0-flash",
+            "messages": [{"role": "user", "content": "test"}],
+            "chat_template_kwargs": {"custom_param": "value"}
+        }
+        result = dashscope_module.inject_agnes_thinking(body, "octonary")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+        assert result["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+        assert result["chat_template_kwargs"]["custom_param"] == "value"
+
+    def test_octonary_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {
+            "model": "agnes-3.0-flash",
+            "messages": [{"role": "user", "content": "test"}],
+            "chat_template_kwargs": {"enable_thinking": False, "reasoning_effort": "low"}
+        }
+        result = dashscope_module.inject_agnes_thinking(body, "octonary")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+        assert result["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+
+    def test_non_octonary_unchanged(self, dashscope_module):
+        body = {"model": "gpt-4", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_agnes_thinking(body, "primary")
+        assert "chat_template_kwargs" not in result
+
+    def test_non_octonary_with_existing_kwargs_unchanged(self, dashscope_module):
+        body = {
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "test"}],
+            "chat_template_kwargs": {"custom_param": "value"}
+        }
+        result = dashscope_module.inject_agnes_thinking(body, "secondary")
+        assert "enable_thinking" not in result["chat_template_kwargs"]
+        assert "reasoning_effort" not in result["chat_template_kwargs"]
+        assert result["chat_template_kwargs"]["custom_param"] == "value"
+
+
+class TestInjectQwenThinking:
+    def test_qwen38_max_injects_thinking_parameters(self, dashscope_module):
+        body = {"model": "qwen3.8-max", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_qwen_thinking(body, "qwen3.8-max")
+        assert result["parameters"]["enable_thinking"] is True
+        assert result["parameters"]["reasoning_effort"] == "xhigh"
+
+    def test_qwen38_max_0902_injects_thinking_parameters(self, dashscope_module):
+        body = {"model": "qwen3.8-max-0902", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_qwen_thinking(body, "qwen3.8-max-0902")
+        assert result["parameters"]["enable_thinking"] is True
+        assert result["parameters"]["reasoning_effort"] == "xhigh"
+
+    def test_qwen38_preserves_existing_parameters(self, dashscope_module):
+        body = {
+            "model": "qwen3.8-max",
+            "messages": [{"role": "user", "content": "test"}],
+            "parameters": {"temperature": 0.7}
+        }
+        result = dashscope_module.inject_qwen_thinking(body, "qwen3.8-max")
+        assert result["parameters"]["enable_thinking"] is True
+        assert result["parameters"]["reasoning_effort"] == "xhigh"
+        assert result["parameters"]["temperature"] == 0.7
+
+    def test_qwen38_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {
+            "model": "qwen3.8-max",
+            "messages": [{"role": "user", "content": "test"}],
+            "parameters": {"enable_thinking": False, "reasoning_effort": "low"}
+        }
+        result = dashscope_module.inject_qwen_thinking(body, "qwen3.8-max")
+        assert result["parameters"]["enable_thinking"] is True
+        assert result["parameters"]["reasoning_effort"] == "xhigh"
+
+    def test_qwen37_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "qwen3.7-plus", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_qwen_thinking(body, "qwen3.7-plus")
+        assert result["parameters"]["enable_thinking"] is True
+
+    def test_qwen36_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "qwen3.6-plus", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_qwen_thinking(body, "qwen3.6-plus")
+        assert result["parameters"]["enable_thinking"] is True
+
+    def test_qwen35_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "qwen3.5-plus", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_qwen_thinking(body, "qwen3.5-plus")
+        assert result["parameters"]["enable_thinking"] is True
+
+    def test_qwen37_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {
+            "model": "qwen3.7-plus",
+            "messages": [{"role": "user", "content": "test"}],
+            "parameters": {"enable_thinking": False}
+        }
+        result = dashscope_module.inject_qwen_thinking(body, "qwen3.7-plus")
+        assert result["parameters"]["enable_thinking"] is True
+
+    def test_non_qwen_unchanged(self, dashscope_module):
+        body = {"model": "gpt-4", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_qwen_thinking(body, "gpt-4")
+        assert "parameters" not in result
+
+
+class TestInjectGlm53Thinking:
+    def test_glm53_injects_thinking_parameters(self, dashscope_module):
+        body = {"model": "glm-5.3", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm53_thinking(body, "glm-5.3")
+        assert result["parameters"]["enable_thinking"] is True
+        assert result["parameters"]["reasoning_effort"] == "max"
+
+    def test_glm53_flash_injects_thinking_parameters(self, dashscope_module):
+        body = {"model": "glm-5.3-flash", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm53_thinking(body, "glm-5.3-flash")
+        assert result["parameters"]["enable_thinking"] is True
+        assert result["parameters"]["reasoning_effort"] == "max"
+
+    def test_glm53_preserves_existing_parameters(self, dashscope_module):
+        body = {
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": "test"}],
+            "parameters": {"temperature": 0.5}
+        }
+        result = dashscope_module.inject_glm53_thinking(body, "glm-5.3")
+        assert result["parameters"]["enable_thinking"] is True
+        assert result["parameters"]["reasoning_effort"] == "max"
+        assert result["parameters"]["temperature"] == 0.5
+
+    def test_glm53_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": "test"}],
+            "parameters": {"enable_thinking": False, "reasoning_effort": "low"}
+        }
+        result = dashscope_module.inject_glm53_thinking(body, "glm-5.3")
+        assert result["parameters"]["enable_thinking"] is True
+        assert result["parameters"]["reasoning_effort"] == "max"
+
+    def test_glm52_unchanged(self, dashscope_module):
+        body = {"model": "glm-5.2", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm53_thinking(body, "glm-5.2")
+        assert "parameters" not in result
+
+    def test_glm5_unchanged(self, dashscope_module):
+        body = {"model": "glm-5", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm53_thinking(body, "glm-5")
+        assert "parameters" not in result
+
+
+class TestInjectGlm5Thinking:
+    def test_glm5_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "glm-5", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm5_thinking(body, "glm-5")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_glm51_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "glm-5.1", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm5_thinking(body, "glm-5.1")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_glm5_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {
+            "model": "glm-5",
+            "messages": [{"role": "user", "content": "test"}],
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
+        result = dashscope_module.inject_glm5_thinking(body, "glm-5")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_non_glm5_unchanged(self, dashscope_module):
+        body = {"model": "glm-4", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm5_thinking(body, "glm-4")
+        assert "chat_template_kwargs" not in result
+
+
+class TestInjectKimiThinking:
+    def test_kimi_k2_injects_thinking_enabled(self, dashscope_module):
+        body = {"model": "kimi-k2", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_kimi_thinking(body, "kimi-k2")
+        assert result["thinking"]["type"] == "enabled"
+
+    def test_kimi_k25_injects_thinking_enabled(self, dashscope_module):
+        body = {"model": "kimi-k2.5", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_kimi_thinking(body, "kimi-k2.5")
+        assert result["thinking"]["type"] == "enabled"
+
+    def test_kimi_k2_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {
+            "model": "kimi-k2",
+            "messages": [{"role": "user", "content": "test"}],
+            "thinking": {"type": "disabled"}
+        }
+        result = dashscope_module.inject_kimi_thinking(body, "kimi-k2")
+        assert result["thinking"]["type"] == "enabled"
+
+    def test_non_kimi_unchanged(self, dashscope_module):
+        body = {"model": "gpt-4", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_kimi_thinking(body, "gpt-4")
+        assert "thinking" not in result
+
+
+class TestInjectMimoThinking:
+    def test_mimo_v2_injects_thinking_enabled(self, dashscope_module):
+        body = {"model": "mimo-v2", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_mimo_thinking(body, "mimo-v2")
+        assert result["thinking"]["type"] == "enabled"
+
+    def test_mimo_v25_injects_thinking_enabled(self, dashscope_module):
+        body = {"model": "mimo-v2.5", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_mimo_thinking(body, "mimo-v2.5")
+        assert result["thinking"]["type"] == "enabled"
+
+    def test_mimo_v2_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {
+            "model": "mimo-v2",
+            "messages": [{"role": "user", "content": "test"}],
+            "thinking": {"type": "disabled"}
+        }
+        result = dashscope_module.inject_mimo_thinking(body, "mimo-v2")
+        assert result["thinking"]["type"] == "enabled"
+
+    def test_non_mimo_unchanged(self, dashscope_module):
+        body = {"model": "gpt-4", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_mimo_thinking(body, "gpt-4")
+        assert "thinking" not in result
+
+
+class TestInjectDeepseekThinking:
+    def test_deepseek_v31_injects_thinking_enabled(self, dashscope_module):
+        body = {"model": "deepseek-v3.1", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_deepseek_thinking(body, "deepseek-v3.1")
+        assert result["chat_template_kwargs"]["thinking"] is True
+
+    def test_deepseek_v32_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "deepseek-v3.2", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_deepseek_thinking(body, "deepseek-v3.2")
+        assert result["parameters"]["enable_thinking"] is True
+        assert result["parameters"]["reasoning_effort"] == "max"
+
+    def test_deepseek_v4_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "deepseek-v4", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_deepseek_thinking(body, "deepseek-v4")
+        assert result["parameters"]["enable_thinking"] is True
+        assert result["parameters"]["reasoning_effort"] == "max"
+
+    def test_non_deepseek_unchanged(self, dashscope_module):
+        body = {"model": "gpt-4", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_deepseek_thinking(body, "gpt-4")
+        assert "parameters" not in result
+
+
+class TestInjectMinimaxThinking:
+    def test_minimax_m25_injects_thinking_enabled(self, dashscope_module):
+        body = {"model": "MiniMax-M2.5", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_minimax_thinking(body, "MiniMax-M2.5")
+        assert result["parameters"]["thinking_mode"] is True
+
+    def test_minimax_m3_injects_thinking_enabled(self, dashscope_module):
+        body = {"model": "MiniMax-M3", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_minimax_thinking(body, "MiniMax-M3")
+        assert result["parameters"]["thinking_mode"] is True
+
+    def test_minimax_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {
+            "model": "MiniMax-M2.5",
+            "messages": [{"role": "user", "content": "test"}],
+            "parameters": {"thinking_mode": False}
+        }
+        result = dashscope_module.inject_minimax_thinking(body, "MiniMax-M2.5")
+        assert result["parameters"]["thinking_mode"] is True
+
+    def test_non_minimax_unchanged(self, dashscope_module):
+        body = {"model": "gpt-4", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_minimax_thinking(body, "gpt-4")
+        assert "parameters" not in result
+
+
+# ---------------------------------------------------------------------------
 # _add_forwarded_headers
 # ---------------------------------------------------------------------------
 
@@ -1763,13 +2049,23 @@ class TestProviderRouter:
         assert router.get_provider_for_model(model_id).name == "secondary"
 
     @pytest.mark.parametrize("model_id", [
-        "qwen3.6-plus", "qwen3.7-plus", "kimi-k2-5", "glm-5-0", "MiniMax-M2.5",
+        "qwen3.5-plus", "qwen3.6-plus", "qwen3.7-plus", "kimi-k2.5", "MiniMax-M2.5",
     ])
     def test_all_primary_models_routed_to_primary(self, dashscope_module, monkeypatch, model_id):
         monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
         monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1")
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model(model_id).name == "primary"
+
+    def test_glm_5_routes_to_primary_when_septenary_unconfigured(self, dashscope_module, monkeypatch):
+        """glm-5 is primary-only when septenary (GLM/Z.ai) is not configured.
+        It is a genuine cross-provider model: when septenary IS configured,
+        the overlap registry routes it to septenary (higher fallback priority).
+        """
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("glm-5").name == "primary"
 
     def test_unknown_model_defaults_to_primary_even_with_secondary(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
@@ -1784,6 +2080,37 @@ class TestProviderRouter:
         router = dashscope_module.ProviderRouter()
         provider = router.get_provider_for_model("mimo-v2.5-pro")
         assert provider.name == "primary"
+
+    def test_qwen3_5_plus_routed_to_primary(self, dashscope_module, monkeypatch):
+        """qwen3.5-plus is in MOCK_MODELS; routes to primary."""
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("qwen3.5-plus").name == "primary"
+
+    def test_glm_5_overlap_primary_vs_septenary(self, dashscope_module, monkeypatch):
+        """glm-5 exists in both MOCK_MODELS and SEPTENARY_MODELS.
+        When septenary is unconfigured, glm-5 routes to primary (primary-only).
+        When septenary is configured, the overlap registry lists both providers
+        and routing follows fallback priority (septenary before primary)."""
+        # Case 1: septenary unconfigured -> primary
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("glm-5").name == "primary"
+        assert "glm-5" not in router.get_model_overlaps()
+
+        # Case 2: septenary configured -> overlap, septenary first
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_API_KEY", "sk-glm")
+        monkeypatch.setattr("dashscope_proxy_lib.config.SEPTENARY_BASE_URL", "https://api.z.ai/api/paas/v4")
+        router = dashscope_module.ProviderRouter()
+        providers = router.get_providers_for_model("glm-5")
+        provider_names = [p.name for p in providers]
+        assert "primary" in provider_names
+        assert "septenary" in provider_names
+        # Septenary has higher priority in the fallback order, so it comes first
+        assert provider_names[0] == "septenary"
+        assert "glm-5" in router.get_model_overlaps()
 
     def test_get_all_models_includes_secondary_when_configured(self, dashscope_module, monkeypatch):
         monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
