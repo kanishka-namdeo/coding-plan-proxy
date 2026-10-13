@@ -162,6 +162,14 @@ from dashscope_proxy_lib.request_transform import (
     inject_mimo_thinking,
     inject_deepseek_thinking,
     inject_minimax_thinking,
+    inject_gpt_thinking,
+    inject_grok_thinking,
+    inject_muse_thinking,
+    inject_glm4_thinking,
+    inject_nemotron_thinking,
+    inject_ling_thinking,
+    inject_step5_thinking,
+    inject_longcat_thinking,
     GENERATION_PATH_MARKERS,
 )
 
@@ -232,7 +240,11 @@ __all__ = [
     "_is_chat_endpoint", "requires_messages", "inject_agnes_thinking",
     "inject_qwen_thinking", "inject_glm53_thinking", "inject_glm5_thinking",
     "inject_kimi_thinking", "inject_mimo_thinking", "inject_deepseek_thinking",
-    "inject_minimax_thinking", "GENERATION_PATH_MARKERS",
+    "inject_minimax_thinking",
+    "inject_gpt_thinking", "inject_grok_thinking", "inject_muse_thinking",
+    "inject_glm4_thinking", "inject_nemotron_thinking", "inject_ling_thinking",
+    "inject_step5_thinking", "inject_longcat_thinking",
+    "GENERATION_PATH_MARKERS",
     # http helpers
     "parse_retry_after", "should_retry_429", "_make_error_response", "_add_ratelimit_headers",
     "_strip_hop_by_hop", "_client_disconnected", "_compute_backoff",

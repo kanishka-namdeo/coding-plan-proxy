@@ -184,15 +184,17 @@ def inject_mimo_thinking(body: dict, model_name: str) -> dict:
 
 
 def inject_deepseek_thinking(body: dict, model_name: str) -> dict:
-    """Force thinking mode for DeepSeek V3.1/V3.2/V4 models.
-    
+    """Force thinking mode for DeepSeek V3.1/V3.2/V4 and Flash models.
+
     DeepSeek V3.1/V3.2/V4 support enable_thinking parameter.
     V3.1 uses chat_template_kwargs.thinking: true
     V3.2/V4 use enable_thinking: true with optional reasoning_effort.
+    deepseek-flash uses a top-level thinking:{type} object plus a
+    top-level reasoning_effort knob (max).
     """
     if not model_name:
         return body
-    
+
     # DeepSeek V3.1 uses chat_template_kwargs.thinking
     if model_name == "deepseek-v3.1":
         kwargs = body.get("chat_template_kwargs")
@@ -208,7 +210,15 @@ def inject_deepseek_thinking(body: dict, model_name: str) -> dict:
             body["parameters"] = params
         params["enable_thinking"] = True
         params["reasoning_effort"] = "max"
-    
+    # deepseek-flash uses a top-level thinking object + reasoning_effort
+    elif model_name == "deepseek-flash":
+        thinking = body.get("thinking")
+        if not isinstance(thinking, dict):
+            thinking = {}
+            body["thinking"] = thinking
+        thinking["type"] = "enabled"
+        body["reasoning_effort"] = "max"
+
     return body
 
 
@@ -242,7 +252,7 @@ def inject_glm5_thinking(body: dict, model_name: str) -> dict:
 
 def inject_minimax_thinking(body: dict, model_name: str) -> dict:
     """Force thinking mode for MiniMax M2.5/M3 models.
-    
+
     MiniMax models use thinking_mode parameter.
     """
     if not model_name or not model_name.startswith("MiniMax-M"):
@@ -252,4 +262,121 @@ def inject_minimax_thinking(body: dict, model_name: str) -> dict:
         params = {}
         body["parameters"] = params
     params["thinking_mode"] = True
+    return body
+
+
+def inject_gpt_thinking(body: dict, model_name: str) -> dict:
+    """Force maximum reasoning effort for OpenAI GPT-5.x/GPT-6 models (OpenLux).
+
+    The OpenAI reasoning ladder is none/minimal/low/medium/high/xhigh/max,
+    so ``max`` is the ceiling. Exposed as a top-level ``reasoning_effort`` on
+    chat completions. Older gpt-4.x is intentionally not matched — it has no
+    documented reasoning-effort knob.
+    """
+    if not model_name or not model_name.startswith(("gpt-5", "gpt-6")):
+        return body
+    body["reasoning_effort"] = "max"
+    return body
+
+
+def inject_grok_thinking(body: dict, model_name: str) -> dict:
+    """Force maximum reasoning effort for xAI Grok models (OpenLux).
+
+    Grok exposes a top-level ``reasoning_effort``; grok-4.6 documents
+    low/medium/high/xhigh, and the knob cannot be disabled, so ``xhigh`` is
+    the ceiling.
+    """
+    if not model_name or not model_name.startswith("grok"):
+        return body
+    body["reasoning_effort"] = "xhigh"
+    return body
+
+
+def inject_muse_thinking(body: dict, model_name: str) -> dict:
+    """Force maximum documented reasoning effort for Meta Muse Spark models.
+
+    Muse Spark (quinary / OpenCode Zen free) exposes a top-level
+    ``reasoning_effort``. The contributor tier caps at ``xhigh`` and does not
+    document the standard-tier-only ``max`` level, so ``xhigh`` is the safe
+    ceiling for the whole family.
+    """
+    if not model_name or not model_name.startswith("muse"):
+        return body
+    body["reasoning_effort"] = "xhigh"
+    return body
+
+
+def inject_glm4_thinking(body: dict, model_name: str) -> dict:
+    """Force thinking on for GLM-4.x / GLM-5-turbo models (GLM / Z.ai).
+
+    These pre-GLM-5.2 Z.ai generations have a thinking toggle but no
+    reasoning_effort knob (effort starts at GLM-5.2). They follow the proven
+    GLM-5 Z.ai convention of ``chat_template_kwargs.enable_thinking``.
+    """
+    if not model_name or not model_name.startswith(
+        ("glm-4.5", "glm-4.6", "glm-4.7", "glm-5-turbo")
+    ):
+        return body
+    kwargs = body.get("chat_template_kwargs")
+    if not isinstance(kwargs, dict):
+        kwargs = {}
+        body["chat_template_kwargs"] = kwargs
+    kwargs["enable_thinking"] = True
+    return body
+
+
+def inject_nemotron_thinking(body: dict, model_name: str) -> dict:
+    """Force thinking on for NVIDIA Nemotron models (OpenCode Zen free tier).
+
+    Nemotron 3.5 Lightning supports an enable_thinking toggle via
+    ``chat_template_kwargs``. Best-effort through the OpenAI-compatible Zen
+    gateway — the gateway may drop the knob if it does not forward it.
+    """
+    if not model_name or not model_name.startswith("nemotron"):
+        return body
+    kwargs = body.get("chat_template_kwargs")
+    if not isinstance(kwargs, dict):
+        kwargs = {}
+        body["chat_template_kwargs"] = kwargs
+    kwargs["enable_thinking"] = True
+    return body
+
+
+def inject_ling_thinking(body: dict, model_name: str) -> dict:
+    """Force thinking on for Ant/InclusionAI Ling-3 models (OpenCode Zen free).
+
+    Ling-3.1-flash is a hybrid-reasoning model with a top-level
+    ``enable_thinking`` boolean. Best-effort through the Zen gateway.
+    """
+    if not model_name or not model_name.startswith("ling-3"):
+        return body
+    body["enable_thinking"] = True
+    return body
+
+
+def inject_step5_thinking(body: dict, model_name: str) -> dict:
+    """Force maximum documented reasoning effort for StepFun Step-5 models.
+
+    Step-5-preview exposes a top-level ``reasoning_effort`` capped at
+    ``"high"``. Best-effort through the Zen gateway.
+    """
+    if not model_name or not model_name.startswith("step-5"):
+        return body
+    body["reasoning_effort"] = "high"
+    return body
+
+
+def inject_longcat_thinking(body: dict, model_name: str) -> dict:
+    """Force thinking on for Meituan LongCat models (OpenCode Zen free tier).
+
+    LongCat 2.5 uses a top-level ``thinking`` object with ``type: enabled``.
+    Best-effort through the Zen gateway.
+    """
+    if not model_name or not model_name.startswith("longcat"):
+        return body
+    thinking = body.get("thinking")
+    if not isinstance(thinking, dict):
+        thinking = {}
+        body["thinking"] = thinking
+    thinking["type"] = "enabled"
     return body

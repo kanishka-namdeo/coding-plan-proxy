@@ -28,6 +28,9 @@ from dashscope_proxy_lib.request_transform import (
     inject_agnes_thinking, inject_qwen_thinking, inject_glm53_thinking,
     inject_kimi_thinking, inject_mimo_thinking, inject_deepseek_thinking,
     inject_glm5_thinking, inject_minimax_thinking,
+    inject_gpt_thinking, inject_grok_thinking, inject_muse_thinking,
+    inject_glm4_thinking, inject_nemotron_thinking, inject_ling_thinking,
+    inject_step5_thinking, inject_longcat_thinking,
 )
 from dashscope_proxy_lib.http_helpers import (
     _add_forwarded_headers, _add_ratelimit_headers, _client_disconnected, _compute_backoff,
@@ -320,6 +323,14 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
         body = inject_mimo_thinking(body, model_name or "")
         body = inject_deepseek_thinking(body, model_name or "")
         body = inject_minimax_thinking(body, model_name or "")
+        body = inject_gpt_thinking(body, model_name or "")
+        body = inject_grok_thinking(body, model_name or "")
+        body = inject_muse_thinking(body, model_name or "")
+        body = inject_glm4_thinking(body, model_name or "")
+        body = inject_nemotron_thinking(body, model_name or "")
+        body = inject_ling_thinking(body, model_name or "")
+        body = inject_step5_thinking(body, model_name or "")
+        body = inject_longcat_thinking(body, model_name or "")
 
     # Single dump after transforms + pin strip; estimate from already-parsed dict
     if body is not None:

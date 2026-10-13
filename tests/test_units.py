@@ -819,6 +819,287 @@ class TestInjectMinimaxThinking:
 
 
 # ---------------------------------------------------------------------------
+# inject_gpt_thinking
+# ---------------------------------------------------------------------------
+
+class TestInjectGptThinking:
+    def test_gpt56_injects_max_effort(self, dashscope_module):
+        body = {"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_gpt_thinking(body, "gpt-5.6-sol")
+        assert result["reasoning_effort"] == "max"
+
+    def test_gpt6_injects_max_effort(self, dashscope_module):
+        body = {"model": "gpt-6-astra", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_gpt_thinking(body, "gpt-6-astra")
+        assert result["reasoning_effort"] == "max"
+
+    def test_gpt_preserves_other_params(self, dashscope_module):
+        body = {"model": "gpt-5.6-luna", "messages": [{"role": "user", "content": "test"}],
+                "temperature": 0.5}
+        result = dashscope_module.inject_gpt_thinking(body, "gpt-5.6-luna")
+        assert result["reasoning_effort"] == "max"
+        assert result["temperature"] == 0.5
+
+    def test_gpt_overwrites_conflicting_effort(self, dashscope_module):
+        body = {"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "test"}],
+                "reasoning_effort": "low"}
+        result = dashscope_module.inject_gpt_thinking(body, "gpt-5.6-sol")
+        assert result["reasoning_effort"] == "max"
+
+    def test_gpt4_unchanged(self, dashscope_module):
+        body = {"model": "gpt-4", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_gpt_thinking(body, "gpt-4")
+        assert "reasoning_effort" not in result
+
+    def test_other_model_unchanged(self, dashscope_module):
+        body = {"model": "grok-4.6", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_gpt_thinking(body, "grok-4.6")
+        assert "reasoning_effort" not in result
+
+
+# ---------------------------------------------------------------------------
+# inject_grok_thinking
+# ---------------------------------------------------------------------------
+
+class TestInjectGrokThinking:
+    def test_grok46_injects_xhigh_effort(self, dashscope_module):
+        body = {"model": "grok-4.6", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_grok_thinking(body, "grok-4.6")
+        assert result["reasoning_effort"] == "xhigh"
+
+    def test_grok_overwrites_conflicting_effort(self, dashscope_module):
+        body = {"model": "grok-4.6", "messages": [{"role": "user", "content": "test"}],
+                "reasoning_effort": "low"}
+        result = dashscope_module.inject_grok_thinking(body, "grok-4.6")
+        assert result["reasoning_effort"] == "xhigh"
+
+    def test_non_grok_unchanged(self, dashscope_module):
+        body = {"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_grok_thinking(body, "gpt-5.6-sol")
+        assert "reasoning_effort" not in result
+
+
+# ---------------------------------------------------------------------------
+# inject_muse_thinking
+# ---------------------------------------------------------------------------
+
+class TestInjectMuseThinking:
+    def test_muse_spark_injects_xhigh_effort(self, dashscope_module):
+        body = {"model": "muse-spark-1.3", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_muse_thinking(body, "muse-spark-1.3")
+        assert result["reasoning_effort"] == "xhigh"
+
+    def test_muse_spark_contributor_injects_xhigh_effort(self, dashscope_module):
+        body = {"model": "muse-spark-1.3-contributor", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_muse_thinking(body, "muse-spark-1.3-contributor")
+        assert result["reasoning_effort"] == "xhigh"
+
+    def test_muse_overwrites_conflicting_effort(self, dashscope_module):
+        body = {"model": "muse-spark-1.3", "messages": [{"role": "user", "content": "test"}],
+                "reasoning_effort": "low"}
+        result = dashscope_module.inject_muse_thinking(body, "muse-spark-1.3")
+        assert result["reasoning_effort"] == "xhigh"
+
+    def test_non_muse_unchanged(self, dashscope_module):
+        body = {"model": "glm-5", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_muse_thinking(body, "glm-5")
+        assert "reasoning_effort" not in result
+
+
+# ---------------------------------------------------------------------------
+# inject_glm4_thinking
+# ---------------------------------------------------------------------------
+
+class TestInjectGlm4Thinking:
+    def test_glm47_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "glm-4.7", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm4_thinking(body, "glm-4.7")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_glm5_turbo_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "glm-5-turbo", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm4_thinking(body, "glm-5-turbo")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_glm45_air_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "glm-4.5-air", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm4_thinking(body, "glm-4.5-air")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_glm4_preserves_existing_kwargs(self, dashscope_module):
+        body = {"model": "glm-4.6", "messages": [{"role": "user", "content": "test"}],
+                "chat_template_kwargs": {"custom": 1}}
+        result = dashscope_module.inject_glm4_thinking(body, "glm-4.6")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+        assert result["chat_template_kwargs"]["custom"] == 1
+
+    def test_glm5_unchanged(self, dashscope_module):
+        # glm-5 is handled by inject_glm5_thinking, not the GLM-4 family
+        body = {"model": "glm-5", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm4_thinking(body, "glm-5")
+        assert "chat_template_kwargs" not in result
+
+    def test_glm53_unchanged(self, dashscope_module):
+        body = {"model": "glm-5.3", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_glm4_thinking(body, "glm-5.3")
+        assert "chat_template_kwargs" not in result
+
+
+# ---------------------------------------------------------------------------
+# inject_nemotron_thinking
+# ---------------------------------------------------------------------------
+
+class TestInjectNemotronThinking:
+    def test_nemotron_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "nemotron-3.5-lightning-free", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_nemotron_thinking(body, "nemotron-3.5-lightning-free")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_nemotron_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {"model": "nemotron-3.5-lightning-free", "messages": [{"role": "user", "content": "test"}],
+                "chat_template_kwargs": {"enable_thinking": False}}
+        result = dashscope_module.inject_nemotron_thinking(body, "nemotron-3.5-lightning-free")
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_non_nemotron_unchanged(self, dashscope_module):
+        body = {"model": "big-pickle", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_nemotron_thinking(body, "big-pickle")
+        assert "chat_template_kwargs" not in result
+
+
+# ---------------------------------------------------------------------------
+# inject_ling_thinking
+# ---------------------------------------------------------------------------
+
+class TestInjectLingThinking:
+    def test_ling_injects_enable_thinking(self, dashscope_module):
+        body = {"model": "ling-3.1-flash-free", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_ling_thinking(body, "ling-3.1-flash-free")
+        assert result["enable_thinking"] is True
+
+    def test_ling_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {"model": "ling-3.1-flash-free", "messages": [{"role": "user", "content": "test"}],
+                "enable_thinking": False}
+        result = dashscope_module.inject_ling_thinking(body, "ling-3.1-flash-free")
+        assert result["enable_thinking"] is True
+
+    def test_non_ling_unchanged(self, dashscope_module):
+        body = {"model": "step-5-preview-free", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_ling_thinking(body, "step-5-preview-free")
+        assert "enable_thinking" not in result
+
+
+# ---------------------------------------------------------------------------
+# inject_step5_thinking
+# ---------------------------------------------------------------------------
+
+class TestInjectStep5Thinking:
+    def test_step5_injects_high_effort(self, dashscope_module):
+        body = {"model": "step-5-preview-free", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_step5_thinking(body, "step-5-preview-free")
+        assert result["reasoning_effort"] == "high"
+
+    def test_step5_overwrites_conflicting_effort(self, dashscope_module):
+        body = {"model": "step-5-preview-free", "messages": [{"role": "user", "content": "test"}],
+                "reasoning_effort": "low"}
+        result = dashscope_module.inject_step5_thinking(body, "step-5-preview-free")
+        assert result["reasoning_effort"] == "high"
+
+    def test_non_step5_unchanged(self, dashscope_module):
+        body = {"model": "longcat-2.5-preview-free", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_step5_thinking(body, "longcat-2.5-preview-free")
+        assert "reasoning_effort" not in result
+
+
+# ---------------------------------------------------------------------------
+# inject_longcat_thinking
+# ---------------------------------------------------------------------------
+
+class TestInjectLongcatThinking:
+    def test_longcat_injects_thinking_enabled(self, dashscope_module):
+        body = {"model": "longcat-2.5-preview-free", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_longcat_thinking(body, "longcat-2.5-preview-free")
+        assert result["thinking"]["type"] == "enabled"
+
+    def test_longcat_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {"model": "longcat-2.5-preview-free", "messages": [{"role": "user", "content": "test"}],
+                "thinking": {"type": "disabled"}}
+        result = dashscope_module.inject_longcat_thinking(body, "longcat-2.5-preview-free")
+        assert result["thinking"]["type"] == "enabled"
+
+    def test_non_longcat_unchanged(self, dashscope_module):
+        body = {"model": "big-pickle", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_longcat_thinking(body, "big-pickle")
+        assert "thinking" not in result
+
+
+# ---------------------------------------------------------------------------
+# deepseek-flash (extends inject_deepseek_thinking)
+# ---------------------------------------------------------------------------
+
+class TestInjectDeepseekFlashThinking:
+    def test_deepseek_flash_injects_thinking_and_effort(self, dashscope_module):
+        body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "test"}]}
+        result = dashscope_module.inject_deepseek_thinking(body, "deepseek-flash")
+        assert result["thinking"]["type"] == "enabled"
+        assert result["reasoning_effort"] == "max"
+
+    def test_deepseek_flash_preserves_other_params(self, dashscope_module):
+        body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "test"}],
+                "temperature": 0.4}
+        result = dashscope_module.inject_deepseek_thinking(body, "deepseek-flash")
+        assert result["thinking"]["type"] == "enabled"
+        assert result["reasoning_effort"] == "max"
+        assert result["temperature"] == 0.4
+
+    def test_deepseek_flash_overwrites_conflicting_thinking(self, dashscope_module):
+        body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "test"}],
+                "thinking": {"type": "disabled"}, "reasoning_effort": "low"}
+        result = dashscope_module.inject_deepseek_thinking(body, "deepseek-flash")
+        assert result["thinking"]["type"] == "enabled"
+        assert result["reasoning_effort"] == "max"
+
+
+# ---------------------------------------------------------------------------
+# No-injection guards: Zen models that must NOT be auto-injected
+# ---------------------------------------------------------------------------
+
+class TestZenNoInjectModels:
+    """big-pickle (rotating stealth alias), jev-1.13* (decision model), and
+    space-bunny-free (unconfirmed vendor) have no reliable thinking knob, so
+    every injector must leave them untouched."""
+
+    _GUARDED = ("big-pickle", "jev-1.13.0", "jev-1.13-free", "space-bunny-free")
+
+    def test_no_injector_touches_guarded_models(self, dashscope_module):
+        injectors = [
+            dashscope_module.inject_gpt_thinking,
+            dashscope_module.inject_grok_thinking,
+            dashscope_module.inject_muse_thinking,
+            dashscope_module.inject_glm4_thinking,
+            dashscope_module.inject_nemotron_thinking,
+            dashscope_module.inject_ling_thinking,
+            dashscope_module.inject_step5_thinking,
+            dashscope_module.inject_longcat_thinking,
+        ]
+        for model in self._GUARDED:
+            body = {"model": model, "messages": [{"role": "user", "content": "test"}]}
+            snapshot = dict(body)
+            for inject in injectors:
+                inject(body, model)
+            assert body == snapshot, f"unexpected mutation for {model}: {body} != {snapshot}"
+
+    def test_gemini_has_no_injectable_knob(self, dashscope_module):
+        # Gemini thinking lives under generateContent.thinkingConfig, which the
+        # OpenAI-style OpenLux gateway does not surface; no injector matches it.
+        for model in ("gemini-3.7-flash", "gemini-3.8-flash"):
+            body = {"model": model, "messages": [{"role": "user", "content": "test"}]}
+            dashscope_module.inject_gpt_thinking(body, model)
+            dashscope_module.inject_grok_thinking(body, model)
+            assert "reasoning_effort" not in body
+
+
+# ---------------------------------------------------------------------------
 # _add_forwarded_headers
 # ---------------------------------------------------------------------------
 
