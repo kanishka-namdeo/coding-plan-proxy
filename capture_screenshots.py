@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Capture TUI screenshots for README documentation."""
 
+import argparse
 import asyncio
 import json
 import os
@@ -11,24 +12,113 @@ from urllib.request import urlopen
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
+class ScreenshotSourceError(RuntimeError):
+    """The configured base URL does not serve this proxy's status payload."""
+
+
+# Sentinel for "key absent", so a present-but-None `rate_limits` is not
+# confused with a missing one.
+_MISSING = object()
+
+
 class LiveRateLimiterProxy:
     """Rate limiter that fetches status from the running proxy."""
 
     def __init__(self, base_url: str = "http://127.0.0.1:8899"):
         self.base_url = base_url
         self._recent_latencies: list[float] = []
+        # Endpoint unreachable → render the built-in placeholder.
+        self.fetch_failed = False
+        # Endpoint answered but the payload is not usable → hard error.
+        self.payload_error: str | None = None
 
     def status(self) -> dict:
-        """Fetch status from the running proxy's /v1/proxy/status endpoint."""
+        """Fetch status from the running proxy's /v1/proxy/status endpoint.
+
+        `GET /v1/proxy/status` does NOT serve the rate limiter's status dict
+        directly. `handlers.py` wraps it one level deep as
+        `{"rate_limits": rate_limiter.status(), "providers": …,
+        "model_overlaps": …}`, while the TUI consumes the limiter status FLAT
+        (`primary` / `secondary` / … at the top level — that is what
+        `tui_status.provider_grid_rows`, `ProxyTUI._REQUIRED_STATUS_KEYS` and
+        `_validate_status` all read). Handing the wrapper straight through left
+        the TUI looking one level too deep, so every panel rendered empty.
+
+        So `_normalize_payload` unwraps `rate_limits` here. That is also why a
+        `rate_limits`/`providers`/`model_overlaps` payload must NOT be reported
+        as a foreign service squatting the port: that IS this proxy's own,
+        legitimate response shape.
+
+        Falls back to `_default_status()` only when the endpoint is genuinely
+        unreachable. When the endpoint answers but its payload is unusable,
+        `payload_error` is set instead: the caller must not render a screenshot
+        from a payload it cannot read.
+        """
+        self.fetch_failed = False
+        self.payload_error = None
         try:
             with urlopen(f"{self.base_url}/v1/proxy/status", timeout=5) as resp:
                 data = json.loads(resp.read().decode())
-                # Add recent_latencies if not present
-                if "recent_latencies" not in data:
-                    data["recent_latencies"] = self._recent_latencies
-                return data
         except Exception:
+            self.fetch_failed = True
             return self._default_status()
+        return self._normalize_payload(data)
+
+    def _normalize_payload(self, data) -> dict:
+        """Unwrap the HTTP `rate_limits` envelope into the flat limiter status.
+
+        Three outcomes, each recorded on `payload_error` / `fetch_failed` so
+        the caller can tell them apart:
+
+        * envelope present and a dict → unwrapped, with `recent_latencies`
+          preserved (see `_merge_latencies`);
+        * `rate_limits` absent → the payload is already flat, used as-is;
+        * anything else (non-object JSON, non-dict `rate_limits`) → unusable.
+          That is a shape problem, so it is reported as one — never as an
+          `AttributeError` from deep inside a `dict.get` chain.
+        """
+        if not isinstance(data, dict):
+            self.payload_error = (
+                f"top-level JSON is a {type(data).__name__}, expected an object"
+            )
+            return self._default_status()
+
+        wrapped = data.get("rate_limits", _MISSING)
+        if wrapped is _MISSING:
+            # Already the limiter status (e.g. a hand-rolled mock endpoint).
+            limiter = dict(data)
+        elif isinstance(wrapped, dict):
+            limiter = dict(wrapped)
+        else:
+            self.payload_error = (
+                f"'rate_limits' is a JSON {type(wrapped).__name__}, expected an "
+                f"object (top-level keys: {self._key_summary(data)})"
+            )
+            return self._default_status()
+
+        limiter["recent_latencies"] = self._merge_latencies(limiter, data)
+        return limiter
+
+    def _merge_latencies(self, limiter: dict, payload: dict) -> list:
+        """Keep the MOST COMPLETE `recent_latencies` the payload can offer.
+
+        The limiter status carries its own combined `recent_latencies`; the HTTP
+        envelope may carry one at the top level as well. Neither may be dropped
+        for the other, and a populated list must never be blanked by a
+        sibling that happens to be empty — so the longer list wins, and
+        `self._recent_latencies` remains the last-resort fallback when the
+        payload offers neither.
+        """
+        best: list | None = None
+        for candidate in (limiter.get("recent_latencies"), payload.get("recent_latencies")):
+            if isinstance(candidate, list) and (best is None or len(candidate) > len(best)):
+                best = list(candidate)
+        return best if best else list(self._recent_latencies)
+
+    @staticmethod
+    def _key_summary(data: dict) -> str:
+        keys = sorted(str(k) for k in data)
+        return ", ".join(keys[:6]) if keys else "none"
 
     def _default_status(self) -> dict:
         return {
@@ -74,12 +164,44 @@ class MockProxyApp(dict):
         self["client_session"] = type("Session", (), {"closed": False})()
 
 
-async def main():
+async def main(base_url: str):
     from proxy_tui import ProxyTUI
+    from tui_status import provider_grid_rows
 
-    # Connect to the running proxy
-    print("Connecting to running proxy at http://127.0.0.1:8899...")
-    rate_limiter = LiveRateLimiterProxy("http://127.0.0.1:8899")
+    print(f"Connecting to running proxy at {base_url}...")
+    rate_limiter = LiveRateLimiterProxy(base_url)
+
+    # Fail loudly instead of writing a misleading empty dashboard, but name
+    # the ACTUAL problem. Three cases, deliberately distinct:
+    #
+    #   (a) unreachable       → warn, render the built-in placeholder (what
+    #                           `_default_status()` exists for), exit 0;
+    #   (b) reachable, payload unusable → hard error, NOTHING written;
+    #   (c) reachable, payload usable → capture.
+    #
+    # Case (b) used to blame a foreign service squatting the port. That was
+    # wrong: `rate_limits` / `providers` / `model_overlaps` is THIS proxy's own
+    # `/v1/proxy/status` envelope, and the cause was the missing unwrap that
+    # `LiveRateLimiterProxy._normalize_payload` now performs.
+    try:
+        probe = rate_limiter.status()
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ScreenshotSourceError(f"could not read {base_url}/v1/proxy/status: {exc}") from exc
+    if rate_limiter.payload_error:
+        raise ScreenshotSourceError(
+            f"{base_url}/v1/proxy/status answered with a payload shape this TUI "
+            f"cannot use: {rate_limiter.payload_error}. Nothing was written. "
+            f"Pass --base-url to point at a running DashScope proxy."
+        )
+    if rate_limiter.fetch_failed:
+        print("  WARNING: proxy unreachable — rendering the built-in placeholder status")
+    elif not provider_grid_rows(probe):
+        raise ScreenshotSourceError(
+            f"{base_url}/v1/proxy/status returned a status dict with no provider "
+            f"entries, so the Overview grid would be empty "
+            f"(top-level keys: {LiveRateLimiterProxy._key_summary(probe)}). "
+            f"Nothing was written."
+        )
 
     # Create a log handler with sample entries
     log_handler = MockLogHandler()
@@ -145,4 +267,15 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--base-url",
+        default="http://127.0.0.1:8899",
+        help="base URL of the RUNNING DashScope proxy (default: %(default)s)",
+    )
+    args = parser.parse_args()
+    try:
+        asyncio.run(main(args.base_url))
+    except ScreenshotSourceError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)

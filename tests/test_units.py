@@ -967,26 +967,27 @@ class TestConfigureLogging:
 class TestClientDisconnected:
     def test_disconnected_when_transport_closing(self, dashscope_module):
         req = MagicMock()
-        req.protocol.transport.is_closing.return_value = True
+        req.transport.is_closing.return_value = True
         assert dashscope_module._client_disconnected(req) is True
 
     def test_connected_when_transport_open(self, dashscope_module):
         req = MagicMock()
-        req.protocol.transport.is_closing.return_value = False
+        req.transport.is_closing.return_value = False
         assert dashscope_module._client_disconnected(req) is False
 
     def test_no_protocol_attribute(self, dashscope_module):
-        req = MagicMock(spec=[])  # no protocol attribute
+        req = MagicMock(spec=[])  # no transport or protocol attribute
         assert dashscope_module._client_disconnected(req) is False
 
-    def test_protocol_without_transport(self, dashscope_module):
+    def test_transport_none_and_protocol_without_transport(self, dashscope_module):
         req = MagicMock()
-        req.protocol = MagicMock(spec=[])  # no transport
+        req.transport = None  # request-level transport unavailable
+        req.protocol = MagicMock(spec=[])  # no transport on the protocol either
         assert dashscope_module._client_disconnected(req) is False
 
     def test_transport_without_is_closing(self, dashscope_module):
         req = MagicMock()
-        req.protocol.transport = MagicMock(spec=[])  # no is_closing
+        req.transport = MagicMock(spec=[])  # no is_closing
         assert dashscope_module._client_disconnected(req) is False
 
 
@@ -1681,6 +1682,19 @@ class TestLoadDisplayConfig:
             expected_source = "env" if "AGNES_TARGET_BASE" in os.environ else "default"
             assert row[3] == expected_source
 
+    def test_includes_opencode_limit_rows_and_base_url(self, dashscope_module):
+        rows = dashscope_module._load_display_config()
+        keys = {r[1] for r in rows}
+        groups = {r[0] for r in rows}
+        for key in ("opencode.rpm_limit", "opencode.tpm_limit"):
+            assert key in keys, f"missing {key} limit row"
+        assert "OpenCode Limits" in groups
+        assert "undenary_base_url" in keys
+        row = next(r for r in rows if r[1] == "undenary_base_url")
+        assert row[0] == "Providers"
+        expected_source = "env" if "OPENCODE_TARGET_BASE" in os.environ else "default"
+        assert row[3] == expected_source
+
     def test_preexisting_non_primary_prefixes_unchanged(self, dashscope_module):
         rows = dashscope_module._load_display_config()
         keys = {r[1] for r in rows}
@@ -2306,6 +2320,116 @@ class TestProviderRouter:
         assert router.get_provider_for_model("mimo-v2.5-pro").name == "secondary"
         assert router.get_provider_for_model("agnes-3.0-flash").name == "octonary"
 
+    # --- Undenary (OpenCode Zen) ---
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "big-pickle",
+            "ling-3.1-flash-free",
+            "mimo-v2.6-flash-free",
+            "muse-spark-1.2-contributor-free",
+            "muse-spark-1.3-contributor-free",
+            "nemotron-3.5-lightning-free",
+            "jev-1.13-free",
+            "step-5-preview-free",
+            "longcat-2.5-preview-free",
+            "space-bunny-free",
+        ],
+    )
+    def test_all_undenary_models_routed_to_undenary(self, dashscope_module, monkeypatch, model_id):
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_API_KEY", "sk-opencode")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.UNDENARY_BASE_URL", "https://opencode.ai/zen/v1"
+        )
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model(model_id)
+        assert provider.name == "undenary"
+        assert provider.api_key == "sk-opencode"
+
+    def test_undenary_unconfigured_returns_primary(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        assert router.undenary.is_available is False
+        assert router.get_provider_for_model("space-bunny-free").name == "primary"
+
+    def test_undenary_get_all_models_entry_and_availability(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_API_KEY", "sk-opencode")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.UNDENARY_BASE_URL", "https://opencode.ai/zen/v1"
+        )
+        router = dashscope_module.ProviderRouter()
+        entry = next(m for m in router.get_all_models()["data"] if m["id"] == "space-bunny-free")
+        assert entry["providers"] == ["undenary"]
+        assert entry["provider_models"] == ["opencode/space-bunny-free"]
+
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_BASE_URL", "")
+        router_off = dashscope_module.ProviderRouter()
+        assert "space-bunny-free" not in [m["id"] for m in router_off.get_all_models()["data"]]
+
+    def test_undenary_get_provider_status_masks_base_url(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_API_KEY", "sk-opencode")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.UNDENARY_BASE_URL", "https://opencode.ai/zen/v1"
+        )
+        status = dashscope_module.ProviderRouter().get_provider_status()
+        assert status["undenary"]["available"] is True
+        assert status["undenary"]["base_url"] == "https://opencode.ai/zen/v1"
+
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_BASE_URL", "")
+        status_off = dashscope_module.ProviderRouter().get_provider_status()
+        assert status_off["undenary"]["available"] is False
+        assert status_off["undenary"]["base_url"] is None
+
+    def test_undenary_model_provider_map_override(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_API_KEY", "sk-opencode")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.UNDENARY_BASE_URL", "https://opencode.ai/zen/v1"
+        )
+        mapping = {"custom-undenary-model": "undenary"}
+        monkeypatch.setattr("dashscope_proxy_lib.config.MODEL_PROVIDER_MAP", mapping)
+        monkeypatch.setattr("dashscope_proxy_lib.provider_router.MODEL_PROVIDER_MAP", mapping)
+        router = dashscope_module.ProviderRouter()
+        assert router.get_provider_for_model("custom-undenary-model").name == "undenary"
+        assert router.get_provider_for_model("big-pickle").name == "undenary"
+
+    def test_undenary_models_have_no_overlap(self, dashscope_module, monkeypatch):
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_API_KEY", "sk-opencode")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.UNDENARY_BASE_URL", "https://opencode.ai/zen/v1"
+        )
+        router = dashscope_module.ProviderRouter()
+        assert [p.name for p in router.get_providers_for_model("space-bunny-free")] == ["undenary"]
+        assert "space-bunny-free" not in router.get_model_overlaps()
+
+    def test_undenary_config_does_not_capture_existing_providers(
+        self, dashscope_module, monkeypatch
+    ):
+        """The Zen free catalog collides with nothing, so existing routing is intact."""
+        monkeypatch.setattr("dashscope_proxy_lib.config.SECONDARY_API_KEY", "sk-test")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.SECONDARY_BASE_URL", "https://secondary.example.com/v1"
+        )
+        monkeypatch.setattr("dashscope_proxy_lib.config.TERTIARY_API_KEY", "sk-openlux")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.TERTIARY_BASE_URL", "https://api.openlux.ai/v1"
+        )
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_API_KEY", "sk-opencode")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.UNDENARY_BASE_URL", "https://opencode.ai/zen/v1"
+        )
+        router = dashscope_module.ProviderRouter()
+        # Near-miss IDs stay with their own providers.
+        assert router.get_provider_for_model("mimo-v2.6-flash").name == "tertiary"
+        assert router.get_provider_for_model("jev-1.13.0").name == "tertiary"
+        assert router.get_provider_for_model("muse-spark-1.3-contributor").name == "quinary"
+        assert router.get_provider_for_model("mimo-v2.6-flash-free").name == "undenary"
+        assert router.get_provider_for_model("jev-1.13-free").name == "undenary"
+        assert router.get_provider_for_model("muse-spark-1.3-contributor-free").name == "undenary"
+
 
 # ---------------------------------------------------------------------------
 # MultiProviderRateLimiter
@@ -2578,6 +2702,49 @@ class TestMultiProviderRateLimiter:
         assert allowed is True
         assert reason == "ok"
 
+    # --- Undenary (OpenCode Zen) trailing config ---
+
+    def _make_undenary_mpl(self, dashscope_module, undenary_cfg):
+        return dashscope_module.MultiProviderRateLimiter(
+            self._make_config(), None, None, None, None, None, None, None, None, None,
+            undenary_cfg,
+        )
+
+    def test_creates_undenary_limiter_when_config_provided(self, dashscope_module):
+        mpl = self._make_undenary_mpl(dashscope_module, self._make_config())
+        assert mpl.undenary is not None
+        assert mpl.decenary is None
+        assert mpl.octonary is None
+        assert mpl.secondary is None
+
+    def test_undenary_limiter_absent_when_config_omitted(self, dashscope_module):
+        mpl = dashscope_module.MultiProviderRateLimiter(self._make_config(), None)
+        assert mpl.undenary is None
+
+    def test_get_limiter_for_provider_returns_undenary(self, dashscope_module):
+        mpl = self._make_undenary_mpl(dashscope_module, self._make_config())
+        assert mpl.get_limiter_for_provider("undenary") is mpl.undenary
+
+    def test_status_includes_undenary(self, dashscope_module):
+        mpl = self._make_undenary_mpl(dashscope_module, self._make_config())
+        status = mpl.status()
+        assert status["undenary"] is not None
+        assert "rpm_limit" in status["undenary"]
+        assert status["shared_limits"] is False
+
+    def test_max_queue_size_setter_propagates_to_undenary(self, dashscope_module):
+        mpl = self._make_undenary_mpl(dashscope_module, self._make_config())
+        mpl.max_queue_size = 19
+        assert mpl.undenary.max_queue_size == 19
+        assert mpl.primary.max_queue_size == 19
+
+    @pytest.mark.asyncio
+    async def test_provider_specific_can_proceed_undenary(self, dashscope_module):
+        mpl = self._make_undenary_mpl(dashscope_module, self._make_config())
+        allowed, reason, _ = await mpl.can_proceed_for_provider(0, "undenary")
+        assert allowed is True
+        assert reason == "ok"
+
 
 # ---------------------------------------------------------------------------
 # SplitProviderPrefix
@@ -2627,6 +2794,21 @@ class TestSplitProviderPrefix:
     def test_agnes_canonical_prefix_splits(self, dashscope_module, pinned, provider, bare):
         from dashscope_proxy_lib.request_transform import split_provider_prefix
         assert split_provider_prefix(pinned) == (provider, bare)
+
+    @pytest.mark.parametrize(
+        "pinned, provider, bare",
+        [
+            ("opencode/space-bunny-free", "undenary", "space-bunny-free"),
+            ("opencode/mimo-v2.6-flash-free", "undenary", "mimo-v2.6-flash-free"),
+        ],
+    )
+    def test_opencode_slug_prefix_splits(self, dashscope_module, pinned, provider, bare):
+        from dashscope_proxy_lib.request_transform import split_provider_prefix
+        assert split_provider_prefix(pinned) == (provider, bare)
+
+    def test_undenary_canonical_prefix_splits(self, dashscope_module):
+        from dashscope_proxy_lib.request_transform import split_provider_prefix
+        assert split_provider_prefix("undenary/big-pickle") == ("undenary", "big-pickle")
 
 
 class TestOverlapRegistry:
@@ -2716,6 +2898,30 @@ class TestPinnedRouting:
         )
         router = dashscope_module.ProviderRouter()
         assert router.get_provider_for_model(pinned).name == ordinal.lower()
+
+    @pytest.mark.parametrize(
+        "pinned",
+        ["opencode/space-bunny-free", "opencode/big-pickle", "undenary/step-5-preview-free"],
+    )
+    def test_opencode_pin_routes_to_undenary(self, dashscope_module, monkeypatch, pinned):
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_API_KEY", "sk-opencode")
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.config.UNDENARY_BASE_URL", "https://opencode.ai/zen/v1"
+        )
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model(pinned)
+        assert provider.name == "undenary"
+        assert provider.is_available is True
+
+    def test_opencode_pin_to_unconfigured_provider_returns_pinned_provider(
+        self, dashscope_module, monkeypatch
+    ):
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_API_KEY", "")
+        monkeypatch.setattr("dashscope_proxy_lib.config.UNDENARY_BASE_URL", "")
+        router = dashscope_module.ProviderRouter()
+        provider = router.get_provider_for_model("opencode/space-bunny-free")
+        assert provider.name == "undenary"
+        assert provider.is_available is False
 
 
 # ---------------------------------------------------------------------------
@@ -2840,15 +3046,18 @@ class TestProviderGridRows:
             "tertiary": self._provider(circuit_open=True, circuit_failure_count=10),
         }
         rows = provider_grid_rows(status)
-        assert rows[0]["circuit"] == "OPEN"
+        assert rows[0]["circuit"] == "open"
 
-    def test_half_open_provider_with_failures(self):
+    def test_closed_provider_with_failures_renders_warn_not_half(self):
         from tui_status import provider_grid_rows
+        # status() never exposes the limiter's genuine HALF_OPEN state, so the
+        # old "half" label claimed a state the status dict cannot express. The
+        # vocabulary is now honest: closed-with-failures is "warn".
         status = {
             "quaternary": self._provider(circuit_failure_count=3),
         }
         rows = provider_grid_rows(status)
-        assert rows[0]["circuit"] == "half"
+        assert rows[0]["circuit"] == "warn"
 
     def test_row_count_matches_providers_in_status(self):
         from tui_status import provider_grid_rows, PROVIDER_KEYS
@@ -2878,6 +3087,14 @@ class TestProviderGridRows:
         assert labels["octonary"] == "Agnes Text"
         assert labels["nonary"] == "Agnes Image"
         assert labels["decenary"] == "Agnes Video"
+
+    def test_opencode_provider_is_registered_with_label(self):
+        from tui_status import provider_grid_rows, PROVIDER_KEYS, PROVIDER_LABELS
+        assert PROVIDER_KEYS[-1] == "undenary"
+        assert PROVIDER_LABELS["undenary"] == "OpenCode"
+        rows = provider_grid_rows({"undenary": self._provider(total_forwarded=1)})
+        assert rows[0]["key"] == "undenary"
+        assert rows[0]["label"] == "OpenCode"
 
 
 # ---------------------------------------------------------------------------

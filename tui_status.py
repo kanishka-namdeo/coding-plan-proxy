@@ -80,7 +80,7 @@ def provider_section_visible(provider_status: dict | None) -> bool:
 # Canonical provider ordering/labels for the Overview compact provider grid.
 PROVIDER_KEYS = (
     "primary", "secondary", "tertiary", "quaternary", "quinary", "senary", "septenary",
-    "octonary", "nonary", "decenary",
+    "octonary", "nonary", "decenary", "undenary",
 )
 PROVIDER_LABELS = {
     "primary": "DashScope",
@@ -93,18 +93,47 @@ PROVIDER_LABELS = {
     "octonary": "Agnes Text",
     "nonary": "Agnes Image",
     "decenary": "Agnes Video",
+    "undenary": "OpenCode",
 }
 
 
+_COMPACT_UNITS = ((1_000, "K"), (1_000_000, "M"), (1_000_000_000, "B"),
+                  (1_000_000_000_000, "T"))
+_COMPACT_SUFFIX_NEXT = {"K": "M", "M": "B", "B": "T"}
+
+
 def _compact_number(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
+    """Shorten a counter for a narrow grid column; never wider than 6 chars.
+
+    Unit continuity matters: a naive `f"{n / 1_000:.1f}K"` renders 999_999 as
+    "1000.0K" — both 7 chars (which overflows the 7-wide grid columns) and
+    wrong, since 999_999 is 1.0M. After rounding, a mantissa that has reached
+    1000 belongs in the next unit; the suffix saturates at "T".
+    """
+    if n < 1_000:
+        return str(n)
+    factor, suffix = _COMPACT_UNITS[-1]
+    for candidate_factor, candidate_suffix in _COMPACT_UNITS:
+        if n >= candidate_factor:
+            factor, suffix = candidate_factor, candidate_suffix
+            break
+    mantissa = n / factor
+    while round(mantissa, 1) >= 1000:
+        mantissa /= 1000
+        suffix = _COMPACT_SUFFIX_NEXT.get(suffix, "T")
+    return f"{mantissa:.1f}{suffix}"
 
 
-def mini_bar(current: int, maximum: int, width: int = 8) -> str:
+# Block width of the Overview grid's usage bars. Worst-case cell length is
+# `OVER_QUOTA_MARK + bar + " " + "999" + "%"` = GRID_BAR_WIDTH + 6, exported as
+# GRID_BAR_CELL_MAX — the RPM/TPM column widths in `proxy_tui.py` are sized from
+# that value plus one cell of slack.
+GRID_BAR_WIDTH = 5
+OVER_QUOTA_MARK = "!"
+GRID_BAR_CELL_MAX = GRID_BAR_WIDTH + 6
+
+
+def mini_bar(current: int, maximum: int, width: int = GRID_BAR_WIDTH) -> str:
     """Compact usage cell for the grid: '████░░░░ 42%'.
 
     Uses block characters — bracketed bars like '[####....]' are eaten by
@@ -112,28 +141,88 @@ def mini_bar(current: int, maximum: int, width: int = 8) -> str:
 
     The displayed percent is clamped to [0, 999]: `current > maximum` (over
     quota) would otherwise show >100% and negative values (TPM available can
-    go negative when reservations overshoot) would render "-12%". The fill is
-    derived from the same clamped percent so the bar and the label agree.
+    go negative when reservations overshoot) would render "-12%". The clamp is
+    what keeps a pathological ratio from producing an arbitrarily long cell.
+
+    Over-quota gets its own treatment: the fill SATURATES at `width`, so a
+    250%-used provider draws a completely full bar — pixel-identical to one
+    sitting exactly at its limit. The leading OVER_QUOTA_MARK is what makes the
+    two distinguishable without reading the label. (`load_level` reports the
+    same fact as data so the renderer can also colour it.)
     """
     if maximum <= 0:
         return f"{'░' * width} 0%"
     clamped_pct = int(max(0, min(999, current / maximum * 100)))
-    filled = int(clamped_pct / 100 * width)
-    filled = max(0, min(filled, width))
-    return f"{'█' * filled}{'░' * (width - filled)} {clamped_pct}%"
+    filled = max(0, min(width, int(clamped_pct / 100 * width)))
+    bar = f"{'█' * filled}{'░' * (width - filled)}"
+    mark = OVER_QUOTA_MARK if current > maximum else ""
+    return f"{mark}{bar} {clamped_pct}%"
+
+
+# Semantic load levels, returned as PLAIN DATA so this module stays free of
+# Textual and Rich imports (that purity is what makes it unit-testable).
+# `proxy_tui.py` maps the level onto a style when it renders the cell.
+LOAD_OK = "ok"
+LOAD_WARM = "warm"
+LOAD_HIGH = "high"
+LOAD_OVER = "over"
+
+# Breakpoints for `load_level`, as percent-of-limit:
+#   70  "getting warm" — the sliding-window limiter is close enough to its
+#       ceiling that bursts start queueing; worth noticing before it alarms.
+#   90  the alarm breakpoint. It is exactly the threshold
+#       `_check_quota_thresholds` already uses for the alert badge, so the bar
+#       and the badge can never disagree about what counts as a warning.
+#  >100  over-quota — the limit has been exceeded, not merely approached.
+LOAD_WARM_THRESHOLD = 70
+LOAD_HIGH_THRESHOLD = 90
+
+
+def load_level(current: int, maximum: int) -> str:
+    """Classify a used/limit pair into a load level (plain string, no styling).
+
+    Non-positive `maximum` and non-positive `current` are LOAD_OK: there is no
+    meaningful pressure to report, and a negative value is an artefact of TPM
+    reservations overshooting rather than real usage.
+    """
+    if maximum <= 0 or current <= 0:
+        return LOAD_OK
+    pct = current / maximum * 100
+    if pct > 100:
+        return LOAD_OVER
+    if pct >= LOAD_HIGH_THRESHOLD:
+        return LOAD_HIGH
+    if pct >= LOAD_WARM_THRESHOLD:
+        return LOAD_WARM
+    return LOAD_OK
+
+
+# Canonical 3-state circuit vocabulary for every render site (grid cell,
+# detail-pane title, detail-pane Circuit row). All lowercase, max 4 chars, so
+# the words fit the Overview grid's `Circuit` column without truncation.
+CIRCUIT_OK = "ok"
+CIRCUIT_WARN = "warn"
+CIRCUIT_OPEN = "open"
 
 
 def circuit_glyph(provider_status: dict) -> str:
-    """Map status dict keys onto the 3-state circuit glyph.
+    """Map status dict keys onto the 3-state circuit label.
 
-    status() exposes only `circuit_open` + `circuit_failure_count`, so:
-    open -> "OPEN", failures recorded (not yet open) -> "half", else "ok".
+    Single source of truth for circuit state in the TUI — every render site
+    calls this instead of re-branching on the raw keys.
+
+    `status()` exposes only `circuit_open` + `circuit_failure_count`, never the
+    limiter's genuine HALF_OPEN state, so the vocabulary stays honest about
+    what it can actually observe:
+    breaker tripped -> "open"; closed but with recorded failures -> "warn"
+    (deliberately NOT named "half": the status dict cannot express HALF_OPEN);
+    otherwise "ok".
     """
     if provider_status.get("circuit_open"):
-        return "OPEN"
+        return CIRCUIT_OPEN
     if provider_status.get("circuit_failure_count", 0) > 0:
-        return "half"
-    return "ok"
+        return CIRCUIT_WARN
+    return CIRCUIT_OK
 
 
 def provider_grid_rows(status: dict) -> list[dict]:
@@ -156,21 +245,30 @@ def provider_grid_rows(status: dict) -> list[dict]:
         if idle:
             rpm_cell = "idle"
             tpm_cell = "idle"
+            rpm_level = LOAD_OK
+            tpm_level = LOAD_OK
         else:
-            rpm_cell = mini_bar(rpm_current, p.get("rpm_limit", 0))
+            rpm_cell = mini_bar(rpm_current, p.get("rpm_limit", 0), GRID_BAR_WIDTH)
             # Both cells mean "used / limit". TPM available can go negative
             # when reservations overshoot, so clamp used to a non-negative
             # value; the full-quota case renders a full bar (like RPM).
             used_tpm = max(0, p.get("tpm_limit", 0) - p.get("tpm_available", 0))
-            tpm_cell = mini_bar(used_tpm, p.get("tpm_limit", 0))
+            tpm_cell = mini_bar(used_tpm, p.get("tpm_limit", 0), GRID_BAR_WIDTH)
+            # Levels are reported as data; `proxy_tui.py` owns the styling.
+            rpm_level = load_level(rpm_current, p.get("rpm_limit", 0))
+            tpm_level = load_level(used_tpm, p.get("tpm_limit", 0))
         rows.append({
             "key": key,
             "label": PROVIDER_LABELS.get(key, key),
             "circuit": circuit_glyph(p),
             "rpm": rpm_cell,
             "tpm": tpm_cell,
+            "rpm_level": rpm_level,
+            "tpm_level": tpm_level,
             "forwarded": _compact_number(forwarded),
-            "count_429s": str(n429),
+            # Compacted like `forwarded`: a raw str(n) overflows the narrow
+            # 429 column once a provider accumulates five digits.
+            "count_429s": _compact_number(n429),
             "idle": idle,
         })
     return rows

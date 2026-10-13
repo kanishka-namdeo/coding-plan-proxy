@@ -1,6 +1,9 @@
-#metrics-panel {
-    width: 50%;
-    border: tall green;
+/* Overview is a single full-width column: the provider grid needs the whole
+   terminal width, so there is no percentage split and no fixed cell budget.
+   No border — the panel IS the tab, so a frame around it decorates rather
+   than groups. */
+#overview-panel {
+    width: 1fr;
     padding: 0 1;
     margin: 0;
     overflow-y: auto;
@@ -32,25 +35,22 @@
     height: auto;
 }
 
-/* Failover events panel */
+/* Failover events panel.
+   Border = "something in here worth reading". Do NOT gate this on `:empty`:
+   Textual's `:empty` means "has no child nodes", which is permanently TRUE for
+   a Static, so an `:empty` rule hid this panel forever, events included.
+   `_update_failover_panel` toggles `.hidden` instead. */
 .failover-panel {
     height: auto;
     padding: 0 1;
     margin: 1 0;
-    border: round $warning;
+    border: round $panel-border-warning;
     max-height: 8;
     overflow-y: auto;
 }
 
-.failover-panel:empty {
+.failover-panel.hidden {
     display: none;
-}
-
-#log-panel {
-    width: 50%;
-    border: tall blue;
-    padding: 0 1;
-    margin: 0;
 }
 
 .panel-title {
@@ -61,10 +61,35 @@
     height: 1;
 }
 
+/* The failover heading collapses with `#failover-events-panel`, which is the
+   only docked widget in this container. Do NOT dock anything else here:
+   Textual gives every `dock: top` sibling the SAME row, so a second docked
+   widget would paint over this one instead of stacking below it. */
+.panel-title.hidden {
+    display: none;
+}
+
 .spacer {
     height: 1;
 }
 
+/* Compact 2-line aggregate strip that replaced the 9-row #request-stats table */
+.stats-strip {
+    height: auto;
+    padding: 0 1;
+    color: $text;
+}
+
+/* Strip is also the surface that reports an unusable status payload, so it
+   gets an error style of its own rather than rendering as normal data. */
+.stats-strip.stats-error {
+    color: $error;
+}
+
+/* Only #status-indicator docks. Textual lays out every `dock: top` sibling in
+   the same row, so docking the alert badge and error banner too made them
+   paint over the status line instead of stacking below it. The other two flow
+   in order directly underneath and still read as the tab's top chrome. */
 #status-indicator {
     dock: top;
     padding: 0 1;
@@ -81,7 +106,6 @@
 }
 
 #error-banner {
-    dock: top;
     padding: 0 1;
     color: $error;
     background: $error 10%;
@@ -89,8 +113,13 @@
     max-height: 2;
 }
 
-#live-log {
-    height: 1fr;
+/* Do NOT use `:empty` here. Textual's `:empty` matches a widget with no
+   CHILD NODES, and a Static never has children, so `:empty` is permanently
+   true for it and the banner would be hidden even while reporting errors.
+   Visibility is driven by an explicit `.hidden` class toggled in
+   `_update_metrics` instead (same `set_class` pattern as `.alert-badge`). */
+#error-banner.hidden {
+    display: none;
 }
 
 DataTable {
@@ -116,8 +145,13 @@ TabPane {
     margin: 1 0;
 }
 
+/* All four labels share one width so the sparklines stay aligned; the width
+   must be >= the longest label text or the label wraps to two rows. */
 .sparkline-label {
-    width: 10;
+    width: 12;
+    height: 1;
+    text-overflow: ellipsis;
+    overflow: hidden;
     text-style: bold;
     color: $primary;
 }
@@ -126,6 +160,9 @@ Sparkline {
     height: 5;
 }
 
+/* Every sparkline needs an explicit fractional width — without it a
+   Sparkline falls back to `width: auto` and greedily eats the whole row,
+   collapsing its siblings to a single blank cell. */
 #rpm-sparkline {
     width: 1fr;
 }
@@ -138,21 +175,24 @@ Sparkline {
     width: 1fr;
 }
 
-.derived-panel {
-    height: auto;
-    padding: 0 1;
-    margin: 1 0;
-    border: round $primary;
+#upstream-latency-sparkline {
+    width: 1fr;
 }
 
+/* Poll error = the proxy lost contact. Border colour means "broken", matching
+   the warning border on the failover panel — one border style, colour carries
+   the severity. Toggled by `_show_poll_error` / `_clear_poll_error`; the old
+   `.poll-error:empty` rule hid it permanently (see the `:empty`-on-Static note
+   above). */
 .poll-error {
     height: auto;
     padding: 0 1;
     color: $error;
     background: $error 10%;
+    border: round $panel-border-error;
 }
 
-.poll-error:empty {
+.poll-error.hidden {
     display: none;
 }
 
@@ -206,12 +246,25 @@ Sparkline {
     width: 1fr;
 }
 
-/* Alert badge */
+/* Alert badge. Collapses when there are no alerts, same `.hidden` mechanism as
+   #error-banner — otherwise it reserves a blank row in the common case.
+   Stays exactly one row: with several providers tripping quotas the alert text
+   runs past 120 cells, and letting it wrap (`height: auto`) would grow the
+   Overview's top chrome and push the provider grid down mid-poll, which is
+   the class of jump this dashboard keeps chasing.
+   `text-overflow` is NOT set here on purpose — verified against Textual 8.2.8,
+   it never reaches a Static's render path, so `height: 1` + `overflow: hidden`
+   clips mid-word either way. The visible ellipsis is produced in Python against
+   the widget's real content width; see `_ellipsize`. */
 .alert-badge {
-    dock: top;
     padding: 0 1;
     color: $warning;
     height: 1;
+    overflow: hidden;
+}
+
+.alert-badge.hidden {
+    display: none;
 }
 
 .alert-badge.alert-active {
@@ -270,14 +323,16 @@ Sparkline {
     margin: 0 1 0 1;
 }
 
-/* Latency histogram */
+/* Latency histogram. No border: a latency distribution is neither a warning
+   nor a success signal, so the old `round $success` frame was decoration.
+   `.hidden` is toggled by `_update_latency_histogram` — the old
+   `.histogram-panel:empty` rule made the histogram permanently invisible. */
 .histogram-panel {
     height: auto;
     padding: 0 1;
     margin: 1 0;
-    border: round $success;
 }
 
-.histogram-panel:empty {
+.histogram-panel.hidden {
     display: none;
 }
