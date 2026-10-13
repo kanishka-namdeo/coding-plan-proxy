@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from dashscope_proxy_lib.config import (
     SECONDARY_MODELS, TERTIARY_MODELS, QUATERNARY_MODELS, QUINARY_MODELS, SENARY_MODELS, SEPTENARY_MODELS,
-    OCTONARY_MODELS, NONARY_MODELS, DECENARY_MODELS, MODEL_PROVIDER_MAP,
+    OCTONARY_MODELS, NONARY_MODELS, DECENARY_MODELS, UNDENARY_MODELS, MODEL_PROVIDER_MAP,
 )
 from dashscope_proxy_lib.logging_config import _log
 from dashscope_proxy_lib.request_transform import normalize_model_name
@@ -71,6 +71,16 @@ def _build_decenary_model_ids(models: dict) -> set[str]:
     return {entry["id"] for entry in models.get("data", [])}
 
 
+def _build_undenary_model_ids(models: dict) -> set[str]:
+    """Build lookup set for undenary (OpenCode Zen) models.
+
+    IDs are used verbatim — the Zen catalog carries dots and hyphens that must
+    not be normalized, and normalize_model_name() only rewrites the
+    ``mimo-v2-5`` alias so ``mimo-v2.6-flash-free`` passes through untouched.
+    """
+    return {entry["id"] for entry in models.get("data", [])}
+
+
 def _cfg(name: str):
     """Resolve a constant through the facade module (supports runtime patching by tests)."""
     _ds = sys.modules.get("dashscope_proxy")
@@ -130,6 +140,12 @@ def _nonary_cfg(name: str) -> str:
 
 def _decenary_cfg(name: str) -> str:
     """Resolve decenary provider config (always reads live config module values)."""
+    from dashscope_proxy_lib import config as _c
+    return getattr(_c, name, "")
+
+
+def _undenary_cfg(name: str) -> str:
+    """Resolve undenary provider config (always reads live config module values)."""
     from dashscope_proxy_lib import config as _c
     return getattr(_c, name, "")
 
@@ -229,6 +245,14 @@ class ProviderRouter:
             base_url=decenary_base or _cfg("TARGET_BASE"),
             is_available=bool(decenary_key and decenary_base),
         )
+        undenary_key = _undenary_cfg("UNDENARY_API_KEY")
+        undenary_base = _undenary_cfg("UNDENARY_BASE_URL")
+        self.undenary = ProviderConfig(
+            name="undenary",
+            api_key=undenary_key,
+            base_url=undenary_base or _cfg("TARGET_BASE"),
+            is_available=bool(undenary_key and undenary_base),
+        )
         # Cache model IDs for O(1) lookup — built from the live config module
         # (same source as the overlap registry below) so post-init config
         # mutations stay consistent.
@@ -242,12 +266,14 @@ class ProviderRouter:
         self._octonary_model_ids: set[str] = _build_octonary_model_ids(_live_cfg.OCTONARY_MODELS)
         self._nonary_model_ids: set[str] = _build_nonary_model_ids(_live_cfg.NONARY_MODELS)
         self._decenary_model_ids: set[str] = _build_decenary_model_ids(_live_cfg.DECENARY_MODELS)
+        self._undenary_model_ids: set[str] = _build_undenary_model_ids(_live_cfg.UNDENARY_MODELS)
         # Overlap registry: bare model_id -> provider names serving it.
         # Seeded with primary's MOCK_MODELS ids first.
         self._overlap_registry: dict[str, list[str]] = {}
         for _entry in _live_cfg.MOCK_MODELS.get("data", []):
             self._overlap_registry.setdefault(_entry["id"], []).append("primary")
         _all_sets = [
+            ("undenary", _build_undenary_model_ids(_live_cfg.UNDENARY_MODELS)),
             ("decenary", _build_decenary_model_ids(_live_cfg.DECENARY_MODELS)),
             ("nonary", _build_nonary_model_ids(_live_cfg.NONARY_MODELS)),
             ("octonary", _build_octonary_model_ids(_live_cfg.OCTONARY_MODELS)),
@@ -276,7 +302,8 @@ class ProviderRouter:
              septenary_available=self.septenary.is_available,
              octonary_available=self.octonary.is_available,
              nonary_available=self.nonary.is_available,
-             decenary_available=self.decenary.is_available)
+             decenary_available=self.decenary.is_available,
+             undenary_available=self.undenary.is_available)
 
     def is_secondary_configured(self) -> bool:
         """Check if secondary provider is fully configured."""
@@ -314,6 +341,10 @@ class ProviderRouter:
         """Check if decenary provider is fully configured."""
         return self.decenary.is_available
 
+    def is_undenary_configured(self) -> bool:
+        """Check if undenary provider is fully configured."""
+        return self.undenary.is_available
+
     def get_provider_for_model(self, model_name: str) -> ProviderConfig:
         """
         Determine which provider should handle a request for the given model.
@@ -322,16 +353,17 @@ class ProviderRouter:
         0. Provider pin '<provider>/<model>' (e.g. 'openlux/...') -> pinned provider if configured,
            else fall through to normal resolution on the bare name
         1. Explicit mapping in MODEL_PROVIDER_MAP
-        2. Model exists in DECENARY_MODELS -> decenary
-        3. Model exists in NONARY_MODELS -> nonary
-        4. Model exists in OCTONARY_MODELS -> octonary
-        5. Model exists in SEPTENARY_MODELS -> septenary
-        6. Model exists in SENARY_MODELS -> senary
-        7. Model exists in QUINARY_MODELS -> quinary
-        8. Model exists in QUATERNARY_MODELS -> quaternary
-        9. Model exists in TERTIARY_MODELS -> tertiary
-        10. Model exists in SECONDARY_MODELS -> secondary
-        11. Default to primary
+        2. Model exists in UNDENARY_MODELS -> undenary
+        3. Model exists in DECENARY_MODELS -> decenary
+        4. Model exists in NONARY_MODELS -> nonary
+        5. Model exists in OCTONARY_MODELS -> octonary
+        6. Model exists in SEPTENARY_MODELS -> septenary
+        7. Model exists in SENARY_MODELS -> senary
+        8. Model exists in QUINARY_MODELS -> quinary
+        9. Model exists in QUATERNARY_MODELS -> quaternary
+        10. Model exists in TERTIARY_MODELS -> tertiary
+        11. Model exists in SECONDARY_MODELS -> secondary
+        12. Default to primary
         """
         model_name = normalize_model_name(model_name)
 
@@ -353,6 +385,8 @@ class ProviderRouter:
 
         # Check explicit mapping first (highest priority)
         mapped = MODEL_PROVIDER_MAP.get(model_name)
+        if mapped == "undenary" and self.undenary.is_available:
+            return self.undenary
         if mapped == "decenary" and self.decenary.is_available:
             return self.decenary
         if mapped == "nonary" and self.nonary.is_available:
@@ -373,6 +407,10 @@ class ProviderRouter:
             return self.secondary
         if mapped == "primary":
             return self.primary
+
+        # O(1) set lookup for undenary models
+        if self.undenary.is_available and model_name in self._undenary_model_ids:
+            return self.undenary
 
         # O(1) set lookup for decenary models
         if self.decenary.is_available and model_name in self._decenary_model_ids:
@@ -420,7 +458,7 @@ class ProviderRouter:
         names = list(self._overlap_registry.get(bare, []))
         # Default order is descending ordinal (newest first), matching _all_sets
         # and the get_provider_for_model priority chain.
-        order = _cfg("MODEL_FALLBACK_ORDER") or ["decenary", "nonary", "octonary", "septenary", "senary", "quinary", "quaternary", "tertiary", "secondary", "primary"]
+        order = _cfg("MODEL_FALLBACK_ORDER") or ["undenary", "decenary", "nonary", "octonary", "septenary", "senary", "quinary", "quaternary", "tertiary", "secondary", "primary"]
         names.sort(key=lambda n: order.index(n) if n in order else len(order))
         return [getattr(self, n) for n in names]
 
@@ -431,7 +469,7 @@ class ProviderRouter:
     def get_all_models(self) -> dict:
         """
         Return combined model list from all configured providers.
-        Only includes secondary/tertiary/quaternary/quinary/senary/septenary/octonary/nonary/decenary
+        Only includes secondary/tertiary/quaternary/quinary/senary/septenary/octonary/nonary/decenary/undenary
         models when those providers are configured.
         Overlapping model IDs are deduped (first occurrence wins); each entry
         carries `providers` (canonical names) and `provider_models` (slugs).
@@ -454,6 +492,7 @@ class ProviderRouter:
             ("octonary", self.octonary.is_available, _live_cfg.OCTONARY_MODELS),
             ("nonary", self.nonary.is_available, _live_cfg.NONARY_MODELS),
             ("decenary", self.decenary.is_available, _live_cfg.DECENARY_MODELS),
+            ("undenary", self.undenary.is_available, _live_cfg.UNDENARY_MODELS),
         ]
         for _pname, _available, _models in _sources:
             if not _available:
@@ -513,5 +552,9 @@ class ProviderRouter:
             "decenary": {
                 "available": self.decenary.is_available,
                 "base_url": self.decenary.base_url if self.decenary.is_available else None,
+            },
+            "undenary": {
+                "available": self.undenary.is_available,
+                "base_url": self.undenary.base_url if self.undenary.is_available else None,
             },
         }

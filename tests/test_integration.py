@@ -2695,6 +2695,174 @@ class TestDecenaryProviderRouting:
             await runner.cleanup()
 
 
+class TestUndenaryProviderRouting:
+    """Integration tests for undenary (OpenCode Zen) provider routing."""
+
+    async def _start_upstream(self, upstream_app):
+        runner = web.AppRunner(upstream_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        return runner, site._server.sockets[0].getsockname()[1]
+
+    async def test_undenary_model_forwarded_to_undenary_upstream(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        import dashscope_proxy_lib.config as cfg
+
+        upstream_app = web.Application()
+        captured = {}
+
+        async def upstream_handler(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.json_response({
+                "id": "resp-undenary",
+                "choices": [{"message": {"role": "assistant", "content": "from opencode zen"}}],
+                "usage": {"total_tokens": 15},
+            })
+
+        upstream_app.router.add_post("/v1/chat/completions", upstream_handler)
+        runner, port = await self._start_upstream(upstream_app)
+
+        monkeypatch.setattr(cfg, "UNDENARY_API_KEY", "sk-opencode")
+        monkeypatch.setattr(cfg, "UNDENARY_BASE_URL", f"http://127.0.0.1:{port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "space-bunny-free",
+                        "messages": [{"role": "user", "content": "hello zen"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                assert (await resp.json())["id"] == "resp-undenary"
+                assert captured["headers"].get("Authorization") == "Bearer sk-opencode"
+                assert captured["body"]["model"] == "space-bunny-free"
+        finally:
+            await runner.cleanup()
+
+    async def test_pinned_opencode_slug_strips_prefix_before_upstream(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        import dashscope_proxy_lib.config as cfg
+
+        upstream_app = web.Application()
+        captured = {}
+
+        async def upstream_handler(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.json_response({
+                "id": "resp-undenary-pinned",
+                "choices": [{"message": {"role": "assistant", "content": "pinned"}}],
+                "usage": {"total_tokens": 9},
+            })
+
+        upstream_app.router.add_post("/v1/chat/completions", upstream_handler)
+        runner, port = await self._start_upstream(upstream_app)
+
+        monkeypatch.setattr(cfg, "UNDENARY_API_KEY", "sk-opencode")
+        monkeypatch.setattr(cfg, "UNDENARY_BASE_URL", f"http://127.0.0.1:{port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "opencode/space-bunny-free",
+                        "messages": [{"role": "user", "content": "hi pinned"}],
+                    }).encode(),
+                )
+                assert resp.status == 200
+                assert (await resp.json())["id"] == "resp-undenary-pinned"
+                assert captured["headers"].get("Authorization") == "Bearer sk-opencode"
+                assert captured["body"]["model"] == "space-bunny-free"
+        finally:
+            await runner.cleanup()
+
+    async def test_undenary_streaming_response_proxied(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        import dashscope_proxy_lib.config as cfg
+
+        upstream_app = web.Application()
+        captured = {}
+
+        async def upstream_handler(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.Response(
+                status=200,
+                body=(
+                    b'data: {"choices": [{"delta": {"content": "hi"}}]}\n\n'
+                    b'data: {"usage": {"total_tokens": 5}}\n\n'
+                    b'data: [DONE]\n\n'
+                ),
+                content_type="text/event-stream",
+            )
+
+        upstream_app.router.add_post("/v1/chat/completions", upstream_handler)
+        runner, port = await self._start_upstream(upstream_app)
+
+        monkeypatch.setattr(cfg, "UNDENARY_API_KEY", "sk-opencode")
+        monkeypatch.setattr(cfg, "UNDENARY_BASE_URL", f"http://127.0.0.1:{port}")
+
+        try:
+            app, _ = proxy_app
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "opencode/space-bunny-free",
+                        "messages": [{"role": "user", "content": "stream"}],
+                        "stream": True,
+                    }).encode(),
+                )
+                assert resp.status == 200
+                text = await resp.text()
+                assert "data:" in text
+                assert "[DONE]" in text
+                assert captured["headers"].get("Authorization") == "Bearer sk-opencode"
+                assert captured["body"]["model"] == "space-bunny-free"
+        finally:
+            await runner.cleanup()
+
+    async def test_opencode_pin_to_unconfigured_provider_is_rejected(
+        self, aiohttp_client, proxy_app, monkeypatch
+    ):
+        """A pin to an unconfigured known provider must not silently reroute."""
+        import dashscope_proxy_lib.config as cfg
+
+        monkeypatch.setattr(cfg, "UNDENARY_API_KEY", "")
+        monkeypatch.setattr(cfg, "UNDENARY_BASE_URL", "")
+
+        app, _ = proxy_app
+        async with aiohttp.ClientSession() as session:
+            app["client_session"] = session
+            client = await aiohttp_client(app)
+            resp = await client.post(
+                "/v1/chat/completions",
+                data=json.dumps({
+                    "model": "opencode/space-bunny-free",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }).encode(),
+            )
+            assert resp.status == 400
+            body = await resp.json()
+            assert "undenary" in json.dumps(body).lower() or "not configured" in json.dumps(body).lower()
+
+
 # ---------------------------------------------------------------------------
 # Generation-path ingress (no `messages`) forwarding
 # ---------------------------------------------------------------------------

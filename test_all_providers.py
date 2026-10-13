@@ -11,12 +11,28 @@ manually.
 import asyncio
 import aiohttp
 import json
+import os
 import time
 
 PROXY_URL = "http://127.0.0.1:8899"
 
+
+def _primary_model() -> str:
+    """Primary model ID, derived from the proxy's advertised catalog.
+
+    Derived rather than hardcoded because retired IDs silently break these live
+    checks. Override with the DASHSCOPE_E2E_MODEL environment variable to
+    probe a specific model (these scripts read os.environ, not .env).
+    """
+    override = os.environ.get("DASHSCOPE_E2E_MODEL", "").strip()
+    if override:
+        return override
+    import dashscope_proxy
+    return dashscope_proxy.MOCK_MODELS["data"][0]["id"]
+
+
 # Test models for each provider
-PRIMARY_MODEL = "qwen3-coder-plus"
+PRIMARY_MODEL = _primary_model()
 SECONDARY_MODEL = "mimo-v2.5-pro"
 TERTIARY_MODEL = "gemini-3.7-flash"
 

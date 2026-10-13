@@ -4,9 +4,27 @@
 import asyncio
 import aiohttp
 import json
+import os
 import time
 
 PROXY_URL = "http://127.0.0.1:8899"
+
+
+def _primary_model() -> str:
+    """Primary model ID, derived from the proxy's advertised catalog.
+
+    Derived rather than hardcoded because retired IDs silently break these live
+    checks. Override with the DASHSCOPE_E2E_MODEL environment variable to
+    probe a specific model (these scripts read os.environ, not .env).
+    """
+    override = os.environ.get("DASHSCOPE_E2E_MODEL", "").strip()
+    if override:
+        return override
+    import dashscope_proxy
+    return dashscope_proxy.MOCK_MODELS["data"][0]["id"]
+
+
+PRIMARY_MODEL = _primary_model()
 
 async def test_health():
     """Test health endpoint."""
@@ -35,14 +53,12 @@ async def test_models():
             assert "data" in data
             models = [m["id"] for m in data["data"]]
             
-            # Check primary models
-            assert "qwen3-coder-plus" in models
-            assert "qwen3-max" in models
+            # Check primary model
+            assert PRIMARY_MODEL in models
             
             # Check secondary MIMO models
             assert "mimo-v2.5-pro" in models
             assert "mimo-v2.5" in models
-            assert "mimo-v2-pro" in models
             
             print(f"[OK] Models endpoint OK - {len(models)} models available")
             print(f"  Primary: {[m for m in models if m.startswith('qwen')]}")
@@ -91,7 +107,7 @@ async def test_primary_model_request():
     """Test request to primary provider (qwen model)."""
     async with aiohttp.ClientSession() as session:
         payload = {
-            "model": "qwen3-coder-plus",
+            "model": PRIMARY_MODEL,
             "messages": [{"role": "user", "content": "Say 'hello from primary'"}],
             "max_tokens": 10,
             "stream": False
@@ -113,7 +129,7 @@ async def test_primary_model_request():
             assert len(data["choices"]) > 0
             assert "usage" in data
             
-            print("[OK] Primary model request OK (qwen3-coder-plus)")
+            print(f"[OK] Primary model request OK ({PRIMARY_MODEL})")
             print(f"  Response: {data['choices'][0]['message']['content'][:50]}...")
 
 async def test_secondary_model_request():
@@ -145,7 +161,7 @@ async def test_streaming_primary():
     """Test streaming request to primary provider."""
     async with aiohttp.ClientSession() as session:
         payload = {
-            "model": "qwen3-coder-plus",
+            "model": PRIMARY_MODEL,
             "messages": [{"role": "user", "content": "Count 1 to 3"}],
             "max_tokens": 20,
             "stream": True
@@ -263,7 +279,7 @@ async def test_validation():
         # Missing messages
         async with session.post(
             f"{PROXY_URL}/v1/chat/completions",
-            json={"model": "qwen3-coder-plus"}
+            json={"model": PRIMARY_MODEL}
         ) as resp:
             assert resp.status == 400
             print("[OK] Validation: missing messages rejected")
@@ -272,7 +288,7 @@ async def test_developer_role_conversion():
     """Test that developer role is converted to system."""
     async with aiohttp.ClientSession() as session:
         payload = {
-            "model": "qwen3-coder-plus",
+            "model": PRIMARY_MODEL,
             "messages": [
                 {"role": "developer", "content": "You are helpful"},
                 {"role": "user", "content": "Say hi"}

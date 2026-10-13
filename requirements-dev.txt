@@ -1,0 +1,10 @@
+# Development dependencies: runtime requirements plus the pytest toolchain.
+# pytest-aiohttp is REQUIRED: it supplies the aiohttp_client fixture used by
+# tests/test_integration.py and tests/test_audit_request_path.py. aiohttp itself
+# does not register a pytest11 entry point, so it provides no fixtures.
+
+-r requirements.txt
+
+pytest>=8.4.0
+pytest-asyncio>=1.4.0
+pytest-aiohttp>=1.1.1

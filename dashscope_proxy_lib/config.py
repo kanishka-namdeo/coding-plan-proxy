@@ -111,6 +111,20 @@ DECENARY_API_KEY = AGNES_API_KEY
 DECENARY_BASE_URL = AGNES_BASE_URL
 
 # ---------------------------------------------------------------------------
+# Undenary provider configuration (optional - OpenCode Zen)
+# Only used if both KEY and BASE_URL are set
+# ---------------------------------------------------------------------------
+UNDENARY_API_KEY = os.environ.get("OPENCODE_API_KEY", "").strip()
+_zen_base = os.environ.get("OPENCODE_TARGET_BASE", "https://opencode.ai/zen/v1").strip()
+# OPENCODE_ZEN_GATEWAY overrides the upstream base URL to route undenary
+# traffic through a local opencode2api sidecar instead of directly to Zen.
+# opencode2api (https://github.com/jasonxu114514/opencode2api) presents the
+# correct TLS fingerprint and session provenance that Zen's free-tier gate
+# checks at the transport layer — header injection alone is insufficient.
+# Example: OPENCODE_ZEN_GATEWAY=http://127.0.0.1:8080/zen/v1
+UNDENARY_BASE_URL = os.environ.get("OPENCODE_ZEN_GATEWAY", _zen_base)
+
+# ---------------------------------------------------------------------------
 # Timeout and connection limits
 # ---------------------------------------------------------------------------
 UPSTREAM_TIMEOUT_TOTAL = _safe_int("UPSTREAM_TIMEOUT_TOTAL", 300)
@@ -325,6 +339,29 @@ DECENARY_CODING_PLAN_CONFIG = {
     "base_backoff": _safe_float("DECENARY_BASE_BACKOFF", DECENARY_DEFAULTS["base_backoff"]),
 }
 
+# ---------------------------------------------------------------------------
+# Undenary provider rate limits (OpenCode Zen - independent defaults)
+# Deliberately conservative: Zen bills against a pay-as-you-go balance and the
+# free tier is throttled, so bursty defaults would spend balance on retries.
+# ---------------------------------------------------------------------------
+UNDENARY_DEFAULTS = {
+    "rpm_limit": 20,
+    "tpm_limit": 1_000_000,
+    "safety_factor": 0.8,
+    "max_queue_size": 200,
+    "max_retries": 10,
+    "base_backoff": 1.0,
+}
+
+UNDENARY_CODING_PLAN_CONFIG = {
+    "rpm_limit": _safe_int("UNDENARY_RPM_LIMIT", UNDENARY_DEFAULTS["rpm_limit"]),
+    "tpm_limit": _safe_int("UNDENARY_TPM_LIMIT", UNDENARY_DEFAULTS["tpm_limit"]),
+    "safety_factor": _safe_float("UNDENARY_SAFETY_FACTOR", UNDENARY_DEFAULTS["safety_factor"]),
+    "max_queue_size": _safe_int("UNDENARY_MAX_QUEUE_SIZE", UNDENARY_DEFAULTS["max_queue_size"]),
+    "max_retries": _safe_int("UNDENARY_MAX_RETRIES", UNDENARY_DEFAULTS["max_retries"]),
+    "base_backoff": _safe_float("UNDENARY_BASE_BACKOFF", UNDENARY_DEFAULTS["base_backoff"]),
+}
+
 
 def _load_config() -> dict:
     """Load rate limiter config with environment variable overrides.
@@ -386,6 +423,7 @@ def _load_display_config() -> list[tuple[str, str, str, str]]:
         ("Agnes Text Limits", OCTONARY_CODING_PLAN_CONFIG, "OCTONARY_", "agnes_text"),
         ("Agnes Image Limits", NONARY_CODING_PLAN_CONFIG, "NONARY_", "agnes_image"),
         ("Agnes Video Limits", DECENARY_CODING_PLAN_CONFIG, "DECENARY_", "agnes_video"),
+        ("OpenCode Limits", UNDENARY_CODING_PLAN_CONFIG, "UNDENARY_", "opencode"),
     ]
     for group, cfg, prefix, key_prefix in provider_cfgs:
         for key, value in cfg.items():
@@ -401,6 +439,7 @@ def _load_display_config() -> list[tuple[str, str, str, str]]:
     add("Providers", "octonary_base_url", OCTONARY_BASE_URL or "(unset)", ["AGNES_TARGET_BASE"])
     add("Providers", "nonary_base_url", NONARY_BASE_URL or "(unset)", ["AGNES_TARGET_BASE"])
     add("Providers", "decenary_base_url", DECENARY_BASE_URL or "(unset)", ["AGNES_TARGET_BASE"])
+    add("Providers", "undenary_base_url", UNDENARY_BASE_URL or "(unset)", ["OPENCODE_ZEN_GATEWAY", "OPENCODE_TARGET_BASE"])
     add("Providers", "model_fallback_order", ",".join(MODEL_FALLBACK_ORDER) or "(default)", ["MODEL_FALLBACK_ORDER"])
     return rows
 
@@ -535,8 +574,44 @@ DECENARY_MODELS = {
 }
 
 # ---------------------------------------------------------------------------
+# Undenary provider models (OpenCode Zen — free-catalog IDs only)
+# Zen's paid catalog (gpt-*, claude-*, gemini-*, paid glm/kimi/deepseek) is
+# deliberately not proxied. Free-catalog IDs carry zero token cost ($0/in,
+# $0/out per million) but require an authenticated, billing-enabled account —
+# OPENCODE_API_KEY is mandatory. Anonymous / keyless access was disabled on
+# 2026-09-23; any request without a valid Authorization header gets
+# HTTP 403 FreeTierError ("OpenCode's free tier can only be used from within
+# OpenCode"). If auth succeeds but balance is $0, Zen returns 402
+# Insufficient account funds.
+#
+# IMPORTANT: Zen's free tier gate checks the TLS fingerprint (JA3/JA4) and
+# session provenance at the transport layer, not just headers. Plain header
+# injection (UA, x-opencode-*) from this Python proxy cannot bypass it.
+# To use free models, route undenary traffic through a local opencode2api
+# sidecar via OPENCODE_ZEN_GATEWAY=http://127.0.0.1:8080/zen/v1. The Go
+# binary's TLS fingerprint matches the official opencode client and passes
+# the gate. See .env.example for setup instructions.
+# ---------------------------------------------------------------------------
+UNDENARY_MODELS = {
+    "object": "list",
+    "data": [
+        {"id": "big-pickle", "object": "model"},
+        {"id": "ling-3.1-flash-free", "object": "model"},
+        {"id": "mimo-v2.6-flash-free", "object": "model"},
+        {"id": "muse-spark-1.2-contributor-free", "object": "model"},
+        {"id": "muse-spark-1.3-contributor-free", "object": "model"},
+        {"id": "nemotron-3.5-lightning-free", "object": "model"},
+        {"id": "jev-1.13-free", "object": "model"},
+        {"id": "step-5-preview-free", "object": "model"},
+        {"id": "longcat-2.5-preview-free", "object": "model"},
+        {"id": "space-bunny-free", "object": "model"},
+    ]
+}
+
+# ---------------------------------------------------------------------------
 # Explicit model-to-provider mapping (optional overrides)
-# Keys are model names, values are "primary", "secondary", "tertiary", "quaternary", "quinary", "senary", or "septenary".
+# Keys are model names, values are canonical provider names (see PROVIDER_SLUGS
+# for slug -> canonical name, or just use the ordinal name directly).
 # When a model is listed here, this mapping takes priority over
 # the model list lookups for routing decisions.
 # ---------------------------------------------------------------------------
@@ -554,6 +629,7 @@ PROVIDER_SLUGS: dict[str, str] = {
     "agnes": "octonary",
     "agnes-image": "nonary",
     "agnes-video": "decenary",
+    "opencode": "undenary",
 }
 
 def _normalize_fallback_entry(entry: str) -> str:

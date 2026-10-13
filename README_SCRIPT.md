@@ -171,14 +171,18 @@ python -m dashscope_proxy_lib.server
 
 ## What Gets Installed
 
-The script installs these packages (from `requirements.txt`):
+The script installs these runtime packages (from `requirements.txt`):
 
-- `aiohttp>=3.9.0` - Async HTTP client/server
-- `textual>=2.0.0` - TUI framework
-- `pytest>=7.0.0` - Testing framework
-- `pytest-asyncio>=0.23.0` - Async test support
-- `python-dotenv>=1.0.0` - .env file loader
-- `psutil>=5.9.0` - System utilities
+- `aiohttp>=3.11.0` - Async HTTP client/server
+- `textual>=8.2.0` - TUI framework
+- `python-dotenv>=1.2.0` - .env file loader
+- `psutil>=7.0.0` - System utilities
+
+Test tooling (pytest, pytest-asyncio, pytest-aiohttp) is not installed by the script. To run the test suite, install the development requirements instead:
+
+```powershell
+pip install -r requirements-dev.txt
+```
 
 ## Features
 

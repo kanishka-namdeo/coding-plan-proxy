@@ -22,7 +22,8 @@ from dashscope_proxy_lib.config import (
     SEPTENARY_CODING_PLAN_CONFIG, OCTONARY_API_KEY, OCTONARY_BASE_URL,
     OCTONARY_CODING_PLAN_CONFIG, NONARY_API_KEY, NONARY_BASE_URL,
     NONARY_CODING_PLAN_CONFIG, DECENARY_API_KEY, DECENARY_BASE_URL,
-    DECENARY_CODING_PLAN_CONFIG,
+    DECENARY_CODING_PLAN_CONFIG, UNDENARY_API_KEY, UNDENARY_BASE_URL,
+    UNDENARY_CODING_PLAN_CONFIG,
 )
 from dashscope_proxy_lib.rate_limiter import RateLimiter, MultiProviderRateLimiter
 from dashscope_proxy_lib.session_log import SessionLogWriter, SESSION_LOG_DIR, SESSION_LOG_ENABLED
@@ -134,9 +135,10 @@ async def create_proxy_resources() -> tuple[MultiProviderRateLimiter, web.Applic
     octonary_config = OCTONARY_CODING_PLAN_CONFIG if (OCTONARY_API_KEY and OCTONARY_BASE_URL) else None
     nonary_config = NONARY_CODING_PLAN_CONFIG if (NONARY_API_KEY and NONARY_BASE_URL) else None
     decenary_config = DECENARY_CODING_PLAN_CONFIG if (DECENARY_API_KEY and DECENARY_BASE_URL) else None
-    rate_limiter = MultiProviderRateLimiter(config, secondary_config, tertiary_config, quaternary_config, quinary_config, senary_config, septenary_config, octonary_config, nonary_config, decenary_config)
+    undenary_config = UNDENARY_CODING_PLAN_CONFIG if (UNDENARY_API_KEY and UNDENARY_BASE_URL) else None
+    rate_limiter = MultiProviderRateLimiter(config, secondary_config, tertiary_config, quaternary_config, quinary_config, senary_config, septenary_config, octonary_config, nonary_config, decenary_config, undenary_config)
 
-    if secondary_config or tertiary_config or quaternary_config or quinary_config or senary_config or septenary_config or octonary_config or nonary_config or decenary_config:
+    if secondary_config or tertiary_config or quaternary_config or quinary_config or senary_config or septenary_config or octonary_config or nonary_config or decenary_config or undenary_config:
         _log(logging.INFO, "multi-provider mode enabled",
              secondary_url=SECONDARY_BASE_URL if secondary_config else None,
              tertiary_url=TERTIARY_BASE_URL if tertiary_config else None,
@@ -146,9 +148,10 @@ async def create_proxy_resources() -> tuple[MultiProviderRateLimiter, web.Applic
              septenary_url=SEPTENARY_BASE_URL if septenary_config else None,
              octonary_url=OCTONARY_BASE_URL if octonary_config else None,
              nonary_url=NONARY_BASE_URL if nonary_config else None,
-             decenary_url=DECENARY_BASE_URL if decenary_config else None)
+             decenary_url=DECENARY_BASE_URL if decenary_config else None,
+             undenary_url=UNDENARY_BASE_URL if undenary_config else None)
     else:
-        _log(logging.INFO, "single-provider mode (secondary/tertiary/quaternary/quinary/senary/septenary/octonary/nonary/decenary not configured)")
+        _log(logging.INFO, "single-provider mode (secondary/tertiary/quaternary/quinary/senary/septenary/octonary/nonary/decenary/undenary not configured)")
 
     app = create_app()
     timeout = aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_TOTAL, connect=UPSTREAM_TIMEOUT_CONNECT)
@@ -156,7 +159,6 @@ async def create_proxy_resources() -> tuple[MultiProviderRateLimiter, web.Applic
         limit=MAX_CONNECTIONS,
         limit_per_host=MAX_CONNECTIONS_PER_HOST,
         ttl_dns_cache=300,
-        enable_cleanup_closed=True,
     )
     app["client_session"] = aiohttp.ClientSession(timeout=timeout, connector=connector)
     app["connector"] = connector

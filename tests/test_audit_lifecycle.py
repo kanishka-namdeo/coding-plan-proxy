@@ -215,7 +215,7 @@ class TestModelFallbackOrderNormalization:
         canonical = {
             "primary", "secondary", "tertiary", "quaternary",
             "quinary", "senary", "septenary",
-            "octonary", "nonary", "decenary",
+            "octonary", "nonary", "decenary", "undenary",
         }
         for slug, target in PROVIDER_SLUG_MAP.items():
             if slug in canonical:

@@ -53,6 +53,7 @@ PROVIDER_SLUG_MAP = {
     "agnes": "octonary", "octonary": "octonary",
     "agnes-image": "nonary", "nonary": "nonary",
     "agnes-video": "decenary", "decenary": "decenary",
+    "opencode": "undenary", "undenary": "undenary",
 }
 
 

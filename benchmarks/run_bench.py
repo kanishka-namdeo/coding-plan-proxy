@@ -27,6 +27,25 @@ import dashscope_proxy_lib.provider_router as _provider_router_mod
 CONNECTOR_LIMIT = 200
 
 
+def _primary_model() -> str:
+    """Primary model ID, derived from the proxy's advertised catalog.
+
+    Derived rather than hardcoded because retired IDs silently break these live
+    checks. Override with the DASHSCOPE_E2E_MODEL environment variable to
+    probe a specific model (these scripts read os.environ, not .env).
+    """
+    override = os.environ.get("DASHSCOPE_E2E_MODEL", "").strip()
+    if override:
+        return override
+    import dashscope_proxy
+    return dashscope_proxy.MOCK_MODELS["data"][0]["id"]
+
+
+# Resolved at import time, before any timed scenario in main() starts, so the
+# catalog lookup is never attributed to proxy overhead.
+PRIMARY_MODEL = _primary_model()
+
+
 def pct(values: list[float], p: float) -> float:
     if not values:
         return 0.0
@@ -123,7 +142,7 @@ async def start_proxy(mock_base: str) -> tuple[web.AppRunner, str, object]:
 
 def small_body() -> dict:
     return {
-        "model": "qwen3-coder-plus",
+        "model": PRIMARY_MODEL,
         "messages": [{"role": "user", "content": "hi"}],
         "stream": False,
     }
@@ -132,7 +151,7 @@ def small_body() -> dict:
 def large_body() -> dict:
     msg = "x" * 8000
     return {
-        "model": "qwen3-coder-plus",
+        "model": PRIMARY_MODEL,
         "messages": [{"role": "user", "content": msg}],
         "tools": [
             {

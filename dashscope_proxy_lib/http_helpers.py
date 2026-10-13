@@ -93,11 +93,13 @@ def _strip_hop_by_hop(headers: dict) -> dict:
 def _client_disconnected(request: web.Request) -> bool:
     """Check if the client has disconnected."""
     try:
-        protocol = getattr(request, "protocol", None)
-        if protocol is not None:
-            transport = getattr(protocol, "transport", None)
-            if transport is not None:
-                return transport.is_closing()
+        transport = getattr(request, "transport", None)
+        if transport is None:
+            protocol = getattr(request, "protocol", None)
+            if protocol is not None:
+                transport = getattr(protocol, "transport", None)
+        if transport is not None:
+            return transport.is_closing()
     except Exception:
         pass
     return False

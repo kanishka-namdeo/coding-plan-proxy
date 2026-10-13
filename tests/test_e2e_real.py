@@ -12,6 +12,7 @@ import os
 import asyncio
 import signal
 import pytest
+import pytest_asyncio
 from aiohttp import web
 import aiohttp
 
@@ -35,6 +36,22 @@ def _load_env():
                     key, _, value = line.partition("=")
                     env[key.strip()] = value.strip()
     return env
+
+
+def _primary_model() -> str:
+    """Model ID used for live forwarding tests.
+
+    Derived from the proxy's advertised primary catalog so this lane tracks the
+    catalog instead of rotting against a hardcoded ID. Override with
+    DASHSCOPE_E2E_MODEL in .env when probing a specific model.
+    """
+    override = _load_env().get("DASHSCOPE_E2E_MODEL", "").strip()
+    if override:
+        return override
+    return dashscope_proxy.MOCK_MODELS["data"][0]["id"]
+
+
+PRIMARY_MODEL = _primary_model()
 
 
 @pytest.fixture(scope="module")
@@ -70,9 +87,14 @@ def e2e_config():
     }
 
 
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def proxy_server(real_api_key, e2e_config):
-    """Start a real proxy server on a random port for the duration of the module."""
+    """Start a real proxy server on a random port for the duration of the module.
+
+    loop_scope is pinned to "module" to match the fixture's caching scope: the
+    suite-wide default is "function", and a module-scoped fixture on a
+    function-scoped loop fails pytest-asyncio's scope-consistency assertion.
+    """
     import importlib
 
     # Set the API key in the module before loading
@@ -181,7 +203,7 @@ class TestRealProxyForwarding:
     def test_non_streaming_request(self, proxy_server):
         port, rl = proxy_server
         status, body, headers = _make_request(port, {
-            "model": "qwen3-coder-plus",
+            "model": PRIMARY_MODEL,
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": "Say hello in exactly 3 words."},
@@ -201,7 +223,7 @@ class TestRealProxyForwarding:
     def test_streaming_request(self, proxy_server):
         port, rl = proxy_server
         status, body, headers = _make_request(port, {
-            "model": "qwen3-coder-plus",
+            "model": PRIMARY_MODEL,
             "messages": [
                 {"role": "user", "content": "Count from 1 to 3."},
             ],
@@ -219,7 +241,7 @@ class TestRealProxyForwarding:
         """Verify that 'developer' role is converted to 'system' before forwarding."""
         port, rl = proxy_server
         status, body, headers = _make_request(port, {
-            "model": "qwen3-coder-plus",
+            "model": PRIMARY_MODEL,
             "messages": [
                 {"role": "developer", "content": "You are a code reviewer. Be concise."},
                 {"role": "user", "content": "What is 2+2?"},
@@ -236,7 +258,7 @@ class TestRealProxyForwarding:
         """Verify X-Request-ID header is present in real responses."""
         port, _ = proxy_server
         status, body, headers = _make_request(port, {
-            "model": "qwen3-coder-plus",
+            "model": PRIMARY_MODEL,
             "messages": [
                 {"role": "user", "content": "Hi"},
             ],
@@ -251,7 +273,7 @@ class TestRealProxyForwarding:
         """Verify X-RateLimit-* headers are present."""
         port, _ = proxy_server
         status, body, headers = _make_request(port, {
-            "model": "qwen3-coder-plus",
+            "model": PRIMARY_MODEL,
             "messages": [
                 {"role": "user", "content": "Hi"},
             ],
@@ -338,7 +360,7 @@ class TestRealProxyForwarding:
                 async with session.post(
                     f"http://127.0.0.1:{port}/v1/chat/completions",
                     json={
-                        "model": "qwen3-coder-plus",
+                        "model": PRIMARY_MODEL,
                         "messages": [{"role": "user", "content": f"Request {req_id}"}],
                         "stream": False,
                         "max_tokens": 10,

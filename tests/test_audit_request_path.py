@@ -555,7 +555,8 @@ class _ScriptedLimiter:
 
 def _ws_request(disconnected=False):
     req = MagicMock()
-    req.protocol.transport.is_closing.return_value = disconnected
+    req.transport = MagicMock()
+    req.transport.is_closing.return_value = disconnected
     return req
 
 

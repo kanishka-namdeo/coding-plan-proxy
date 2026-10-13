@@ -67,3 +67,7 @@ proxy.pid
 # Benchmark outputs
 benchmarks/results/
 
+# Local agent tooling artifacts (plans, plugin pointers)
+.video_agent/
+.zcode/
+

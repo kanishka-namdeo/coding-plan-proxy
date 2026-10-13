@@ -742,6 +742,7 @@ class MultiProviderRateLimiter:
         octonary_config: dict | None = None,
         nonary_config: dict | None = None,
         decenary_config: dict | None = None,
+        undenary_config: dict | None = None,
     ):
         self.primary = RateLimiter(primary_config)
         self.primary_config = primary_config
@@ -772,6 +773,9 @@ class MultiProviderRateLimiter:
 
         self.decenary: RateLimiter | None = None
         self.decenary_config = decenary_config
+
+        self.undenary: RateLimiter | None = None
+        self.undenary_config = undenary_config
 
         if secondary_config:
             self.secondary = RateLimiter(secondary_config)
@@ -872,6 +876,17 @@ class MultiProviderRateLimiter:
             else:
                 _log(logging.INFO, "decenary rate limiter created with shared limits")
 
+        if undenary_config:
+            self.undenary = RateLimiter(undenary_config)
+            limits_differ = any(
+                primary_config.get(k) != undenary_config.get(k)
+                for k in ["rpm_limit", "tpm_limit"]
+            )
+            if limits_differ:
+                _log(logging.INFO, "undenary rate limiter created with independent limits")
+            else:
+                _log(logging.INFO, "undenary rate limiter created with shared limits")
+
         # Global pending request counter (shared across providers for queue management).
         # Guarded by a threading.Lock (never an asyncio.Lock): increments run on
         # the event loop but reads come from the TUI thread, and an asyncio.Lock
@@ -882,6 +897,8 @@ class MultiProviderRateLimiter:
 
     def get_limiter_for_provider(self, provider_name: str) -> RateLimiter:
         """Get the appropriate rate limiter for a provider."""
+        if provider_name == "undenary" and self.undenary:
+            return self.undenary
         if provider_name == "decenary" and self.decenary:
             return self.decenary
         if provider_name == "nonary" and self.nonary:
@@ -947,6 +964,8 @@ class MultiProviderRateLimiter:
             self.nonary.max_queue_size = value
         if self.decenary:
             self.decenary.max_queue_size = value
+        if self.undenary:
+            self.undenary.max_queue_size = value
 
     def is_queue_full(self) -> bool:
         return self._pending_requests > self.primary.max_queue_size
@@ -1032,7 +1051,7 @@ class MultiProviderRateLimiter:
         primary_status = self.primary.status()
         result = {
             "primary": primary_status,
-            "shared_limits": self.secondary is None and self.tertiary is None and self.quaternary is None and self.quinary is None and self.senary is None and self.septenary is None and self.octonary is None and self.nonary is None and self.decenary is None,
+            "shared_limits": self.secondary is None and self.tertiary is None and self.quaternary is None and self.quinary is None and self.senary is None and self.septenary is None and self.octonary is None and self.nonary is None and self.decenary is None and self.undenary is None,
         }
 
         secondary_status = self.secondary.status() if self.secondary else None
@@ -1044,6 +1063,7 @@ class MultiProviderRateLimiter:
         octonary_status = self.octonary.status() if self.octonary else None
         nonary_status = self.nonary.status() if self.nonary else None
         decenary_status = self.decenary.status() if self.decenary else None
+        undenary_status = self.undenary.status() if self.undenary else None
 
         if self.secondary:
             result["secondary"] = secondary_status
@@ -1090,6 +1110,11 @@ class MultiProviderRateLimiter:
         else:
             result["decenary"] = None
 
+        if self.undenary:
+            result["undenary"] = undenary_status
+        else:
+            result["undenary"] = None
+
         # Aggregate stats across all providers (using thread-safe status dicts)
         all_statuses = [primary_status]
         if secondary_status:
@@ -1110,6 +1135,8 @@ class MultiProviderRateLimiter:
             all_statuses.append(nonary_status)
         if decenary_status:
             all_statuses.append(decenary_status)
+        if undenary_status:
+            all_statuses.append(undenary_status)
 
         # Sum counters across all providers
         total_forwarded = sum(s.get("total_forwarded", 0) for s in all_statuses)
