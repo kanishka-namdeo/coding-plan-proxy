@@ -1,6 +1,20 @@
 # Coding Plan Proxy
 
+[![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
+[![Tests](https://img.shields.io/badge/tests-757%20passed-brightgreen.svg)](https://github.com/kanishka-namdeo/coding-plan-proxy)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+
 An HTTP proxy for the DashScope Coding API with multi-provider routing, rate limiting, request queuing, automatic retries, and a rich Textual TUI dashboard.
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [TUI Dashboard](#tui-dashboard)
+- [Features](#features)
+- [Endpoints](#endpoints)
+- [Configuration](#configuration)
+- [Running Tests](#running-tests)
 
 ## Quick Start
 
@@ -14,6 +28,27 @@ py dashscope_proxy.py --headless # launches proxy without TUI
 ```
 
 Point your OpenAI-compatible client at `http://127.0.0.1:8899`.
+
+## Why Use This Proxy?
+
+| Feature | Benefit |
+|---------|---------|
+| **Multi-Provider Routing** | Access 11 AI providers through a single endpoint with automatic failover |
+| **Rate Limiting** | Protect your API quotas with RPM/TPM enforcement and safety factors |
+| **Circuit Breaker** | Automatic recovery from upstream failures without cascading errors |
+| **Request Queuing** | Graceful handling of traffic spikes instead of immediate failures |
+| **Live Dashboard** | Real-time monitoring of quotas, latencies, and provider health |
+| **Session Logging** | Complete audit trail of all requests for debugging and analysis |
+| **Token Accounting** | Accurate TPM tracking with reserve/reconcile/refund lifecycle |
+| **Thinking Mode** | Automatic reasoning injection for 16+ model families |
+
+## Technology Stack
+
+- **Runtime**: Python 3.14+ with asyncio
+- **HTTP**: aiohttp (async client/server)
+- **TUI**: Textual 8.2+ (modern terminal UI framework)
+- **Testing**: pytest with 757 tests (unit, integration, audit, e2e)
+- **Architecture**: Multi-provider routing with 3-state circuit breaker
 
 ## TUI Dashboard
 
@@ -188,3 +223,83 @@ The default order is `undenary` → `decenary` → `nonary` → `octonary` → `
 ```powershell
 py -m pytest tests/
 ```
+
+The test suite includes 757 tests across multiple categories:
+- **Unit tests**: Rate limiter, token utilities, request transformation
+- **Integration tests**: Handler behavior with mock upstream servers
+- **Audit tests**: Edge cases, error handling, security patterns
+- **E2E tests**: Real API calls (requires API key)
+
+## Architecture
+
+```
+┌─────────────────┐
+│  OpenAI Client  │
+└────────┬────────┘
+         │ POST /v1/chat/completions
+         ▼
+┌─────────────────────────────────────────┐
+│         Coding Plan Proxy               │
+│  ┌─────────────────────────────────┐   │
+│  │   Request Queue (bounded)       │   │
+│  └──────────────┬──────────────────┘   │
+│                 ▼                       │
+│  ┌─────────────────────────────────┐   │
+│  │   Rate Limiter (RPM/TPM/RPS)    │   │
+│  └──────────────┬──────────────────┘   │
+│                 ▼                       │
+│  ┌─────────────────────────────────┐   │
+│  │   Provider Router               │   │
+│  │   ├─ Primary (DashScope)        │   │
+│  │   ├─ Secondary (MIMO)           │   │
+│  │   ├─ Tertiary (OpenLux)         │   │
+│  │   ├─ ... (11 providers total)   │   │
+│  │   └─ Undenary (OpenCode Zen)    │   │
+│  └──────────────┬──────────────────┘   │
+│                 ▼                       │
+│  ┌─────────────────────────────────┐   │
+│  │   Circuit Breaker (3-state)     │   │
+│  └──────────────┬──────────────────┘   │
+└─────────────────┼───────────────────────┘
+                  │
+                  ▼
+         ┌────────────────┐
+         │  AI Provider   │
+         │  (Upstream)    │
+         └────────────────┘
+```
+
+**Key components:**
+- **Request Queue**: Bounded queue with deadline-based waits and client disconnect detection
+- **Rate Limiter**: Multi-layer enforcement (RPM, TPM, RPS) with token bucket and sliding window
+- **Provider Router**: Model-based routing with explicit mapping and fallback chains
+- **Circuit Breaker**: 3-state (CLOSED → OPEN → HALF_OPEN) with single-probe recovery
+- **Session Logger**: Async JSON-line logging with daily rotation and batched flush
+
+## Contributing
+
+Contributions are welcome! Areas where help is especially appreciated:
+
+- **Bug reports**: Open an issue with reproduction steps
+- **Feature requests**: Describe the use case and expected behavior
+- **Provider additions**: New AI providers following the existing pattern
+- **Test coverage**: Edge cases and failure modes
+- **Documentation**: Clarifications, examples, and translations
+
+Before contributing, please read `AGENTS.md` for the development workflow and coding standards.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- **Textual** - Modern terminal UI framework for Python
+- **aiohttp** - Async HTTP client/server framework
+- **All AI providers** - DashScope, MIMO, OpenLux, ARK, Meta AI, DeepSeek, GLM/Z.ai, Agnes AI, OpenCode Zen
+
+## Support
+
+- **Documentation**: See `AGENTS.md` for detailed architecture and development guidelines
+- **Examples**: Check `.env.example` for configuration patterns
+- **Diagnostics**: Use the TUI dashboard for real-time monitoring and debugging
