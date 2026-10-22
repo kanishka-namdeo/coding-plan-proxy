@@ -202,9 +202,16 @@ def _sse_response_headers() -> dict[str, str]:
 
 
 async def _finalize_stream_response(resp: web.StreamResponse) -> web.StreamResponse:
-    """Finish a prepared stream response; ignore errors if the client already left."""
+    """Finish a prepared stream response; ignore errors if the client already left.
+
+    ``asyncio.CancelledError`` is deliberately NOT swallowed: it means the task
+    was cancelled (server shutdown / handler timeout), not that the peer hung up.
+    Swallowing it here would return normally to the caller, so the handler's own
+    cancellation handlers never run and shutdown stalls until the handler returns
+    on its own.
+    """
     try:
         await resp.write_eof()
-    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, asyncio.CancelledError):
+    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
         pass
     return resp

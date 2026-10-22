@@ -1,6 +1,9 @@
 """Textual TUI dashboard for the DashScope proxy server."""
 
+import asyncio
+import concurrent.futures
 import json
+import logging
 import math
 import os
 import statistics
@@ -24,6 +27,10 @@ from textual.css.query import NoMatches
 from dashscope_proxy_lib.config import LOG_BUFFER_SIZE, _load_display_config
 from dashscope_proxy_lib.rate_limiter import RateLimiter
 from dashscope_proxy_lib.logging_config import TUILogHandler
+
+# Poll-loop diagnostics go to stderr via the stdlib root logger, never into the
+# TUI log feed this same loop drives.
+_tui_logger = logging.getLogger("proxy_tui.poll")
 
 # Provider registry for dynamic UI rendering
 PROVIDER_REGISTRY = [
@@ -148,7 +155,9 @@ def _progress_bar(current: int, maximum: int, width: int = 20) -> str:
         filled = 0
     else:
         filled = int((current / maximum) * width)
-    filled = min(filled, width)
+    # Clamp BOTH ends: a negative current (e.g. a negative tpm_available) would
+    # otherwise make empty = width - filled exceed width and overflow the cell.
+    filled = max(0, min(filled, width))
     empty = width - filled
     bar = "█" * filled + "░" * empty
     return f"{bar} {_fmt_number(current)}/{_fmt_number(maximum)}"
@@ -719,7 +728,13 @@ class ProxyTUI(App):
 
                 # Refresh only what the user can actually see.
                 self._bump_poll_generation()
-                self._dispatch_poll_updates(raw_status)
+                # `call_from_thread` blocks on `future.result()` with NO timeout,
+                # so a dispatch posted while the app is tearing down can park this
+                # thread forever (cancelling the worker cancels the asyncio Task
+                # awaiting the executor, not the thread blocked in result()).
+                # Once shutdown is signalled, stop dispatching entirely.
+                if not self._shutdown_event.is_set():
+                    self._dispatch_poll_updates(raw_status)
 
                 consecutive_errors = 0
                 # Polling recovered: clear any stale poll-error banner so the
@@ -735,7 +750,20 @@ class ProxyTUI(App):
                 if series["queue_depth"] > 0:
                     interval = 0.5
 
-            except Exception:
+            except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                # BaseException(s) from a cancelled dispatch future: `except
+                # Exception` below cannot see them, so without this the poll
+                # thread would die outright and the UI silently freeze with no
+                # banner. Shutting down anyway — stop.
+                _tui_logger.info("poll loop cancelled, exiting")
+                break
+            except Exception as e:
+                # Log it: swallowing this made an updater bug indistinguishable
+                # from a poll failure, and the backoff masked the real cause.
+                # Goes to stderr via the stdlib root logger, deliberately NOT
+                # into the TUI log feed this loop drives.
+                _tui_logger.warning("poll tick failed (%d in a row)", consecutive_errors + 1,
+                                    exc_info=True)
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
                     try:
@@ -808,7 +836,10 @@ class ProxyTUI(App):
         demand for the histogram/percentile display math.
         """
         union: list[float] = []
-        for tracker in self._latency_trackers.values():
+        # Iterate a snapshot: the poll thread inserts keys via setdefault, so a
+        # tab switch racing a multi-provider poll could otherwise raise
+        # "dictionary changed size during iteration".
+        for tracker in list(self._latency_trackers.values()):
             union.extend(tracker.latencies)
         return union
 
@@ -1183,28 +1214,33 @@ class ProxyTUI(App):
 
     @_safe_update
     def _update_sparklines(self) -> None:
-        """Update sparkline widgets in Metrics tab."""
+        """Update sparkline widgets in Metrics tab.
+
+        Hand the widgets a COPY: `Sparkline.data` is a plain reactive holding
+        the reference, and the poll thread keeps appending to these very lists
+        next tick — aliasing them lets another thread mutate widget-held state.
+        """
         try:
             rpm_sparkline = self.query_one("#rpm-sparkline", Sparkline)
-            rpm_sparkline.data = self.history.rpm_samples
+            rpm_sparkline.data = list(self.history.rpm_samples)
         except NoMatches:
             pass
 
         try:
             tpm_sparkline = self.query_one("#tpm-sparkline", Sparkline)
-            tpm_sparkline.data = self.history.tpm_used_samples
+            tpm_sparkline.data = list(self.history.tpm_used_samples)
         except NoMatches:
             pass
 
         try:
             queue_sparkline = self.query_one("#queue-sparkline", Sparkline)
-            queue_sparkline.data = self.history.queue_samples
+            queue_sparkline.data = list(self.history.queue_samples)
         except NoMatches:
             pass
 
         try:
             upstream_sparkline = self.query_one("#upstream-latency-sparkline", Sparkline)
-            upstream_sparkline.data = self.history.upstream_latency_samples
+            upstream_sparkline.data = list(self.history.upstream_latency_samples)
         except NoMatches:
             pass
 

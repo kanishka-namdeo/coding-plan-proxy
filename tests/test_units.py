@@ -47,6 +47,16 @@ class TestSlidingWindowCounter:
         sw = dashscope_module.SlidingWindowCounter(60)
         assert sw.count(now=100.0) == 0
 
+    def test_explicit_zero_now_is_honoured(self, dashscope_module):
+        """A falsy-but-valid now=0.0 must be used verbatim, never replaced by the wall clock."""
+        sw = dashscope_module.SlidingWindowCounter(60)
+        sw.add(now=0.0)
+        # The stamp is recorded as 0.0, not time.monotonic().
+        assert sw.events[0] == 0.0
+        assert sw.count(now=0.0) == 1
+        # ...so it ages out of the 60s window by t=61 (a wall-clock stamp would not).
+        assert sw.count(now=61.0) == 0
+
 
 # ---------------------------------------------------------------------------
 # RateLimiter
@@ -208,6 +218,22 @@ class TestTokenWindowCounter:
         counter.refund(200)
         assert counter.reserved == 0
 
+    def test_status_tpm_available_clamped_after_overshoot(self, dashscope_module):
+        """status() clamps like available(): an upstream overshoot must not publish negative."""
+        counter = dashscope_module.TokenWindowCounter(capacity=1000)
+        assert counter.try_reserve(500) is True
+        counter.reconcile(500, 5000)  # upstream reports far more than reserved
+        assert counter.status()["tpm_available"] >= 0
+        assert counter.status()["tpm_available"] == 0
+        assert counter.available() == 0.0
+        assert counter.status()["tpm_reserved"] == 0
+
+    def test_status_reports_true_remainder_on_partial_use(self, dashscope_module):
+        counter = dashscope_module.TokenWindowCounter(capacity=1000)
+        assert counter.try_reserve(250) is True
+        assert counter.status()["tpm_available"] == 750
+        assert counter.available() == 750.0
+
 
 # ---------------------------------------------------------------------------
 # Token extraction
@@ -268,6 +294,36 @@ class TestTokenExtraction:
         }).encode()
         result = dashscope_module.extract_tokens_from_response(body)
         assert result["cached_tokens"] == 15
+
+    def test_safe_int_coerces_upstream_garbage(self, dashscope_module):
+        """Upstream usage values arrive as str/null/float; left uncoerced they reach
+        tokens_used["total_tokens"] - estimated_tokens in handlers.py and raise
+        TypeError, which the handler does NOT catch, so the request 500s while
+        its TPM reservation stays held."""
+        from dashscope_proxy_lib.token_utils import _safe_int
+        assert _safe_int("12345") == 12345
+        assert _safe_int(None) == 0
+        assert _safe_int("abc") == 0
+        assert _safe_int(3.9) == 3
+        assert _safe_int(["unhashable"]) == 0
+
+    def test_extract_tokens_coerces_garbage_usage_to_int(self, dashscope_module):
+        body = json.dumps({
+            "usage": {
+                "total_tokens": "12345",
+                "prompt_tokens": None,
+                "completion_tokens": 12.9,
+                "input_tokens_details": {"cached_tokens": "7"},
+            }
+        }).encode()
+        result = dashscope_module.extract_tokens_from_response(body)
+        assert result["total_tokens"] == 12345
+        assert result["prompt_tokens"] == 0
+        assert result["completion_tokens"] == 12
+        assert result["cached_tokens"] == 7
+        for key in ("total_tokens", "prompt_tokens", "completion_tokens",
+                    "input_tokens", "output_tokens", "cached_tokens"):
+            assert isinstance(result[key], int), key
 
     def test_estimate_tokens(self, dashscope_module):
         body = json.dumps({
@@ -1190,6 +1246,22 @@ class TestExtractStreamTokensEdgeCases:
         result = dashscope_module.extract_tokens_from_stream(data)
         assert isinstance(result, dict)
 
+    def test_malformed_line_after_usage_does_not_discard(self, dashscope_module):
+        """A malformed data: line is skipped, not fatal: usage seen earlier still reports."""
+        sse = (
+            b'data: {"usage": {"total_tokens": 500, "prompt_tokens": 300, "completion_tokens": 200}}\n'
+            b'\n'
+            b'data: {not json'
+        )
+        result = dashscope_module.extract_tokens_from_stream(sse)
+        assert result["total_tokens"] == 500
+
+    def test_stream_happy_paths_still_hold(self, dashscope_module):
+        assert dashscope_module.extract_tokens_from_stream(b"data: [DONE]\n\n")["total_tokens"] == 0
+        assert dashscope_module.extract_tokens_from_stream(b"hello garbage\nnot sse\n")["total_tokens"] == 0
+        sse = b'data: {"usage": {"total_tokens": 55}}\n\ndata: [DONE]\n\n'
+        assert dashscope_module.extract_tokens_from_stream(sse)["total_tokens"] == 55
+
 
 # ---------------------------------------------------------------------------
 # StructuredLogFormatter
@@ -1237,6 +1309,19 @@ class TestStructuredLogFormatter:
         assert "exception" in data
         assert "ValueError" in data["exception"]
         assert "test error" in data["exception"]
+
+    def test_format_survives_non_serializable_extra_context(self, dashscope_module):
+        """default=str coerces the blob instead of raising inside format()."""
+        formatter = dashscope_module.StructuredLogFormatter()
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=1,
+            msg="with blob", args=(), exc_info=None,
+        )
+        record.extra_context = {"request_id": "abc", "blob": {1, 2}}
+        output = formatter.format(record)  # must not raise
+        data = json.loads(output)
+        assert data["request_id"] == "abc"
+        assert isinstance(data["blob"], str)
 
 
 # ---------------------------------------------------------------------------
@@ -1479,6 +1564,19 @@ class TestTUILogHandler:
         assert len(logs) == 3
         msgs = [e["message"] for e in logs]
         assert msgs == ["msg-2", "msg-3", "msg-4"]
+
+    def test_emit_copies_extra_context(self, dashscope_module):
+        """The buffered entry must not alias the caller's dict."""
+        handler = dashscope_module.TUILogHandler(max_size=100)
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=1,
+            msg="hello", args=(), exc_info=None,
+        )
+        d = {"k": "v"}
+        record.extra_context = d
+        handler.emit(record)
+        d["k"] = "mutated"
+        assert handler.get_logs()[0]["extra"]["k"] == "v"
 
 
 class TestConfigureLogging:
@@ -1858,6 +1956,32 @@ class TestRateLimiterTokenManagement:
 
 
 # ---------------------------------------------------------------------------
+# RateLimiter.status queue percentiles
+# ---------------------------------------------------------------------------
+
+class TestStatusQueuePercentiles:
+    """Queue wait percentiles share RateLimiter._compute_percentile with model latencies."""
+
+    def test_queue_percentiles_match_compute_percentile(self, dashscope_module):
+        from collections import deque
+        rl = dashscope_module.RateLimiter({
+            "rpm_limit": 6000, "tpm_limit": 10_000_000, "safety_factor": 0.8,
+            "max_queue_size": 50, "max_retries": 2, "base_backoff": 0.05,
+        })
+        values = [float(i) for i in range(1, 21)]
+        rl.queue_wait_times = deque(values)
+        status = rl.status()
+        # The old sorted[int(n*p)] index form read the maximum (20.0) for p95 of 1..20.
+        assert status["queue_p95_ms"] == dashscope_module.RateLimiter._compute_percentile(values, 95)
+        assert status["queue_p95_ms"] != 20.0
+        assert status["queue_p50_ms"] == dashscope_module.RateLimiter._compute_percentile(values, 50)
+        assert status["queue_p99_ms"] == dashscope_module.RateLimiter._compute_percentile(values, 99)
+        p50, p95, p99 = status["queue_p50_ms"], status["queue_p95_ms"], status["queue_p99_ms"]
+        assert p50 < p95 < p99
+        assert max(p50, p95, p99) <= 20.0
+
+
+# ---------------------------------------------------------------------------
 # Circuit Breaker
 # ---------------------------------------------------------------------------
 
@@ -2060,6 +2184,28 @@ class TestSessionLogAsyncEnqueue:
         text = next((tmp_path / "logs").glob("*.jsonl")).read_text(encoding="utf-8")
         assert text.count("request_id") == 1
         assert "kept" in text
+
+    @pytest.mark.asyncio
+    async def test_drain_thread_survives_non_serializable_entry(self, dashscope_module, tmp_path):
+        """A poison entry must not kill the drain thread nor drop the entry.
+
+        The set leaf is coerced via json.dumps(..., default=str), so "no field
+        dropping" holds: every enqueued entry still produces a line on disk."""
+        writer = dashscope_module.SessionLogWriter(str(tmp_path / "logs"))
+        try:
+            await writer.log_async({"request_id": "before", "status_code": 200})
+            await writer.log_async({"request_id": "poison", "status_code": 200, "blob": {1, 2}})
+            await writer.log_async({"request_id": "after", "status_code": 200})
+            time.sleep(0.3)
+            assert writer._writer_thread is not None
+            assert writer._writer_thread.is_alive()
+        finally:
+            writer.close()
+        lines = next((tmp_path / "logs").glob("*.jsonl")).read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 3
+        by_id = {json.loads(line)["request_id"]: json.loads(line) for line in lines}
+        assert set(by_id) == {"before", "poison", "after"}
+        assert isinstance(by_id["poison"]["blob"], str)
 
 
 # ---------------------------------------------------------------------------

@@ -31,13 +31,16 @@ def normalize_model_name(model_name: str) -> str:
 
     The input is stripped and the MIMO alias prefix is matched
     case-insensitively; the suffix after the alias prefix is preserved
-    as-is.
+    as-is. The alias must match as a whole ID or at a hyphen boundary —
+    a bare ``startswith`` would also rewrite ``mimo-v2-50`` to
+    ``mimo-v2.50``, which is not a real model ID.
     """
     if not isinstance(model_name, str):
         return model_name
     stripped = model_name.strip()
     _alias = "mimo-v2-5"
-    if stripped.lower().startswith(_alias):
+    lowered = stripped.lower()
+    if lowered == _alias or lowered.startswith(_alias + "-"):
         return "mimo-v2.5" + stripped[len(_alias):]
     return stripped
 

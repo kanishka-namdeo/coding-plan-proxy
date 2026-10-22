@@ -7,6 +7,20 @@ _MEDIA_PART_TYPES = frozenset({"image_url", "image", "input_audio", "audio"})
 _MEDIA_PART_CHARS = 4096
 
 
+def _safe_int(value, default: int = 0) -> int:
+    """Coerce an upstream usage value to ``int``.
+
+    Providers occasionally report ``"total_tokens": "12345"`` or ``null``.
+    Left uncoerced these reach arithmetic in the handler (``actual -
+    estimated``) and raise ``TypeError``, which is not a caught upstream
+    error, so the request 500s with its TPM reservation still held.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _count_content_chars(content) -> int:
     """Count char allowance for a message/system content value.
 
@@ -33,10 +47,43 @@ def _count_content_chars(content) -> int:
     return total
 
 
+def _empty_tokens() -> dict:
+    return {
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+    }
+
+
+def _tokens_from_usage(usage: dict) -> dict:
+    """Build a token dict from a provider ``usage`` block, coercing every count."""
+    if not isinstance(usage, dict):
+        return _empty_tokens()
+    result = {
+        "total_tokens": _safe_int(usage.get("total_tokens", 0)),
+        "prompt_tokens": _safe_int(usage.get("prompt_tokens", 0)),
+        "completion_tokens": _safe_int(usage.get("completion_tokens", 0)),
+        "input_tokens": _safe_int(usage.get("input_tokens", usage.get("prompt_tokens", 0))),
+        "output_tokens": _safe_int(usage.get("output_tokens", usage.get("completion_tokens", 0))),
+        "cached_tokens": 0,
+    }
+    # Check for cached tokens in nested details
+    input_details = usage.get("input_tokens_details", {})
+    if isinstance(input_details, dict):
+        result["cached_tokens"] = _safe_int(input_details.get("cached_tokens", 0))
+    # Also check direct field
+    if "cached_tokens" in usage:
+        result["cached_tokens"] = _safe_int(usage["cached_tokens"])
+    return result
+
+
 def extract_tokens_from_response(body: bytes) -> dict:
     """Parse token usage from a JSON response body.
 
-    Returns a dict with all available token fields:
+    Returns a dict with all available token fields, all coerced to ``int``:
     - total_tokens: int
     - prompt_tokens: int
     - completion_tokens: int
@@ -46,71 +93,36 @@ def extract_tokens_from_response(body: bytes) -> dict:
     """
     try:
         data = json.loads(body)
-        usage = data.get("usage", {})
-        result = {
-            "total_tokens": usage.get("total_tokens", 0),
-            "prompt_tokens": usage.get("prompt_tokens", 0),
-            "completion_tokens": usage.get("completion_tokens", 0),
-            "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
-            "output_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
-            "cached_tokens": 0,
-        }
-        # Check for cached tokens in nested details
-        input_details = usage.get("input_tokens_details", {})
-        if isinstance(input_details, dict):
-            result["cached_tokens"] = input_details.get("cached_tokens", 0)
-        # Also check direct field
-        if "cached_tokens" in usage:
-            result["cached_tokens"] = usage["cached_tokens"]
-        return result
-    except (json.JSONDecodeError, AttributeError):
-        return {
-            "total_tokens": 0,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cached_tokens": 0,
-        }
+        return _tokens_from_usage(data.get("usage", {}))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return _empty_tokens()
 
 
 def extract_tokens_from_stream(buffer: bytes) -> dict:
     """Parse token usage from accumulated SSE stream buffer.
 
     Returns a dict with all available token fields (see extract_tokens_from_response).
+    Malformed ``data:`` lines are skipped, not fatal — a provider heartbeat or
+    a truncated trailing line must not discard a usage line already seen.
     """
     try:
         lines = buffer.decode("utf-8", errors="replace").split("\n")
-        for line in reversed(lines):
-            line = line.strip()
-            if line.startswith("data:") and line[5:].lstrip() != "[DONE]":
-                data = json.loads(line[5:].lstrip())
-                usage = data.get("usage", {})
-                if usage and "total_tokens" in usage:
-                    result = {
-                        "total_tokens": usage.get("total_tokens", 0),
-                        "prompt_tokens": usage.get("prompt_tokens", 0),
-                        "completion_tokens": usage.get("completion_tokens", 0),
-                        "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
-                        "output_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
-                        "cached_tokens": 0,
-                    }
-                    input_details = usage.get("input_tokens_details", {})
-                    if isinstance(input_details, dict):
-                        result["cached_tokens"] = input_details.get("cached_tokens", 0)
-                    if "cached_tokens" in usage:
-                        result["cached_tokens"] = usage["cached_tokens"]
-                    return result
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        pass
-    return {
-        "total_tokens": 0,
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cached_tokens": 0,
-    }
+    except UnicodeDecodeError:  # pragma: no cover - errors="replace" above cannot raise
+        return _empty_tokens()
+    for line in reversed(lines):
+        line = line.strip()
+        if not (line.startswith("data:") and line[5:].lstrip() != "[DONE]"):
+            continue
+        try:
+            data = json.loads(line[5:].lstrip())
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            continue  # malformed line — keep scanning backwards for a real usage line
+        if not isinstance(data, dict):
+            continue
+        usage = data.get("usage", {})
+        if usage and "total_tokens" in usage:
+            return _tokens_from_usage(usage)
+    return _empty_tokens()
 
 
 def estimate_tokens_for_body(body: dict) -> int:

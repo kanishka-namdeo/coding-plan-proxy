@@ -501,6 +501,28 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
         stream_prepared = False
         stream_resp: web.StreamResponse | None = None
+        # Bound before the loop: `upstream` is only assigned by the streaming
+        # branch's `session.request(...)` await, so a cancellation delivered at
+        # that await would leave it UNBOUND and turn the cleanup handlers below
+        # into UnboundLocalError — which masks the CancelledError they exist to
+        # propagate, and strands the reservation.
+        upstream = None
+
+        async def _refund_reserved() -> None:
+            """Refund the outstanding TPM reservation on the CURRENT limiter, once.
+
+            ``tokens_reserved`` is the single source of truth for "does the
+            current limiter still hold a reservation?", and ``limiter`` is
+            rebound on failover — so refunding and clearing in ONE place is
+            what keeps the accounting exactly-once. A bare refund leaves the
+            flag set, and a later cancellation path refunds a second time,
+            crediting quota that was never charged.
+            """
+            nonlocal tokens_reserved
+            if not tokens_reserved:
+                return
+            tokens_reserved = False
+            await limiter.refund_tokens(estimated_tokens)
 
         client_session = request.app.get("client_session")
         if client_session is None or getattr(client_session, "closed", False) is True:
@@ -509,7 +531,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
             _log(logging.ERROR, "client session unavailable",
                  request_id=request_id, method=method, path=path)
             if estimated_tokens:
-                await limiter.refund_tokens(estimated_tokens)
+                await _refund_reserved()
             return _make_error_response(
                 503, b'{"error":"proxy unavailable, restart the server"}', request_id, retry_after=5
             )
@@ -554,9 +576,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 holding_probe = False
 
             # Refund tokens to old limiter before failover
-            if tokens_reserved and estimated_tokens > 0:
-                await limiter.refund_tokens(estimated_tokens)
-                tokens_reserved = False
+            await _refund_reserved()
             
             # Try to advance to next provider
             if not _advance_candidate():
@@ -611,8 +631,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 if app_shutting_down and app_shutting_down.is_set():
                     error_reason = "shutting_down"
                     status_code = 503
-                    await limiter.refund_tokens(estimated_tokens)
-                    tokens_reserved = False
+                    await _refund_reserved()
                     return _make_error_response(
                         503, b'{"error":"shutting down"}', request_id, retry_after=30
                     )
@@ -642,8 +661,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                              request_id=request_id, failure_count=limiter.circuit_failure_count,
                              circuit_state=limiter.circuit_state,
                              probe_in_flight=limiter.circuit_probe_in_flight)
-                        await limiter.refund_tokens(estimated_tokens)
-                        tokens_reserved = False
+                        await _refund_reserved()
                         return _make_error_response(
                             503,
                             json.dumps({"error": "upstream unavailable", "retry_after": int(limiter.circuit_cooldown)}).encode(),
@@ -657,8 +675,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                     status_code = 499
                     _log(logging.INFO, "client disconnected before upstream",
                          request_id=request_id)
-                    await limiter.refund_tokens(estimated_tokens)
-                    tokens_reserved = False
+                    await _refund_reserved()
                     return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
 
                 if is_stream:
@@ -685,7 +702,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                                 status_code = 429
                                 _log(logging.WARNING, "upstream terminal 429, not retrying",
                                      request_id=request_id, model=model_name)
-                                await limiter.refund_tokens(estimated_tokens)
+                                await _refund_reserved()
                                 resp = web.Response(status=429, body=error_body, content_type="application/json")
                                 resp.headers["X-Request-ID"] = request_id
                                 _add_forwarded_headers(resp, upstream_headers)
@@ -717,7 +734,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             if not await _sleep_interruptible(request, retry_wait):
                                 error_reason = "client_disconnected"
                                 status_code = 499
-                                await limiter.refund_tokens(estimated_tokens)
+                                await _refund_reserved()
                                 return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
                             continue
 
@@ -735,7 +752,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                                  request_id=request_id, model=model_name,
                                  status=upstream.status,
                                  body_preview=error_body[:500].decode(errors="replace"))
-                            await limiter.refund_tokens(estimated_tokens)
+                            await _refund_reserved()
                             return _upstream_error_response(
                                 upstream.status, error_body, upstream_headers, request_id
                             )
@@ -779,7 +796,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             if not await _sleep_interruptible(request, retry_wait):
                                 error_reason = "client_disconnected"
                                 status_code = 499
-                                await limiter.refund_tokens(estimated_tokens)
+                                await _refund_reserved()
                                 return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
                             continue
 
@@ -804,7 +821,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             status_code = 502
                             _log(logging.ERROR, "unexpected upstream status on streaming request",
                                  request_id=request_id, model=model_name, status=upstream.status)
-                            await limiter.refund_tokens(estimated_tokens)
+                            await _refund_reserved()
                             return _make_error_response(
                                 502,
                                 json.dumps({"error": "unexpected upstream response", "upstream_status": upstream.status}).encode(),
@@ -859,7 +876,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                                  request_id=request_id, model=model_name,
                                  total_bytes=total_stream_bytes)
                             upstream.close()
-                            await limiter.refund_tokens(estimated_tokens)
+                            await _refund_reserved()
                             return await _finalize_stream_response(resp)
                         except asyncio.CancelledError:
                             # Task cancellation is not a client disconnect:
@@ -881,6 +898,12 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         else:
                             tokens_from_stream = token_info["total_tokens"]
 
+                        # Ownership transfer, BEFORE the call: record_completion
+                        # reconciles the reservation synchronously before its
+                        # first suspension, so clearing after would leave the flag
+                        # set — and a cancellation at that suspension would make
+                        # the outer handler refund a reservation already charged.
+                        tokens_reserved = False
                         await limiter.record_completion(
                             estimated_tokens=estimated_tokens,
                             actual_tokens=tokens_from_stream,
@@ -893,7 +916,6 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             # circuit state untouched.
                             circuit_success=True if stream_clean else None,
                         )
-                        tokens_reserved = False
                         actual_tokens = tokens_from_stream
                         prompt_tokens = token_info.get("prompt_tokens", 0)
                         completion_tokens = token_info.get("completion_tokens", 0)
@@ -921,14 +943,13 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         # sees the cancellation; the outer finally releases the
                         # probe claim. A single await completes even in a
                         # cancelled task unless re-cancelled.
-                        await limiter.refund_tokens(estimated_tokens)
-                        tokens_reserved = False
-                        if not upstream.closed:
+                        await _refund_reserved()
+                        if upstream is not None and not upstream.closed:
                             upstream.close()
                         raise
                     except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
-                        await limiter.refund_tokens(estimated_tokens)
-                        if not upstream.closed:
+                        await _refund_reserved()
+                        if upstream is not None and not upstream.closed:
                             upstream.close()
                         error_reason = "client_disconnected"
                         status_code = 499
@@ -936,8 +957,8 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             return await _finalize_stream_response(stream_resp)
                         return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
                     except Exception as e:
-                        await limiter.refund_tokens(estimated_tokens)
-                        if not upstream.closed:
+                        await _refund_reserved()
+                        if upstream is not None and not upstream.closed:
                             upstream.close()
                         error_reason = "streaming_error"
                         status_code = 502
@@ -952,7 +973,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             request_id,
                         )
                     finally:
-                        if not upstream.closed:
+                        if upstream is not None and not upstream.closed:
                             upstream.close()
 
                 else:
@@ -970,7 +991,8 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
                     if _client_disconnected(request):
                         error_reason = "client_disconnected"
-                        await limiter.refund_tokens(estimated_tokens)
+                        status_code = 499
+                        await _refund_reserved()
                         _log(logging.INFO, "client disconnected after upstream response",
                              request_id=request_id, model=model_name)
                         return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
@@ -983,8 +1005,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             _log(logging.ERROR, "upstream response body exceeded cap, discarding",
                                  request_id=request_id, model=model_name, status=resp_up.status,
                                  cap=_cfg("UPSTREAM_MAX_BODY_SIZE"))
-                            await limiter.refund_tokens(estimated_tokens)
-                            tokens_reserved = False
+                            await _refund_reserved()
                             return _make_error_response(
                                 502, json.dumps({"error": "upstream response body too large"}).encode(), request_id
                             )
@@ -1003,7 +1024,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             status_code = 429
                             _log(logging.WARNING, "upstream terminal 429, not retrying",
                                  request_id=request_id, model=model_name)
-                            await limiter.refund_tokens(estimated_tokens)
+                            await _refund_reserved()
                             out = web.Response(status=429, body=resp_body, content_type="application/json")
                             out.headers["X-Request-ID"] = request_id
                             retry_after_raw = resp_headers.get("Retry-After")
@@ -1045,7 +1066,8 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         del resp_body, resp_headers  # Release response body before backoff sleep
                         if not await _sleep_interruptible(request, wait):
                             error_reason = "client_disconnected"
-                            await limiter.refund_tokens(estimated_tokens)
+                            status_code = 499
+                            await _refund_reserved()
                             return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
                         continue
 
@@ -1078,7 +1100,8 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         del resp_body, resp_headers  # Release response body before backoff sleep
                         if not await _sleep_interruptible(request, retry_wait):
                             error_reason = "client_disconnected"
-                            await limiter.refund_tokens(estimated_tokens)
+                            status_code = 499
+                            await _refund_reserved()
                             return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
                         continue
 
@@ -1086,6 +1109,8 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                     if tokens_used["total_tokens"] == 0:
                         tokens_used = {**tokens_used, "total_tokens": estimated_tokens}
                     duration_ms = round((time.monotonic() - request_start) * 1000, 1)
+                    # Ownership transfer, BEFORE the call (see stream path).
+                    tokens_reserved = False
                     await limiter.record_completion(
                         estimated_tokens=estimated_tokens,
                         actual_tokens=tokens_used["total_tokens"],
@@ -1095,7 +1120,6 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         response_bytes=len(resp_body),
                         circuit_success=True,
                     )
-                    tokens_reserved = False
 
                     _log(logging.DEBUG, "token reconciliation",
                          request_id=request_id, estimated=estimated_tokens,
@@ -1158,18 +1182,17 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                     return _make_error_response(502, b'{"error":"proxy forward error"}', request_id)
                 if not await _sleep_interruptible(request, _compute_backoff(limiter, retry)):
                     error_reason = "client_disconnected"
-                    await limiter.refund_tokens(estimated_tokens)
+                    status_code = 499
+                    await _refund_reserved()
                     return _make_error_response(499, b'{"error":"client disconnected"}', request_id)
                 continue
 
         error_reason = "max_retries_exhausted"
         status_code = 502
-        await limiter.refund_tokens(estimated_tokens)
-        tokens_reserved = False
+        await _refund_reserved()
         return _make_error_response(502, b'{"error":"proxy forward error"}', request_id)
     except asyncio.CancelledError:
-        if tokens_reserved and estimated_tokens > 0:
-            await limiter.refund_tokens(estimated_tokens)
+        await _refund_reserved()
         raise
     finally:
         if holding_probe:

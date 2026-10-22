@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from dashscope_proxy_lib.config import (
     SECONDARY_MODELS, TERTIARY_MODELS, QUATERNARY_MODELS, QUINARY_MODELS, SENARY_MODELS, SEPTENARY_MODELS,
     OCTONARY_MODELS, NONARY_MODELS, DECENARY_MODELS, UNDENARY_MODELS, MODEL_PROVIDER_MAP,
+    _normalize_fallback_entry,
 )
 from dashscope_proxy_lib.logging_config import _log
 from dashscope_proxy_lib.request_transform import normalize_model_name
@@ -383,8 +384,15 @@ class ProviderRouter:
         else:
             model_name = bare
 
-        # Check explicit mapping first (highest priority)
-        mapped = MODEL_PROVIDER_MAP.get(model_name)
+        # Check explicit mapping first (highest priority). Normalize so a map
+        # written with a provider SLUG ("openlux", "dashscope") resolves like
+        # MODEL_FALLBACK_ORDER does, instead of being silently ignored.
+        raw_mapped = MODEL_PROVIDER_MAP.get(model_name)
+        mapped = (
+            _normalize_fallback_entry(raw_mapped)
+            if isinstance(raw_mapped, str)
+            else None
+        )
         if mapped == "undenary" and self.undenary.is_available:
             return self.undenary
         if mapped == "decenary" and self.decenary.is_available:
@@ -478,7 +486,12 @@ class ProviderRouter:
 
         # Invert the live PROVIDER_SLUGS registry (slug -> canonical) so
         # adding/renaming a slug cannot desync this map from the config.
-        _slug_for = {v: k for k, v in _cfg("PROVIDER_SLUGS").items()}
+        # FIRST slug wins: a provider may list several aliases (septenary has
+        # both `glm` and `zai`); a plain comprehension would advertise the last
+        # one and silently hide the documented pin.
+        _slug_for: dict[str, str] = {}
+        for _slug, _canonical in _cfg("PROVIDER_SLUGS").items():
+            _slug_for.setdefault(_canonical, _slug)
         models = {"object": "list", "data": []}
         seen: set[str] = set()
         _sources = [

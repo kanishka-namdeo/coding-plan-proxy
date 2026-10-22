@@ -104,7 +104,15 @@ async def test_models_endpoint():
                 models = [m["id"] for m in data.get("data", [])]
                 has_primary = any("qwen" in m for m in models)
                 has_secondary = any("mimo" in m for m in models)
-                has_tertiary = any("kat" in m for m in models)
+                # Derive the tertiary expectation from the real catalog. This
+                # used to hardcode `any("kat" in m ...)`, a leftover from the
+                # retired kat-coder-pro-v2.5, so it could never match and this
+                # check was permanently red — masking real regressions.
+                import dashscope_proxy as _dp
+                tertiary_ids = {
+                    d["id"] for d in _dp.TERTIARY_MODELS["data"]
+                }
+                has_tertiary = bool(tertiary_ids & set(models))
                 if has_primary and has_secondary and has_tertiary:
                     results.append(("PASS", "models_endpoint", f"count={len(models)}", f"primary={has_primary}", f"secondary={has_secondary}", f"tertiary={has_tertiary}"))
                 else:

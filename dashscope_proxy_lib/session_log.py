@@ -123,7 +123,13 @@ class SessionLogWriter:
                 self._file.flush()
             except OSError:
                 pass
-            self._file.close()
+            try:
+                self._file.close()
+            except OSError as e:
+                # Never let a failed close strand the handle we just opened.
+                _logger.warning("session log file close failed: %s", e)
+                new_file.close()
+                return
         self._file = new_file
         self._current_date = today
         self._lines_since_flush = 0
@@ -148,11 +154,16 @@ class SessionLogWriter:
             self._ensure_file()
             if self._file is None:
                 return
-            self._file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # default=str coerces a non-JSON leaf instead of dropping the whole
+            # entry, so "no field dropping" survives a stray bytes/set/exception.
+            self._file.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
             self._lines_since_flush += 1
             if self._sync_flush or self._lines_since_flush >= self._flush_every:
                 self._flush_unlocked()
-        except OSError as e:
+        except (OSError, TypeError, ValueError) as e:
+            # TypeError/ValueError: a genuinely unencodable entry (e.g. a circular
+            # reference). Must NOT escape — it would kill the drain thread and
+            # silently turn every later log_async into a queue-full drop.
             _logger.warning("session log write failed: %s", e)
 
     def _log_with_lock(self, entry: dict) -> None:
@@ -205,6 +216,10 @@ class SessionLogWriter:
                     ):
                         self._flush_unlocked()
                         last_flush = now
+            except Exception as e:  # noqa: BLE001 - the drain thread must never die
+                # A thread that exits here silently degrades every later
+                # log_async() into a queue-full drop for the process lifetime.
+                _logger.warning("session log writer dropped an entry: %s", e)
             finally:
                 self._queue.task_done()
 
@@ -270,6 +285,9 @@ class SessionLogWriter:
                     item = self._queue.get_nowait()
                 except queue.Empty:
                     continue
+                # Balance unfinished_tasks for the item we just pulled, so the
+                # counter can never drift upward (and would hang a future join()).
+                self._queue.task_done()
                 if item is _SENTINEL:
                     # Another closer already signaled; keep room for our path.
                     continue
@@ -285,6 +303,7 @@ class SessionLogWriter:
                 item = self._queue.get_nowait()
             except queue.Empty:
                 break
+            self._queue.task_done()
             if item is not _SENTINEL:
                 drained.append(item)
         return drained

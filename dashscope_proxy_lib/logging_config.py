@@ -24,7 +24,10 @@ class StructuredLogFormatter(logging.Formatter):
         extra = getattr(record, "extra_context", {})
         if extra:
             log_entry.update(extra)
-        return json.dumps(log_entry, ensure_ascii=False)
+        # default=str: a non-JSON value in extra_context (e.g. server.py's
+        # metrics=status()) would otherwise raise TypeError inside format() and
+        # lose the whole record.
+        return json.dumps(log_entry, ensure_ascii=False, default=str)
 
 
 class TUILogHandler(logging.Handler):
@@ -43,7 +46,9 @@ class TUILogHandler(logging.Handler):
             "message": record.getMessage(),
         }
         if hasattr(record, "extra_context") and record.extra_context:
-            entry["extra"] = record.extra_context
+            # Copy: the deque entry must not alias (and thereby pin) the
+            # caller's dict, nor observe a later mutation of it.
+            entry["extra"] = dict(record.extra_context)
         if record.exc_info and record.exc_info[0] is not None:
             entry["exception"] = self.format(record)
         with self._lock:

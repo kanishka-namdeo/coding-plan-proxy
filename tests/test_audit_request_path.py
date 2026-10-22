@@ -44,7 +44,7 @@ from dashscope_proxy_lib.http_helpers import (
 from dashscope_proxy_lib.provider_router import ProviderRouter
 from dashscope_proxy_lib.queue import wait_for_slot
 from dashscope_proxy_lib.rate_limiter import MultiProviderRateLimiter, RateLimiter
-from dashscope_proxy_lib.request_transform import normalize_model_name, split_provider_prefix
+from dashscope_proxy_lib.request_transform import normalize_model_name, split_provider_prefix, PROVIDER_SLUG_MAP
 from dashscope_proxy_lib.session_log import SessionLogWriter
 from dashscope_proxy_lib.token_utils import (
     estimate_tokens_for_body,
@@ -384,6 +384,18 @@ class TestNormalizeModelNameAudit:
         assert normalize_model_name("qwen3.6-plus") == "qwen3.6-plus"
         assert normalize_model_name(None) is None
         assert normalize_model_name(123) == 123
+
+    def test_mimo_alias_matches_whole_id_or_hyphen_boundary_only(self):
+        """Lock the hyphen-boundary contract: a bare startswith rewrote the
+        nonexistent ``mimo-v2-50`` into ``mimo-v2.50``."""
+        assert normalize_model_name("mimo-v2-5-pro") == "mimo-v2.5-pro"  # alias still works
+        assert normalize_model_name("mimo-v2-5") == "mimo-v2.5"  # bare alias, no suffix
+        assert normalize_model_name("mimo-v2-50") == "mimo-v2-50"  # NOT rewritten
+        assert normalize_model_name("MIMO-V2-5-Flash") == "mimo-v2.5-Flash"  # case-insensitive
+        # Zen IDs are matched verbatim; normalization must not be widened to them.
+        zen_ids = [e["id"] for e in dashscope_proxy.UNDENARY_MODELS["data"]]
+        zen_id = next(i for i in zen_ids if "mimo-v2-5" not in i.lower())
+        assert normalize_model_name(zen_id) == zen_id
 
 
 # ---------------------------------------------------------------------------
@@ -1066,6 +1078,120 @@ class TestProviderRouterAudit:
         assert provider is router.tertiary
         assert provider.is_available is False
 
+    @pytest.mark.parametrize("mapped_value", ["glm", "septenary"])
+    def test_model_provider_map_accepts_slug_and_canonical(self, monkeypatch, mapped_value):
+        """Lock the slug-normalization contract: a MODEL_PROVIDER_MAP value
+        written with a documented slug (``glm``) must resolve exactly like the
+        canonical ordinal (``septenary``); previously it was silently ignored
+        and the model fell through to list routing."""
+        monkeypatch.setattr(_config_mod, "SEPTENARY_API_KEY", "k")
+        monkeypatch.setattr(_config_mod, "SEPTENARY_BASE_URL", "https://glm.example/v1")
+        # ProviderRouter binds MODEL_PROVIDER_MAP at import, so patch the live
+        # config dict (this file's _config_mod convention) plus the router's
+        # module-level binding (test_units.py convention).
+        mapping = {"custom-slug-map-model": mapped_value}
+        monkeypatch.setattr(_config_mod, "MODEL_PROVIDER_MAP", mapping)
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.provider_router.MODEL_PROVIDER_MAP", mapping
+        )
+        router = ProviderRouter()
+        assert router.get_provider_for_model("custom-slug-map-model") is router.septenary
+
+    def test_unknown_map_entry_falls_through_to_list_routing(self, monkeypatch):
+        """Negative control: an unknown map value must fall through to ordinary
+        model-list routing (here: primary), never to a mapped provider."""
+        monkeypatch.setattr(_config_mod, "SEPTENARY_API_KEY", "k")
+        monkeypatch.setattr(_config_mod, "SEPTENARY_BASE_URL", "https://glm.example/v1")
+        mapping = {"custom-slug-map-model": "nosuchprovider"}
+        monkeypatch.setattr(_config_mod, "MODEL_PROVIDER_MAP", mapping)
+        monkeypatch.setattr(
+            "dashscope_proxy_lib.provider_router.MODEL_PROVIDER_MAP", mapping
+        )
+        router = ProviderRouter()
+        assert router.get_provider_for_model("custom-slug-map-model") is router.primary
+
+    def test_get_all_models_advertises_first_slug_per_provider(self, monkeypatch):
+        """Lock the first-slug-wins contract: ``_slug_for`` inversion keeps the
+        FIRST slug in PROVIDER_SLUGS (septenary advertises ``glm/…``, not the
+        later alias ``zai/…``); a plain dict comprehension kept the LAST."""
+        for ordinal in (
+            "SECONDARY", "TERTIARY", "QUATERNARY", "QUINARY", "SENARY",
+            "SEPTENARY", "OCTONARY", "NONARY", "DECENARY", "UNDENARY",
+        ):
+            monkeypatch.setattr(_config_mod, f"{ordinal}_API_KEY", "k")
+            monkeypatch.setattr(_config_mod, f"{ordinal}_BASE_URL", "https://example.invalid/v1")
+        router = ProviderRouter()
+        # Same derivation as production: first slug declared per canonical name.
+        first_slug: dict[str, str] = {}
+        for slug, canonical in dashscope_proxy.PROVIDER_SLUGS.items():
+            first_slug.setdefault(canonical, slug)
+        models = router.get_all_models()
+        assert models["data"]
+        seen: set[str] = set()
+        for entry in models["data"]:
+            assert entry["providers"]
+            for name in entry["providers"]:
+                seen.add(name)
+                assert f"{first_slug[name]}/{entry['id']}" in entry["provider_models"]
+            for pin in entry["provider_models"]:
+                slug, _, _ = pin.partition("/")
+                # Every advertised prefix must be a pin ingress would accept.
+                assert slug in PROVIDER_SLUG_MAP
+        assert seen == {
+            "primary", "secondary", "tertiary", "quaternary", "quinary",
+            "senary", "septenary", "octonary", "nonary", "decenary", "undenary",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Non-stream client-disconnect paths record 499 in the session log
+# ---------------------------------------------------------------------------
+
+class TestNonStreamDisconnectSessionLog:
+    async def test_disconnect_after_upstream_records_499_in_session_log(
+        self, aiohttp_client, tmp_path, monkeypatch
+    ):
+        """Lock the 499 symmetry contract: the non-stream disconnect sites must
+        set ``status_code = 499`` alongside ``error_reason`` (as the streaming
+        paths already do), so the session-log ``finally`` records 499 instead
+        of the stale upstream status while the client receives 499."""
+        async def ok(request):
+            return web.json_response({"choices": [], "usage": {"total_tokens": 5}})
+
+        async with _mock_upstream(ok) as port:
+            _patch_target(monkeypatch, port)
+            calls = {"n": 0}
+
+            def fake_disconnected(request):
+                # wait_for_slot uses queue's own _client_disconnected (real, still
+                # connected); the handler pre-upstream check passes, the
+                # post-upstream non-stream check trips.
+                calls["n"] += 1
+                return calls["n"] >= 2
+
+            monkeypatch.setattr(_handlers_mod, "_client_disconnected", fake_disconnected)
+            app = _proxy_app()
+            log_dir = tmp_path / "slogs"
+            writer = SessionLogWriter(str(log_dir), sync_flush=True)
+            app["session_log"] = writer
+            try:
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post("/v1/chat/completions", data=CHAT_BODY_BYTES)
+                assert resp.status == 499
+                request_id = resp.headers["X-Request-ID"]
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                entries = [
+                    json.loads(line)
+                    for line in (log_dir / f"{today}.jsonl").read_text(encoding="utf-8").strip().splitlines()
+                ]
+                entry = next(e for e in entries if e["request_id"] == request_id)
+                assert entry["status_code"] == 499
+                assert entry["error_reason"] == "client_disconnected"
+            finally:
+                writer.close()
+
 
 # ---------------------------------------------------------------------------
 # Item 14 — generation-path ingress exemption is messages-only
@@ -1129,4 +1255,204 @@ class TestGenerationPathIngressExemption:
                 assert resp.status == 200
         finally:
             await runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# TPM refund exactly-once locks (double-refund + cancellation fixes)
+# ---------------------------------------------------------------------------
+
+class TestCircuitOpenExhaustedFailoverSingleRefund:
+    async def test_open_circuit_with_no_failover_candidate_refunds_exactly_once(
+        self, aiohttp_client, monkeypatch
+    ):
+        """Lock the exactly-once refund contract: with the current provider's
+        circuit OPEN, the request UNPINNED, and every failover candidate also
+        circuit-open, ``_try_failover_with_tpm`` refunds the reservation and
+        the circuit-open return path must no-op. A second ``refund_tokens``
+        credit clamps through zero (``TokenWindowCounter.refund``) and eats
+        into OTHER in-flight reservations, so ``reserved`` must equal its
+        pre-request baseline and ``refund_tokens`` must fire exactly once."""
+        async def never_hit(request):  # canary: nothing may be contacted
+            raise AssertionError("no upstream should be contacted when all circuits are open")
+
+        async with _mock_upstream(never_hit) as q_port:
+            async with _mock_upstream(never_hit) as t_port:
+                _overlap_patches(monkeypatch, t_port, q_port)
+                app = _proxy_app(tertiary_config=make_test_config(), quaternary_config=make_test_config())
+                rl = app["rate_limiter"]
+                # Simulate OTHER in-flight work: with a zero baseline a double
+                # refund is invisible (clamp hides it), but here it would eat
+                # this credit and land below baseline.
+                baseline = 200
+                assert rl.tertiary.tpm_bucket.try_reserve(baseline) is True
+                for name in ("tertiary", "quaternary"):
+                    sub = getattr(rl, name)
+                    sub.circuit_state = "OPEN"
+                    sub.circuit_open_until = time.monotonic() + 60
+                refunds = []
+                real_refund = rl.tertiary.refund_tokens
+
+                async def counting_refund(n):
+                    refunds.append(n)
+                    return await real_refund(n)
+
+                rl.tertiary.refund_tokens = counting_refund
+                async with aiohttp.ClientSession() as session:
+                    app["client_session"] = session
+                    client = await aiohttp_client(app)
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "overlap-circuit-model",
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }).encode(),
+                    )
+                    assert resp.status == 503
+                    data = await resp.json()
+                assert data["error"] == "upstream unavailable"
+                assert refunds == [100]  # exactly one refund of the estimate
+                assert rl.tertiary.tpm_bucket.reserved == baseline
+
+
+class TestRefundHelperIdempotentOnFailoverExhausted:
+    async def test_5xx_with_no_failover_candidate_refunds_exactly_once(
+        self, aiohttp_client, monkeypatch
+    ):
+        """Lock the ``_refund_reserved`` idempotency contract end to end: a
+        non-stream 5xx with retries exhausted and no failover candidate
+        refunds inside ``_try_failover_with_tpm`` and the 5xx return path must
+        not credit again. ``reserved`` must equal its pre-request baseline
+        (any second credit — including a late cancellation — would drive it
+        below baseline through the clamp) and ``refund_tokens`` fires once."""
+        async def always_500(request):
+            return web.Response(status=500, body=b'{"error": "boom"}')
+
+        async with _mock_upstream(always_500) as port:
+            _patch_target(monkeypatch, port)
+            monkeypatch.setattr(dashscope_proxy, "MAX_5XX_RETRIES", 0)
+            app = _proxy_app()
+            rl = app["rate_limiter"]
+            baseline = 200
+            assert rl.primary.tpm_bucket.try_reserve(baseline) is True
+            refunds = []
+            real_refund = rl.primary.refund_tokens
+
+            async def counting_refund(n):
+                refunds.append(n)
+                return await real_refund(n)
+
+            rl.primary.refund_tokens = counting_refund
+            async with aiohttp.ClientSession() as session:
+                app["client_session"] = session
+                client = await aiohttp_client(app)
+                resp = await client.post("/v1/chat/completions", data=CHAT_BODY_BYTES)
+            assert resp.status == 500
+            assert refunds == [100]  # exactly one refund of the estimate
+            assert rl.primary.tpm_bucket.reserved == baseline
+
+
+class TestTryAdmitCancelledOnAdmitLock:
+    async def test_cancel_while_blocked_on_admit_lock_refunds_reservation(self):
+        """Lock the cancellation-refund contract: a ``try_admit`` cancelled
+        while blocked acquiring the Phase-4 admit lock must refund the TPM
+        reservation it took in Phase 3 before re-raising, or the tokens leak
+        for the life of the process (``reserved`` is not windowed)."""
+        cfg = {
+            "rpm_limit": 6000,
+            "tpm_limit": 100,
+            "safety_factor": 1.0,
+            "max_queue_size": 50,
+            "max_retries": 2,
+            "base_backoff": 0.05,
+        }
+        rl = dashscope_proxy.RateLimiter(cfg)
+        n = 10
+        orig_try_reserve = rl.tpm_bucket.try_reserve
+
+        def hooked(tokens, now=None):
+            # Admit lock is FREE for the Phase-2 pre-check; only once the
+            # Phase-3 reservation succeeds does the lock appear HELD, so
+            # Phase 4 blocks and the task can be cancelled there.
+            ok = orig_try_reserve(tokens, now)
+            if ok:
+                rl._lock._locked = True
+            return ok
+
+        rl.tpm_bucket.try_reserve = hooked
+        try:
+            task = asyncio.create_task(rl.try_admit(n))
+            for _ in range(100):
+                if rl.tpm_bucket.reserved == n:
+                    break
+                await asyncio.sleep(0.01)
+            assert rl.tpm_bucket.reserved == n  # Phase 3 completed, Phase 4 blocked
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert rl.tpm_bucket.reserved == 0  # reservation returned, not leaked
+        finally:
+            rl._lock._locked = False
+            rl.tpm_bucket.try_reserve = orig_try_reserve
+
+    async def test_admit_without_cancellation_holds_reservation(self):
+        """Positive control for the cancellation refund: a NON-cancelled
+        ``try_admit`` still admits and still holds its reservation, proving
+        the refund fires only on cancellation and not unconditionally."""
+        cfg = {
+            "rpm_limit": 6000,
+            "tpm_limit": 100,
+            "safety_factor": 1.0,
+            "max_queue_size": 50,
+            "max_retries": 2,
+            "base_backoff": 0.05,
+        }
+        rl = dashscope_proxy.RateLimiter(cfg)
+        ok, reason, _ = await rl.try_admit(10)
+        assert ok is True
+        assert reason == "ok"
+        assert rl.tpm_bucket.reserved == 10
+
+
+class TestTryAdmitAdmissionPaths:
+    async def test_happy_path_admits_and_completion_releases(self):
+        """Lock the admission happy path: ``try_admit`` returns
+        ``(True, "ok", ...)`` and holds the reservation, then
+        ``record_completion`` reconciles it back to zero and records actuals —
+        the new ``except CancelledError`` must not have broken admission."""
+        rl = dashscope_proxy.RateLimiter(make_test_config())
+        ok, reason, _ = await rl.try_admit(100)
+        assert ok is True
+        assert reason == "ok"
+        assert rl.tpm_bucket.reserved == 100
+        await rl.record_completion(
+            estimated_tokens=100, actual_tokens=40, model="m",
+            latency_ms=5.0, request_bytes=10, response_bytes=20,
+        )
+        assert rl.tpm_bucket.reserved == 0
+        assert rl.total_forwarded == 1
+        assert rl.total_tokens_consumed == 40
+
+    async def test_rps_loser_denied_without_holding_reservation(self):
+        """Lock the RPS-loser path: with ``rps_limit`` at 1, a second
+        immediate ``try_admit`` loses the spacing race, returns False, and
+        holds no reservation of its own (only the first call's ``reserved``
+        remains) — i.e. the loser self-refunded instead of leaking."""
+        cfg = {
+            "rpm_limit": 60,
+            "tpm_limit": 10_000_000,
+            "safety_factor": 1.0,
+            "max_queue_size": 50,
+            "max_retries": 2,
+            "base_backoff": 0.05,
+        }
+        rl = dashscope_proxy.RateLimiter(cfg)
+        assert rl.rps_limit == 1
+        ok_first, _, _ = await rl.try_admit(100)
+        assert ok_first is True
+        assert rl.tpm_bucket.reserved == 100
+        ok_second, reason_second, wait_second = await rl.try_admit(100)
+        assert ok_second is False
+        assert reason_second == "RPS spacing"
+        assert wait_second > 0
+        assert rl.tpm_bucket.reserved == 100  # second call holds nothing
 

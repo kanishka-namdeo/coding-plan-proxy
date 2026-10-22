@@ -25,13 +25,13 @@ class SlidingWindowCounter:
         self._lock = threading.Lock()
 
     def add(self, now: float | None = None):
-        now = now or time.monotonic()
+        now = time.monotonic() if now is None else now
         with self._lock:
             self.events.append(now)
             self._prune(now)
 
     def count(self, now: float | None = None) -> int:
-        now = now or time.monotonic()
+        now = time.monotonic() if now is None else now
         with self._lock:
             self._prune(now)
             return len(self.events)
@@ -92,14 +92,14 @@ class TokenWindowCounter:
 
     def available(self, now: float | None = None) -> float:
         """Return currently available tokens (capacity minus tokens used in window, minus reservations)."""
-        now = now or time.monotonic()
+        now = time.monotonic() if now is None else now
         with self._lock:
             used = self._tokens_used(now)
             return max(0.0, self.capacity - used - self.reserved)
 
     def try_reserve(self, tokens: int, now: float | None = None) -> bool:
         """Reserve tokens if available. Returns True on success."""
-        now = now or time.monotonic()
+        now = time.monotonic() if now is None else now
         with self._lock:
             used = self._tokens_used(now)
             if self.capacity - used - self.reserved >= tokens:
@@ -138,7 +138,7 @@ class TokenWindowCounter:
         Computes when the oldest consumed tokens will expire from the window,
         freeing up enough capacity for the requested amount.
         """
-        now = now or time.monotonic()
+        now = time.monotonic() if now is None else now
         with self._lock:
             used = self._tokens_used(now)
             needed = tokens + self.reserved - (self.capacity - used)
@@ -163,7 +163,11 @@ class TokenWindowCounter:
             used = self._tokens_used(now)
             return {
                 "tpm_capacity": self.capacity,
-                "tpm_available": int(self.capacity - used - self.reserved),
+                # Clamp like available(): a reconcile that overshoots the
+                # reservation (upstream reports more than reserved) would
+                # otherwise publish a negative availability to /v1/proxy/status
+                # and the TUI, which cannot render it.
+                "tpm_available": int(max(0.0, self.capacity - used - self.reserved)),
                 "tpm_reserved": self.reserved,
             }
 
@@ -320,6 +324,7 @@ class RateLimiter:
             return False, "RPS spacing", min_gap - (now_mono - last_req)
 
         # Phase 3: TPM reservation — bucket's own lock only, no admit lock held.
+        reserved_here = False
         if estimated_tokens > 0:
             if not self.tpm_bucket.try_reserve(estimated_tokens):
                 avail_snap = self.tpm_bucket.available(now_mono)
@@ -329,18 +334,31 @@ class RateLimiter:
                      estimated_tokens=estimated_tokens, available_tokens=int(avail_snap),
                      shortfall=estimated_tokens - avail_snap)
                 return False, "TPM limit reached", wait
+            reserved_here = True
 
         # Phase 4: Stamp last_request_time and re-check RPS (another request may
         # have stamped while we were doing TPM work). The lock is held only for
         # the single-float read-modify-write; the refund and log below run
         # after it is released (no other locks, no I/O inside the lock).
+        #
+        # `reserved` is NOT windowed (only recorded actuals age out in _prune),
+        # so a reservation abandoned here is lost for the life of the process.
+        # Acquiring the admit lock below is the one suspension point between the
+        # Phase-3 reserve and the caller learning the outcome, and cancellation
+        # lands there under contention — refund before propagating, because the
+        # caller never receives a return value and so cannot know it must.
         denied = False
-        async with self._lock:
-            now_mono = time.monotonic()
-            time_since_last = now_mono - self.last_request_time
-            denied = time_since_last < min_gap
-            if not denied:
-                self.last_request_time = now_mono
+        try:
+            async with self._lock:
+                now_mono = time.monotonic()
+                time_since_last = now_mono - self.last_request_time
+                denied = time_since_last < min_gap
+                if not denied:
+                    self.last_request_time = now_mono
+        except asyncio.CancelledError:
+            if reserved_here:
+                self.tpm_bucket.refund(estimated_tokens)
+            raise
 
         if denied:
             # Another request beat us; refund TPM and deny (outside the lock).
@@ -374,7 +392,7 @@ class RateLimiter:
         ``_thread_lock``. The stamp is a single float write — no other locks,
         no I/O — so hold time stays in microseconds. Never hold both at once.
         """
-        now = now or time.monotonic()
+        now = time.monotonic() if now is None else now
         self.rpm_window.add(now)
         async with self._lock:
             self.last_request_time = now
@@ -671,11 +689,12 @@ class RateLimiter:
         queue_p95 = 0.0
         queue_p99 = 0.0
         if queue_wait_snapshot:
-            sorted_waits = sorted(queue_wait_snapshot)
-            n = len(sorted_waits)
-            queue_p50 = sorted_waits[int(n * 0.50)]
-            queue_p95 = sorted_waits[int(n * 0.95)]
-            queue_p99 = sorted_waits[int(n * 0.99)]
+            # Same helper as the model-latency percentiles below: one percentile
+            # definition per payload. The old sorted_waits[int(n * p)] index form
+            # was one rank high (n=20, p95 read the maximum).
+            queue_p50 = self._compute_percentile(queue_wait_snapshot, 50)
+            queue_p95 = self._compute_percentile(queue_wait_snapshot, 95)
+            queue_p99 = self._compute_percentile(queue_wait_snapshot, 99)
 
         return {
             "rps_limit": self.rps_limit,
@@ -704,8 +723,8 @@ class RateLimiter:
         }
 
     @staticmethod
-    def _compute_percentile(latencies: deque, p: float) -> float:
-        """Compute percentile from a deque of latencies."""
+    def _compute_percentile(latencies, p: float) -> float:
+        """Compute percentile from any sequence of latencies."""
         if not latencies:
             return 0.0
         sorted_vals = sorted(latencies)

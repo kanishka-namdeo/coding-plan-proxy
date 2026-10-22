@@ -987,8 +987,106 @@ class TestProviderGridColumnBudget:
         assert _compact_number(999_999_999) == "1.0B"
         assert _compact_number(999_999_999_999) == "1.0T"
         for n in (0, 7, 999, 1_000, 12_345, 999_500, 999_999, 1_000_000,
-                  123_456_789, 999_999_999, 1_000_000_000_000, 10 ** 18):
+                  123_456_789, 999_999_999, 1_000_000_000_000):
             assert len(_compact_number(n)) <= 6, f"{n} -> {_compact_number(n)!r}"
+
+    def test_progress_bar_clamps_negative_current_to_empty_bar(self):
+        """`_progress_bar` clamps BOTH ends of the fill.
+
+        The old code clamped only the top (`min(filled, width)`), so a
+        negative `current` — reachable straight from a negative
+        `tpm_available` in the detail pane — made
+        `empty = width - filled` EXCEED `width` and overflowed the cell.
+        The bar must render exactly `width` cells for negative input, the
+        same length as a normal reading.
+        """
+        from proxy_tui import _progress_bar
+        normal = _progress_bar(10000, 20000)
+        negative = _progress_bar(-5000, 20000)
+        assert len(negative) == len(normal) == 32, (
+            f"negative bar changed length: {len(negative)} vs {len(normal)}"
+        )
+        width = 20
+        for current in (-1, -5000, -10 ** 9):
+            rendered = _progress_bar(current, 20000)
+            bar = rendered.split(" ", 1)[0]
+            filled = bar.count("\u2588")
+            empty = bar.count("\u2591")
+            assert filled == 0, f"{current}: negative fill leaked: {rendered!r}"
+            assert empty == width - filled, (
+                f"{current}: empty {empty} != width - filled {width - filled}"
+            )
+            assert filled + empty == width, (
+                f"{current}: bar is {filled + empty} cells, expected {width}"
+            )
+
+    def test_progress_bar_clamps_over_maximum_to_full_bar(self):
+        """The upper clamp survives alongside the lower one: no overflow."""
+        from proxy_tui import _progress_bar
+        width = 20
+        for current in (20000, 99999):
+            rendered = _progress_bar(current, 20000)
+            bar = rendered.split(" ", 1)[0]
+            assert len(bar) == width, (
+                f"{current}: bar is {len(bar)} cells, expected {width}"
+            )
+            assert bar.count("\u2588") == width, f"{current}: not saturated: {rendered!r}"
+            assert bar.count("\u2591") == 0, f"{current}: not saturated: {rendered!r}"
+
+    def test_progress_bar_degenerate_maximum_renders_empty_bar(self):
+        """`maximum <= 0` renders an empty bar rather than raising."""
+        from proxy_tui import _progress_bar
+        rendered = _progress_bar(5, 0)
+        bar = rendered.split(" ", 1)[0]
+        assert len(bar) == 20
+        assert bar.count("\u2588") == 0
+        assert bar.count("\u2591") == 20
+
+    def test_compact_number_saturates_suffix_at_terae(self):
+        """Past "T" the suffix saturates and the <= 6-char bound wins.
+
+        The promotion loop keeps dividing after the suffix has saturated at
+        "T", so `10**15` renders as "1.0T" and loses 1000x of magnitude.
+        That is DELIBERATE, not an oversight: this function's contract is a
+        hard 6-character ceiling, because the Overview grid runs
+        `cell_padding = 0` and sizes its RPM/TPM columns from that budget. A
+        10**15 counter cannot occur through a local proxy, so the ceiling is
+        worth more than the magnitude.
+        """
+        from tui_status import _compact_number
+        assert _compact_number(10 ** 15) == "1.0T"
+        # The ceiling holds at every magnitude, however absurd.
+        for n in (10 ** 15, 10 ** 18, 10 ** 21):
+            rendered = _compact_number(n)
+            assert len(rendered) <= 6, f"{n} -> {rendered!r} exceeds the grid budget"
+            assert rendered.endswith("T"), f"{n} -> {rendered!r} lost the suffix"
+        # Ordinary promotions are unaffected.
+        assert _compact_number(999) == "999"
+        assert _compact_number(1_000) == "1.0K"
+        assert _compact_number(999_999) == "1.0M"
+
+    def test_compact_number_unit_ladder_is_monotonic(self):
+        """Parsed magnitudes never decrease up the unit ladder.
+
+        A future reordering of `_COMPACT_UNITS` would show up here as a
+        mantissa that runs backwards even while every individual rendering
+        still looks plausible. Scoped to <= "T", which is where the ladder
+        actually tracks magnitude (past "T" the suffix saturates by design).
+        """
+        from tui_status import _compact_number
+
+        def _magnitude(rendered):
+            multipliers = {"K": 1_000, "M": 1_000_000,
+                           "B": 1_000_000_000, "T": 1_000_000_000_000}
+            if rendered[-1] in multipliers:
+                return float(rendered[:-1]) * multipliers[rendered[-1]]
+            return float(rendered)
+
+        inputs = [999, 1_000, 999_999, 10 ** 6, 10 ** 9, 10 ** 12]
+        magnitudes = [_magnitude(_compact_number(n)) for n in inputs]
+        assert magnitudes == sorted(magnitudes), (
+            f"unit ladder runs backwards: {list(zip(inputs, magnitudes))}"
+        )
 
 
 
@@ -2046,3 +2144,309 @@ class TestStatusEnvelopeUnwrap:
         # service: `rate_limits` / `providers` / `model_overlaps` is THIS
         # proxy's own envelope.
         assert "squat" not in message.lower()
+
+
+# ---------------------------------------------------------------------------
+# Sparkline copy, latency-union snapshot, and poll-loop shutdown/logging locks
+# ---------------------------------------------------------------------------
+
+class TestSparklineHandsCopy:
+    """`_update_sparklines` must hand widgets a COPY, not the shared list.
+
+    `Sparkline.data` is a plain reactive holding the reference, so aliasing
+    the history list lets the poll thread `append` to widget-held state.
+    """
+
+    async def test_all_four_sparklines_get_copies_not_aliases(self):
+        from textual.widgets import Sparkline
+        tui, _ = _live_tui_app()
+        async with tui.run_test(size=(120, 40)) as pilot:
+            tui.workers.cancel_all()
+            await pilot.pause()
+            tui.history.rpm_samples = [10, 20, 30]
+            tui.history.tpm_used_samples = [100, 200, 300]
+            tui.history.queue_samples = [1, 2, 3]
+            tui.history.upstream_latency_samples = [0.5, 1.5, 2.5]
+
+            tui._update_sparklines()
+            await pilot.pause()
+
+            pairs = [
+                ("#rpm-sparkline", tui.history.rpm_samples),
+                ("#tpm-sparkline", tui.history.tpm_used_samples),
+                ("#queue-sparkline", tui.history.queue_samples),
+                ("#upstream-latency-sparkline",
+                 tui.history.upstream_latency_samples),
+            ]
+            for selector, backing in pairs:
+                widget = tui.query_one(selector, Sparkline)
+                assert list(widget.data) == list(backing), (
+                    f"{selector} values diverged from history"
+                )
+                assert widget.data is not backing, (
+                    f"{selector} aliases the history list — the poll "
+                    f"thread would mutate widget-held state"
+                )
+
+            # The actual leak: growing the history must not grow the widget.
+            tui.history.rpm_samples.append(40)
+            tui.history.tpm_used_samples.append(400)
+            tui.history.queue_samples.append(4)
+            tui.history.upstream_latency_samples.append(3.5)
+            await pilot.pause()
+
+            expected = {
+                "#rpm-sparkline": [10, 20, 30],
+                "#tpm-sparkline": [100, 200, 300],
+                "#queue-sparkline": [1, 2, 3],
+                "#upstream-latency-sparkline": [0.5, 1.5, 2.5],
+            }
+            for selector, values in expected.items():
+                widget = tui.query_one(selector, Sparkline)
+                assert list(widget.data) == values, (
+                    f"{selector} grew when history grew — it holds an alias"
+                )
+
+
+class TestLatencyUnionValuesSnapshot:
+    """`_latency_union_values` must tolerate concurrent key insertion.
+
+    The poll thread inserts keys via `setdefault` while a tab switch can be
+    reading the union. Iterating the live view raises "dictionary changed
+    size during iteration"; iterating `list(...values())` snapshots first.
+    """
+
+    def test_union_is_correct_and_fresh(self):
+        tui = _bare_tui()
+        from proxy_tui import LatencyTracker
+        tui._latency_trackers = {
+            "primary": LatencyTracker(),
+            "secondary": LatencyTracker(),
+        }
+        tui._latency_trackers["primary"].latencies = [1.0, 2.0]
+        tui._latency_trackers["secondary"].latencies = [3.0]
+
+        union = tui._latency_union_values()
+        assert union == [1.0, 2.0, 3.0]
+        for tracker in tui._latency_trackers.values():
+            assert union is not tracker.latencies, (
+                "union aliases a tracker list — mutating it corrupts history"
+            )
+        union.append(99.0)
+        assert 99.0 not in tui._latency_trackers["primary"].latencies
+        assert 99.0 not in tui._latency_trackers["secondary"].latencies
+
+    def test_insertion_during_iteration_does_not_raise(self):
+        """A `setdefault` racing the read must neither raise nor be observed."""
+        tui = _bare_tui()
+        from proxy_tui import LatencyTracker
+        host: dict = {}
+        late = LatencyTracker()
+        late.latencies = [9.0]
+
+        class _Inserting:
+            def __init__(self):
+                self._vals = [1.0, 2.0]
+                self._inserted = False
+
+            @property
+            def latencies(self):
+                if not self._inserted:
+                    self._inserted = True
+                    host["tertiary"] = late
+                return self._vals
+
+        second = LatencyTracker()
+        second.latencies = [3.0]
+        host["primary"] = _Inserting()
+        host["secondary"] = second
+        tui._latency_trackers = host
+
+        union = tui._latency_union_values()
+        assert union == [1.0, 2.0, 3.0], (
+            f"snapshot must not observe the concurrent insert: {union!r}"
+        )
+
+    def test_iteration_is_snapshot_based(self):
+        """Pin the source of the robustness, not just its effect."""
+        import inspect
+        from proxy_tui import ProxyTUI
+        src = inspect.getsource(ProxyTUI._latency_union_values)
+        assert "list(self._latency_trackers.values())" in src, (
+            "union must iterate a snapshot so setdefault cannot resize it"
+        )
+
+
+class TestPollTickFailureIsLogged:
+    """A tick failure must EMIT a log record, never be swallowed."""
+
+    def test_status_failure_emits_warning_with_exc_info(self, monkeypatch):
+        import threading
+        import proxy_tui as pt
+        from proxy_tui import MetricHistory
+        tui = _bare_tui()
+        tui.history = MetricHistory()
+        tui._shutdown_event = threading.Event()
+        tui._shutdown_event.set()  # break after the first tick
+        tui._poll_error_count = 0
+        tui.call_from_thread = lambda *a, **k: None
+
+        class _Boom:
+            def status(self):
+                raise RuntimeError("boom-status")
+
+        tui.rate_limiter = _Boom()
+        monkeypatch.setattr(
+            tui._refresh_wake, "wait", lambda timeout=None: True)
+
+        class _Worker:
+            is_cancelled = False
+
+        monkeypatch.setattr(pt, "get_current_worker", lambda: _Worker())
+
+        warnings: list = []
+
+        class _Logger:
+            def warning(self, *a, **k):
+                warnings.append((a, k))
+
+            def info(self, *a, **k):
+                pass
+
+        monkeypatch.setattr(pt, "_tui_logger", _Logger())
+        tui._poll_loop()
+
+        assert warnings, "poll tick failure was swallowed with no log record"
+        assert "poll tick failed" in str(warnings[0][0][0])
+        assert warnings[0][1].get("exc_info") is True, (
+            "tick failure must carry exc_info so the traceback survives"
+        )
+
+    def test_cancelled_dispatch_breaks_loop_without_warning(self, monkeypatch):
+        """`CancelledError` is a BaseException: `except Exception` misses it."""
+        import asyncio
+        import threading
+        import proxy_tui as pt
+        from proxy_tui import MetricHistory
+        tui = _bare_tui()
+        tui.history = MetricHistory()
+        tui._shutdown_event = threading.Event()
+        tui._poll_error_count = 0
+        tui.rate_limiter = _MultiProviderLimiter()
+        tui.call_from_thread = lambda *a, **k: None
+
+        def _cancelled(_raw):
+            raise asyncio.CancelledError("dispatch torn down")
+
+        tui._dispatch_poll_updates = _cancelled
+        monkeypatch.setattr(
+            tui._refresh_wake, "wait", lambda timeout=None: True)
+
+        class _Worker:
+            is_cancelled = False
+
+        monkeypatch.setattr(pt, "get_current_worker", lambda: _Worker())
+
+        infos: list = []
+        warnings: list = []
+
+        class _Logger:
+            def warning(self, *a, **k):
+                warnings.append((a, k))
+
+            def info(self, *a, **k):
+                infos.append((a, k))
+
+        monkeypatch.setattr(pt, "_tui_logger", _Logger())
+        tui._poll_loop()
+
+        assert not warnings, f"cancel was misreported as a tick failure: {warnings!r}"
+        assert any("cancelled" in str(a[0]).lower() for a, _k in infos), (
+            "cancel path must log its exit"
+        )
+
+
+class TestPollLoopShutdownGuard:
+    """Once shutdown is signalled the loop must stop dispatching."""
+
+    def _loop_tui(self):
+        import threading
+        from proxy_tui import MetricHistory
+        tui = _bare_tui()
+        tui.history = MetricHistory()
+        tui._shutdown_event = threading.Event()
+        tui._poll_error_count = 0
+        tui.rate_limiter = _MultiProviderLimiter()
+        tui.call_from_thread = lambda *a, **k: None
+        return tui
+
+    def test_dispatch_not_reached_after_shutdown(self, monkeypatch):
+        import proxy_tui as pt
+        tui = self._loop_tui()
+        tui._shutdown_event.set()
+        monkeypatch.setattr(
+            tui._refresh_wake, "wait", lambda timeout=None: True)
+
+        class _Worker:
+            is_cancelled = False
+
+        monkeypatch.setattr(pt, "get_current_worker", lambda: _Worker())
+
+        class _Logger:
+            def warning(self, *a, **k):
+                pass
+
+            def info(self, *a, **k):
+                pass
+
+        monkeypatch.setattr(pt, "_tui_logger", _Logger())
+
+        called: list = []
+        tui._dispatch_poll_updates = lambda raw: called.append(raw)
+        tui._poll_loop()
+        assert called == [], "dispatch ran after shutdown was signalled"
+
+    def test_signal_sets_both_events(self):
+        import threading
+        tui = _bare_tui()
+        tui._shutdown_event = threading.Event()
+        tui._refresh_wake.clear()
+        tui._workers = []
+        tui.proxy_app = {}
+        tui._signal_proxy_shutdown()
+        assert tui._shutdown_event.is_set()
+        assert tui._refresh_wake.is_set(), (
+            "the poll loop sleeps on `_refresh_wake`, so shutdown must wake it"
+        )
+
+    def test_poll_thread_exits_on_shutdown(self, monkeypatch):
+        """The thread join is bounded; dispatch is stubbed so no UI is needed."""
+        import threading
+        import proxy_tui as pt
+        tui = self._loop_tui()
+        tui._workers = []
+        tui.proxy_app = {}
+
+        class _Worker:
+            is_cancelled = False
+
+        monkeypatch.setattr(pt, "get_current_worker", lambda: _Worker())
+
+        class _Logger:
+            def warning(self, *a, **k):
+                pass
+
+            def info(self, *a, **k):
+                pass
+
+        monkeypatch.setattr(pt, "_tui_logger", _Logger())
+
+        thread = threading.Thread(target=tui._poll_loop, daemon=True)
+        thread.start()
+        thread.join(timeout=0.5)
+        assert thread.is_alive(), "loop exited without shutdown — test proves nothing"
+
+        tui._signal_proxy_shutdown()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "poll thread did not exit after shutdown"
+

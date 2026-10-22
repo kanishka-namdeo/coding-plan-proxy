@@ -1,3 +1,4 @@
+import sys
 import urllib.request
 import json
 import os
@@ -10,6 +11,12 @@ base_url = os.getenv('OPENLUX_TARGET_BASE', 'https://api.openlux.ai/v1')
 
 # Models to find
 target_models = ['gpt-5.6-sol', 'gemini-3.7-flash', 'gpt-5.6-terra', 'qwen3.8-max']
+
+# Fail fast: a missing key otherwise sends "Bearer None" and reports a 401 as
+# a successful query.
+if not api_key:
+    print('OPENLUX_API_KEY is not set — nothing to query.')
+    sys.exit(1)
 
 print('Querying full models list from OpenLux...\n')
 
@@ -40,9 +47,13 @@ try:
             
         if not found_models:
             print('\nNone of the target models were found in the list.')
-            
+
 except urllib.error.HTTPError as e:
     print(f'HTTP Error: {e.code}')
     print(f'Response: {e.read().decode()[:500]}')
+    # Never exit 0 on a failed query: an unattended run would report success
+    # while having measured nothing.
+    sys.exit(1)
 except Exception as e:
     print(f'Error: {e}')
+    sys.exit(1)

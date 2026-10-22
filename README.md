@@ -65,11 +65,11 @@ Grouped network, timeout, connection, buffering, logging, and per-provider limit
 
 ### Multi-Provider Routing
 
-**Ten provider entries supported**
-Route requests to DashScope (primary), MIMO (secondary), OpenLux (tertiary), ARK/BytePlus (quaternary), Meta AI/Muse Spark (quinary), DeepSeek (senary), GLM/Z.ai (septenary), or Agnes AI (octonary/nonary/decenary). Agnes AI is a single vendor with a single Token Plan key, but it contributes three entries — `Agnes Text`, `Agnes Image`, and `Agnes Video` — so each modality's distinct upstream RPM cap gets its own rate limiter. Only the create-task `POST /v1/videos` is proxyable for Agnes Video; poll the result directly against Agnes (see `.env.example`).
+**Eleven provider entries supported**
+Route requests to DashScope (primary), MIMO (secondary), OpenLux (tertiary), ARK/BytePlus (quaternary), Meta AI/Muse Spark (quinary), DeepSeek (senary), GLM/Z.ai (septenary), Agnes AI (octonary/nonary/decenary), or OpenCode Zen (undenary). Agnes AI is a single vendor with a single Token Plan key, but it contributes three entries — `Agnes Text`, `Agnes Image`, and `Agnes Video` — so each modality's distinct upstream RPM cap gets its own rate limiter. Only the create-task `POST /v1/videos` is proxyable for Agnes Video; poll the result directly against Agnes (see `.env.example`). OpenCode Zen offers a free-catalog of models with $0 token cost (requires a funded account with $20 prepaid balance; anonymous keyless access was disabled on 2026-09-23).
 
 **Provider pinning**
-Force a specific provider by prefixing the model name: `openlux/gpt-5.6-sol`, `deepseek/deepseek-flash`, `glm/glm-5.3`, `agnes/agnes-3.0-flash`, `agnes-image/agnes-image-2.1-flash`, `agnes-video/agnes-video-2.5-flash`. Available slugs: `dashscope`, `mimo`, `openlux`, `ark`, `metaspark`, `deepseek`, `glm`, `zai`, `agnes`, `agnes-image`, `agnes-video`. Agnes model IDs are unique across all providers, so a bare model name routes to Agnes without a pin; the pinnable ordinal names (`octonary`, `nonary`, `decenary`) also work.
+Force a specific provider by prefixing the model name: `openlux/gpt-5.6-sol`, `deepseek/deepseek-flash`, `glm/glm-5.3`, `agnes/agnes-3.0-flash`, `agnes-image/agnes-image-2.1-flash`, `agnes-video/agnes-video-2.5-flash`, `opencode/big-pickle`. Available slugs: `dashscope`, `mimo`, `openlux`, `ark`, `metaspark`, `deepseek`, `glm`, `zai`, `agnes`, `agnes-image`, `agnes-video`, `opencode`. Agnes model IDs are unique across all providers, so a bare model name routes to Agnes without a pin; the pinnable ordinal names (`octonary`, `nonary`, `decenary`, `undenary`) also work.
 
 **Cross-provider failover**
 Overlapping models (present in multiple provider lists) support automatic failover on 429/5xx/timeout. After per-provider retries are exhausted, the handler advances to the next available provider with a closed circuit.
@@ -165,20 +165,23 @@ Each provider has its own environment variables for API key, base URL, and rate 
 | Agnes Text (octonary) | `AGNES_API_KEY` | `AGNES_TARGET_BASE` |
 | Agnes Image (nonary) | `AGNES_API_KEY` | `AGNES_TARGET_BASE` |
 | Agnes Video (decenary) | `AGNES_API_KEY` | `AGNES_TARGET_BASE` |
+| OpenCode Zen (undenary) | `OPENCODE_API_KEY` | `OPENCODE_TARGET_BASE` |
 
 All three Agnes entries share one Token Plan key and base URL (`AGNES_API_KEY`, `AGNES_TARGET_BASE`, default `https://apihub.agnes-ai.com/v1`); they exist as separate entries only so each modality keeps its own rate limiter.
 
-Override rate limits per provider with `SECONDARY_RPM_LIMIT`, `TERTIARY_TPM_LIMIT`, `OCTONARY_RPM_LIMIT`, `NONARY_MAX_RETRIES`, `DECENARY_BASE_BACKOFF`, etc.
+OpenCode Zen's free-catalog models carry $0 token cost but require a funded account with $20 prepaid balance (anonymous keyless access was disabled on 2026-09-23). Free-tier access is also gated at the TLS transport layer, so a local `opencode2api` sidecar is required for that lane — configured via `OPENCODE_ZEN_GATEWAY`. See `.env.example` for details.
+
+Override rate limits per provider with `SECONDARY_RPM_LIMIT`, `TERTIARY_TPM_LIMIT`, `OCTONARY_RPM_LIMIT`, `NONARY_MAX_RETRIES`, `DECENARY_BASE_BACKOFF`, `UNDENARY_RPM_LIMIT`, etc.
 
 ### Failover Order
 
 Customize the cross-provider failover order with `MODEL_FALLBACK_ORDER`:
 
 ```bash
-MODEL_FALLBACK_ORDER=decenary,nonary,octonary,septenary,senary,quinary,quaternary,tertiary,secondary,primary
+MODEL_FALLBACK_ORDER=undenary,decenary,nonary,octonary,septenary,senary,quinary,quaternary,tertiary,secondary,primary
 ```
 
-The default order is `decenary` → `nonary` → `octonary` → `septenary` → `senary` → `quinary` → `quaternary` → `tertiary` → `secondary` → `primary` (descending ordinal, newest provider first).
+The default order is `undenary` → `decenary` → `nonary` → `octonary` → `septenary` → `senary` → `quinary` → `quaternary` → `tertiary` → `secondary` → `primary` (descending ordinal, newest provider first).
 
 ## Running Tests
 

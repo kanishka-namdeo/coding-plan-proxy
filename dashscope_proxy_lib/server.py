@@ -226,10 +226,13 @@ async def create_proxy_resources() -> tuple[MultiProviderRateLimiter, web.Applic
     try:
         loop.add_signal_handler(signal.SIGTERM, _handle_signal)
         loop.add_signal_handler(signal.SIGINT, _handle_signal)
-    except (NotImplementedError, OSError):
+    except (NotImplementedError, OSError, RuntimeError):
         # Windows: add_signal_handler is unavailable; fall back to signal.signal
         # for SIGINT and (Windows-only) SIGBREAK so Ctrl+C / Ctrl+Break still
         # trigger the same graceful shutdown. Best effort.
+        # RuntimeError also covers the non-main-thread case — without it the
+        # exception escapes after the site is bound and the PID file written,
+        # leaking the session, connector, runner and session-log writer.
         _fallback_signals = [signal.SIGINT]
         _sig_break = getattr(signal, "SIGBREAK", None)
         if _sig_break is not None:
@@ -275,11 +278,20 @@ async def cleanup_proxy_resources(
     session = app.get("client_session")
     connector = app.get("connector")
     if session and not session.closed:
-        await session.close()
+        # Bounded: a hung upstream transport must not stall shutdown forever.
+        try:
+            async with asyncio.timeout(5):
+                await session.close()
+        except Exception as e:
+            _log(logging.WARNING, "client session close raised or timed out", error=str(e))
         # Allow in-flight transports to finish closing before runner teardown.
         await asyncio.sleep(0.25)
     if connector is not None and not connector.closed:
-        await connector.close()
+        try:
+            async with asyncio.timeout(5):
+                await connector.close()
+        except Exception as e:
+            _log(logging.WARNING, "connector close raised or timed out", error=str(e))
     session_log = app.get("session_log")
     if session_log:
         # Run the (potentially slow) close off the event loop so a stuck
@@ -291,8 +303,14 @@ async def cleanup_proxy_resources(
             _log(logging.INFO, "session log writer closed")
         except Exception as e:
             _log(logging.WARNING, "session log close raised or timed out", error=str(e))
-    await runner.cleanup()
-    _remove_pid_file()
+    try:
+        await runner.cleanup()
+    except Exception as e:
+        _log(logging.WARNING, "runner cleanup raised", error=str(e))
+    finally:
+        # Always remove the PID file: a leftover one makes the next start report
+        # a bogus "already running".
+        _remove_pid_file()
     _log(logging.INFO, "shutdown complete")
 
 

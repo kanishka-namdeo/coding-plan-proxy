@@ -118,6 +118,10 @@ def _compact_number(n: int) -> str:
             factor, suffix = candidate_factor, candidate_suffix
             break
     mantissa = n / factor
+    # Suffix saturates at "T"; magnitude beyond that is deliberately NOT
+    # preserved, because the <= 6-char bound is what lets the Overview grid
+    # size its RPM/TPM columns (cell_padding=0). A counter that reaches 10**15
+    # cannot happen through a local proxy, so the cap wins over the magnitude.
     while round(mantissa, 1) >= 1000:
         mantissa /= 1000
         suffix = _COMPACT_SUFFIX_NEXT.get(suffix, "T")
